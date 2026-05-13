@@ -1,0 +1,211 @@
+{
+  "backend": "torch_native",
+  "results": [
+    {
+      "clip": "adv_patch_attacked.mp4",
+      "frames": 600,
+      "wall_seconds": 981.073,
+      "fps_effective": 0.6,
+      "alert_frames": 0,
+      "p_adv_max": 0.258,
+      "p_adv_mean": 0.0696,
+      "timing_mean_ms": 1631.5,
+      "timing_p95_ms": 8065.78,
+      "reason_code_counts": {
+        "local_temporal_texture_change": 332,
+        "temporal_texture_change": 142,
+        "roi_temporal_texture_change": 1
+      },
+      "static_image_trigger_frames": 0
+    },
+    {
+      "clip": "clean_baseline.mp4",
+      "frames": 4548,
+      "wall_seconds": 7393.223,
+      "fps_effective": 0.6,
+      "alert_frames": 0,
+      "p_adv_max": 0.9976,
+      "p_adv_mean": 0.1228,
+      "timing_mean_ms": 1621.79,
+      "timing_p95_ms": 8538.27,
+      "reason_code_counts": {
+        "local_temporal_texture_change": 2173,
+        "temporal_texture_change": 644,
+        "light_optical_flow_artifact": 18,
+        "local_blur_degradation": 13,
+        "paired_temporal_blur_degradation": 11,
+        "track_consistency_drop": 10,
+        "classifier_adv": 7,
+        "motion_artifact": 3
+      },
+      "static_image_trigger_frames": 0
+    },
+    {
+      "clip": "glare_attacked.mp4",
+      "frames": 300,
+      "wall_seconds": 506.493,
+      "fps_effective": 0.6,
+      "alert_frames": 151,
+      "p_adv_max": 1.0,
+      "p_adv_mean": 0.544,
+      "timing_mean_ms": 1687.35,
+      "timing_p95_ms": 8784.75,
+      "reason_code_counts": {
+        "local_temporal_texture_change": 244,
+        "temporal_texture_change": 191,
+        "classifier_adv": 151,
+        "motion_artifact": 83,
+        "overexposure": 75,
+        "paired_temporal_flow_change": 22,
+        "strong_temporal_texture_change": 21,
+        "static_image_spoof_hold": 8,
+        "static_image_spoof": 5,
+        "light_optical_flow_artifact": 3,
+        "benign_global_motion_suppressed": 2
+      },
+      "static_image_trigger_frames": 5
+    },
+    {
+      "clip": "motion_blur_attacked.mp4",
+      "frames": 300,
+      "wall_seconds": 964.454,
+      "fps_effective": 0.3,
+      "alert_frames": 146,
+      "p_adv_max": 1.0,
+      "p_adv_mean": 0.5623,
+      "timing_mean_ms": 3212.55,
+      "timing_p95_ms": 21719.09,
+      "reason_code_counts": {
+        "local_temporal_texture_change": 261,
+        "temporal_texture_change": 216,
+        "classifier_adv": 154,
+        "roi_temporal_texture_change": 12,
+        "sustained_roi_temporal_texture_change": 7,
+        "local_blur_degradation": 5,
+        "paired_temporal_blur_degradation": 5,
+        "track_consistency_drop": 3,
+        "paired_track_consistency_drop": 1
+      },
+      "static_image_trigger_frames": 0
+    },
+    {
+      "clip": "occlusion_attacked.mp4",
+      "frames": 300,
+      "wall_seconds": 798.452,
+      "fps_effective": 0.4,
+      "alert_frames": 156,
+      "p_adv_max": 1.0,
+      "p_adv_mean": 0.6056,
+      "timing_mean_ms": 2660.0,
+      "timing_p95_ms": 17200.26,
+      "reason_code_counts": {
+        "local_temporal_texture_change": 252,
+        "temporal_texture_change": 178,
+        "classifier_adv": 170,
+        "motion_artifact": 99,
+        "paired_temporal_flow_change": 20,
+        "track_consistency_drop": 11,
+        "roi_temporal_texture_change": 8,
+        "local_blur_degradation": 5,
+        "paired_temporal_blur_degradation": 5,
+        "sustained_roi_temporal_texture_change": 4,
+        "paired_track_consistency_drop": 1,
+        "strong_temporal_texture_change": 1
+      },
+      "static_image_trigger_frames": 0
+    },
+    {
+      "clip": "screen_spoof_attacked.mp4",
+      "frames": 2618,
+      "wall_seconds": 4449.84,
+      "fps_effective": 0.6,
+      "alert_frames": 9,
+      "p_adv_max": 0.4409,
+      "p_adv_mean": 0.1892,
+      "timing_mean_ms": 1673.58,
+      "timing_p95_ms": 8597.99,
+      "reason_code_counts": {
+        "temporal_texture_change": 2617,
+        "local_temporal_texture_change": 2617,
+        "sustained_roi_temporal_texture_change": 419,
+        "roi_temporal_texture_change": 336,
+        "light_optical_flow_artifact": 180,
+        "local_blur_degradation": 85,
+        "paired_temporal_blur_degradation": 85,
+        "strong_temporal_texture_change": 24,
+        "track_consistency_drop": 10,
+        "static_image_spoof_hold": 8,
+        "static_image_spoof": 5,
+        "motion_artifact": 3,
+        "paired_temporal_light_flow_change": 3,
+        "paired_track_consistency_drop": 2
+      },
+      "static_image_trigger_frames": 5
+    },
+    {
+      "clip": "visibility_degradation_attacked.mp4",
+      "frames": 300,
+      "wall_seconds": 542.318,
+      "fps_effective": 0.6,
+      "alert_frames": 145,
+      "p_adv_max": 1.0,
+      "p_adv_mean": 0.5865,
+      "timing_mean_ms": 1806.69,
+      "timing_p95_ms": 8076.95,
+      "reason_code_counts": {
+        "local_temporal_texture_change": 265,
+        "temporal_texture_change": 196,
+        "classifier_adv": 160,
+        "local_blur_degradation": 47,
+        "motion_artifact": 45,
+        "paired_temporal_blur_degradation": 43,
+        "paired_temporal_flow_change": 35,
+        "roi_temporal_texture_change": 8,
+        "strong_temporal_texture_change": 6,
+        "track_consistency_drop": 3,
+        "paired_track_consistency_drop": 2
+      },
+      "static_image_trigger_frames": 0
+    }
+  ],
+  "summary": {
+    "ok": false,
+    "verdicts": [
+      {
+        "clip": "adv_patch_attacked.mp4",
+        "ok": false,
+        "alert_frames": 0
+      },
+      {
+        "clip": "clean_baseline.mp4",
+        "ok": true,
+        "alert_frames": 0
+      },
+      {
+        "clip": "glare_attacked.mp4",
+        "ok": true,
+        "alert_frames": 151
+      },
+      {
+        "clip": "motion_blur_attacked.mp4",
+        "ok": true,
+        "alert_frames": 146
+      },
+      {
+        "clip": "occlusion_attacked.mp4",
+        "ok": true,
+        "alert_frames": 156
+      },
+      {
+        "clip": "screen_spoof_attacked.mp4",
+        "ok": false,
+        "alert_frames": 9
+      },
+      {
+        "clip": "visibility_degradation_attacked.mp4",
+        "ok": true,
+        "alert_frames": 145
+      }
+    ]
+  }
+}

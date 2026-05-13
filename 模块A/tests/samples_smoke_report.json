@@ -1,0 +1,208 @@
+{
+  "config": "D:\\联合防御模块\\模块A\\experiments\\configs\\module_a_baseline.yaml",
+  "backend": "tensorrt",
+  "results": [
+    {
+      "clip": "adv_patch_attacked.mp4",
+      "frames": 600,
+      "wall_seconds": 11.563,
+      "fps_effective": 51.9,
+      "alert_frames": 8,
+      "p_adv_max": 0.2944,
+      "p_adv_mean": 0.0712,
+      "timing_mean_ms": 15.75,
+      "timing_p95_ms": 21.22,
+      "reason_code_counts": {
+        "temporal_texture_change": 26,
+        "static_image_spoof_hold": 7,
+        "static_image_spoof": 3,
+        "roi_temporal_texture_change": 1,
+        "static_media_spoof": 1
+      },
+      "static_image_trigger_frames": 3
+    },
+    {
+      "clip": "clean_baseline.mp4",
+      "frames": 4548,
+      "wall_seconds": 77.157,
+      "fps_effective": 58.9,
+      "alert_frames": 0,
+      "p_adv_max": 0.9962,
+      "p_adv_mean": 0.1255,
+      "timing_mean_ms": 13.44,
+      "timing_p95_ms": 20.56,
+      "reason_code_counts": {
+        "temporal_texture_change": 77,
+        "local_blur_degradation": 13,
+        "classifier_adv_high_confidence": 12,
+        "paired_temporal_blur_degradation": 11,
+        "track_consistency_drop": 10,
+        "light_optical_flow_artifact": 10,
+        "local_temporal_texture_change": 5
+      },
+      "static_image_trigger_frames": 0
+    },
+    {
+      "clip": "glare_attacked.mp4",
+      "frames": 300,
+      "wall_seconds": 4.441,
+      "fps_effective": 67.6,
+      "alert_frames": 153,
+      "p_adv_max": 1.0,
+      "p_adv_mean": 0.5679,
+      "timing_mean_ms": 13.98,
+      "timing_p95_ms": 21.34,
+      "reason_code_counts": {
+        "temporal_texture_change": 140,
+        "classifier_adv_high_confidence": 79,
+        "classifier_adv_bonus": 76,
+        "motion_artifact": 75,
+        "overexposure": 75,
+        "local_temporal_texture_change": 22,
+        "static_image_spoof": 5,
+        "paired_temporal_flow_change": 4,
+        "static_image_spoof_hold": 4,
+        "light_optical_flow_artifact": 1
+      },
+      "static_image_trigger_frames": 5
+    },
+    {
+      "clip": "motion_blur_attacked.mp4",
+      "frames": 300,
+      "wall_seconds": 4.46,
+      "fps_effective": 67.3,
+      "alert_frames": 143,
+      "p_adv_max": 1.0,
+      "p_adv_mean": 0.5848,
+      "timing_mean_ms": 14.05,
+      "timing_p95_ms": 20.87,
+      "reason_code_counts": {
+        "classifier_adv_high_confidence": 157,
+        "temporal_texture_change": 48,
+        "roi_temporal_texture_change": 12,
+        "local_blur_degradation": 5,
+        "paired_temporal_blur_degradation": 5,
+        "track_consistency_drop": 3,
+        "paired_track_consistency_drop": 1
+      },
+      "static_image_trigger_frames": 0
+    },
+    {
+      "clip": "occlusion_attacked.mp4",
+      "frames": 300,
+      "wall_seconds": 4.641,
+      "fps_effective": 64.6,
+      "alert_frames": 142,
+      "p_adv_max": 1.0,
+      "p_adv_mean": 0.6179,
+      "timing_mean_ms": 14.64,
+      "timing_p95_ms": 21.54,
+      "reason_code_counts": {
+        "classifier_adv_high_confidence": 167,
+        "motion_artifact": 67,
+        "local_temporal_texture_change": 33,
+        "temporal_texture_change": 29,
+        "track_consistency_drop": 11,
+        "roi_temporal_texture_change": 8,
+        "local_blur_degradation": 5,
+        "paired_temporal_blur_degradation": 5,
+        "paired_track_consistency_drop": 1
+      },
+      "static_image_trigger_frames": 0
+    },
+    {
+      "clip": "screen_spoof_attacked.mp4",
+      "frames": 2618,
+      "wall_seconds": 104.346,
+      "fps_effective": 25.1,
+      "alert_frames": 9,
+      "p_adv_max": 0.4409,
+      "p_adv_mean": 0.1892,
+      "timing_mean_ms": 15.56,
+      "timing_p95_ms": 23.38,
+      "reason_code_counts": {
+        "temporal_texture_change": 1889,
+        "roi_temporal_texture_change": 336,
+        "local_blur_degradation": 85,
+        "paired_temporal_blur_degradation": 85,
+        "light_optical_flow_artifact": 74,
+        "local_temporal_texture_change": 24,
+        "track_consistency_drop": 10,
+        "static_image_spoof_hold": 8,
+        "static_image_spoof": 5,
+        "paired_track_consistency_drop": 2
+      },
+      "static_image_trigger_frames": 5
+    },
+    {
+      "clip": "visibility_degradation_attacked.mp4",
+      "frames": 300,
+      "wall_seconds": 3.899,
+      "fps_effective": 76.9,
+      "alert_frames": 145,
+      "p_adv_max": 1.0,
+      "p_adv_mean": 0.6221,
+      "timing_mean_ms": 12.19,
+      "timing_p95_ms": 18.06,
+      "reason_code_counts": {
+        "classifier_adv_high_confidence": 163,
+        "local_temporal_texture_change": 52,
+        "local_blur_degradation": 47,
+        "paired_temporal_blur_degradation": 43,
+        "motion_artifact": 31,
+        "temporal_texture_change": 27,
+        "paired_temporal_flow_change": 11,
+        "roi_temporal_texture_change": 8,
+        "track_consistency_drop": 3,
+        "paired_track_consistency_drop": 2
+      },
+      "static_image_trigger_frames": 0
+    }
+  ],
+  "summary": {
+    "ok": true,
+    "verdicts": [
+      {
+        "clip": "adv_patch_attacked.mp4",
+        "ok": true,
+        "missing_reasons": [],
+        "alert_frames": 8
+      },
+      {
+        "clip": "clean_baseline.mp4",
+        "ok": true,
+        "why": "clean calm"
+      },
+      {
+        "clip": "glare_attacked.mp4",
+        "ok": true,
+        "missing_reasons": [],
+        "alert_frames": 153
+      },
+      {
+        "clip": "motion_blur_attacked.mp4",
+        "ok": true,
+        "missing_reasons": [],
+        "alert_frames": 143
+      },
+      {
+        "clip": "occlusion_attacked.mp4",
+        "ok": true,
+        "missing_reasons": [],
+        "alert_frames": 142
+      },
+      {
+        "clip": "screen_spoof_attacked.mp4",
+        "ok": true,
+        "missing_reasons": [],
+        "alert_frames": 9
+      },
+      {
+        "clip": "visibility_degradation_attacked.mp4",
+        "ok": true,
+        "missing_reasons": [],
+        "alert_frames": 145
+      }
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "created_at": "2026-05-13T01:15:17",
+  "package_root": "D:\\security_project_c\\交付成品\\module_a_video_defense_runtime",
+  "file_count": 67,
+  "total_bytes": 559571967,
+  "total_mb": 533.65,
+  "runtime_entry": "tools/module_a_monitor_app.py",
+  "default_command": "pixi run app",
+  "configs": [
+    "experiments/configs/module_a_baseline.yaml",
+    "experiments/configs/module_a_baseline_v2.yaml",
+    "experiments/configs/module_a_baseline_yolov5_v1.yaml",
+    "experiments/configs/module_a_runtime_profiles.yaml",
+    "experiments/configs/module_a_classifier_universal_yolov5_yolov8_v1.json",
+    "experiments/configs/module_a_static_media_classifier_v1.json",
+    "experiments/configs/module_a_synth_classifier_v2_lowcost.json"
+  ],
+  "models": [
+    "baseline_training/runs/baseline_yolov5/weights/best_fp16_640.engine",
+    "baseline_training/runs/baseline_yolov5/weights/best.engine",
+    "baseline_training/runs/baseline_yolov5/weights/best.onnx",
+    "baseline_training/runs/baseline_yolov5/weights/best.pt",
+    "baseline_training/runs/baseline_yolov8/weights/best_fp16_640.engine",
+    "baseline_training/runs/baseline_yolov8/weights/best.engine",
+    "baseline_training/runs/baseline_yolov8/weights/best.onnx",
+    "baseline_training/runs/baseline_yolov8/weights/best.pt"
+  ],
+  "samples": [
+    "samples/clean_baseline.mp4",
+    "samples/adv_patch_attacked.mp4",
+    "samples/glare_attacked.mp4",
+    "samples/visibility_degradation_attacked.mp4",
+    "samples/motion_blur_attacked.mp4",
+    "samples/occlusion_attacked.mp4",
+    "samples/screen_spoof_attacked.mp4"
+  ]
+}

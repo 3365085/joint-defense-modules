@@ -1,0 +1,16 @@
+# Security gate defaults. CLI values override this file.
+model: path/to/model.pt
+images: path/to/images
+labels: null
+out: runs/security_gate
+critical_classes: ["helmet"]
+imgsz: 640
+conf: 0.25
+iou: 0.7
+max_images: 200
+device: null
+occlusion: false
+occlusion_max_images: 20
+channel_scan: false
+channel_max_images: 80
+risk_config: configs/risk_thresholds.yaml

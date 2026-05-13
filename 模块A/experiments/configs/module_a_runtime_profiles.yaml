@@ -1,0 +1,45 @@
+version: module_a_runtime_profiles_v2
+baseline: experiments/configs/module_a_baseline.yaml
+
+profiles:
+  full_gpu:
+    name: 全速GPU
+    detector_backend: tensorrt
+    purpose: 正式实验与最佳检测能力；使用完整GPU链路和通用校准A4。
+    device_target: RTX / TensorRT CUDA设备
+    realtime_goal: 最高检测能力，维持实时。
+    module_overrides: {}
+
+  balanced_gpu:
+    name: 均衡GPU
+    detector_backend: tensorrt
+    purpose: 中等算力GPU；降低关键帧和轻光流频率，保留通用校准A4。
+    device_target: 移动端GPU或共享GPU负载
+    realtime_goal: 降低平均耗时，优先保证片段级告警。
+    module_overrides:
+      alert_trigger_count: 5
+      keyframe_interval: 4
+      light_flow_interval: 4
+      static_image_interval: 4
+      source_authenticity_interval: 4
+      light_flow_size: 144
+      emit_roi_details: false
+      emit_roi_temporal_details: false
+      emit_roi_motion_details: false
+
+  edge_onnx:
+    name: 边缘ONNX
+    detector_backend: onnx
+    purpose: ONNX兼容路径验证；后续可映射到NPU/CPU/C++部署。
+    device_target: ONNX Runtime CUDA / NPU / CPU+C++
+    realtime_goal: 验证跨后端指标一致性，牺牲部分速度换部署兼容性。
+    module_overrides:
+      alert_trigger_count: 5
+      keyframe_interval: 5
+      light_flow_interval: 5
+      static_image_interval: 5
+      source_authenticity_interval: 5
+      light_flow_size: 128
+      emit_roi_details: false
+      emit_roi_temporal_details: false
+      emit_roi_motion_details: false

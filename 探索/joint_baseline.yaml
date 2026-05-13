@@ -1,0 +1,107 @@
+# 联合防御基线配置模板（探索版 2026-05-13）
+#
+# 目的：为联合仓库提供一份统一的 YAML，让 A（流式检测）和 B（模型安检）可以
+# 被同一个入口脚本读入。本文件在合并前仅作为设计参考；真正落地后，应该复制
+# 到联合仓根目录 `configs/joint_baseline.yaml` 并与各自历史的 baseline 对齐。
+#
+# 读取约定：
+#   - A 脚本 / monitor_app：只消费 `module_a.*` + `inference.*` 两段。
+#   - B 脚本：只消费 `security_gate.*` / `strong_detox.*` 等各自那段。
+#   - joint runner：读 `joint.*` 和 `module_b.*` 做编排。
+
+joint:
+  name: 联合防御基线 2026-05-13
+  repo_layout_version: 1
+  description: >
+    A 负责实时物理扰动/翻拍检测（p_adv），B 负责模型后门扫描+强净化+联合决策。
+
+# ======================================================================
+# 模块 A（流式检测 / Monitor_App 复用）
+# ======================================================================
+inference:
+  backend: tensorrt
+  device: cuda:0
+  half: true
+  image_size: 640
+  confidence: 0.25
+  warmup_frames: 3
+  artifacts:
+    engine:
+      - baseline_training/runs/baseline_yolov5/weights/best_fp16_640.engine
+      - baseline_training/runs/baseline_yolov5/weights/best.engine
+    onnx:
+      - baseline_training/runs/baseline_yolov5/weights/best.onnx
+    pytorch:
+      - baseline_training/runs/baseline_yolov5/weights/best.pt
+  model_family: yolov5
+
+module_a:
+  require_gpu: true
+  device: cuda:0
+  frame_size: 640
+  keyframe_interval: 3
+  alert_window: 5
+  alert_trigger_count: 4
+  attack_state_hold_frames: 4
+  # A2 LBP 时域新增的抗噪参数（P1-A-4 2026-05-13）
+  temporal_persistence_frames: 1
+  temporal_adaptive_baseline: true
+  temporal_adaptive_ema_alpha: 0.02
+  temporal_adaptive_multiplier: 2.0
+  temporal_adaptive_floor: 0.015
+  # A3b 多尺度 fallback（P1-A-6 2026-05-13）
+  static_image_multiscale_fallback_enabled: true
+  static_image_multiscale_trigger_count: 1
+  # A4 分类器阈值覆盖（P1-A-5 2026-05-13；留空 → 使用 artifact 默认）
+  classifier_threshold_override: null
+  # ...（其他键继承自 experiments/configs/module_a_baseline.yaml）
+  fusion_backend: classifier
+  classifier_artifact: experiments/configs/module_a_classifier_universal_yolov5_yolov8_v1.json
+  classifier_calibration_model: yolov5_v1
+  p_adv_threshold: 0.55
+
+# ======================================================================
+# 模块 B（Model Security Gate + Detox + Joint Decision）
+# ======================================================================
+module_b:
+  repo_path: repo
+  final_model: artifacts/current_best/best2_purified_semantic_fixed_2026-05-09.pt
+  poisoned_model: repo/models/best_2_poisoned.pt
+  clean_val_yaml: data/helmet_head_yolo_val/data.yaml
+  external_hard_suite_roots:
+    - data/poison_benchmark_tuned_val
+  try_attack_roots:
+    - data/try_attack_data
+    - data/try_attack_data1
+  expected_baseline:
+    security_gate: Green
+    security_score: 18.12
+    clean_map50: 0.6135
+    clean_map50_95: 0.3474
+    try_attack_auto_helmet_detections: 0
+
+# B 原生段落（直接被 B 的脚本消费）
+security_gate:
+  critical_classes:
+    - helmet
+  imgsz: 416
+  conf: 0.25
+  max_images: 200
+  risk_config: repo/configs/risk_thresholds.yaml
+
+external_hard_suite:
+  imgsz: 416
+  conf: 0.25
+  target_classes:
+    - helmet
+
+# ======================================================================
+# 联合决策 hook（未来合并时启用；现在保持 disabled）
+# ======================================================================
+joint_decision:
+  enabled: false
+  # 当 A 的 alert_confirmed=True 连续 N 帧 → 触发一次 B 的 runtime_guard
+  # 对当前视频流的 YOLO 输出做后验检查
+  a_alert_frames_before_b_guard: 10
+  # B 的 helmet 检测输出 → 填 A 的 p_safety 分路（目前 A 始终落 null）
+  route_b_helmet_to_p_safety: false

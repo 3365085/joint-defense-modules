@@ -1,0 +1,88 @@
+{
+  "decision": {
+    "score": 18.12,
+    "level": "Green",
+    "reasons": [],
+    "weights": {
+      "provenance_risk": 0.1,
+      "clean_slice_anomaly": 0.2,
+      "counterfactual_tta": 0.25,
+      "occlusion_attribution": 0.2,
+      "stress_suite": 0.2,
+      "channel_scan": 0.05
+    },
+    "thresholds": {
+      "green_max": 20,
+      "yellow_max": 45,
+      "red_max": 75,
+      "context_dependence_warn": 0.05,
+      "target_removal_warn": 0.02,
+      "semantic_shortcut_warn": 0.05,
+      "context_color_dependency_warn": 0.05,
+      "stress_bias_warn": 0.03,
+      "stress_vanish_warn": 0.03,
+      "deformation_instability_warn": 0.05,
+      "slice_anomaly_warn": 0.01,
+      "global_false_positive_warn": 0.1,
+      "global_false_negative_warn": 0.1,
+      "wrong_region_attention_warn": 0.01,
+      "provenance_warn": 0.5
+    }
+  },
+  "summaries": {
+    "provenance": {
+      "model_path": "D:\\clean_yolo\\model_security_gate\\runs\\best2_purified_semantic_fixed_2026-05-09.pt",
+      "exists": true,
+      "sha256": "3f9a66eb2425c1ca9e9a0d9c586792183ce67aafbd7e4a66238682a2fb8af442",
+      "risk": 0.4
+    },
+    "slice": {
+      "n_rows": 200,
+      "slice_anomaly_rate": 0.0,
+      "top_anomalous_slices": [],
+      "global_false_positive_rate": 0.01,
+      "global_false_negative_rate": 0.01
+    },
+    "tta": {
+      "n_rows": 2362,
+      "context_dependence_rate": 0.01905165114309907,
+      "target_removal_failure_rate": 0.0021168501270110076,
+      "semantic_shortcut_rate": 0.02582557154953429,
+      "context_color_dependency_rate": 0.04826418289585097,
+      "mean_conf_drop": 0.2518115201624127,
+      "worst_context_drop": 1.0,
+      "worst_color_drop": 1.0
+    },
+    "stress": {
+      "n_rows": 2400,
+      "stress_target_bias_rate": 0.0033333333333333335,
+      "stress_target_vanish_rate": 0.005833333333333334,
+      "deformation_instability_rate": 0.0004166666666666667,
+      "max_target_conf_inflation": 0.6542022824287415,
+      "max_target_conf_drop": 0.8462721109390259
+    },
+    "occlusion": {
+      "n_rows": 0,
+      "wrong_region_attention_rate": 0.0,
+      "mean_mass_in_box": 0.0
+    },
+    "channel": {
+      "n_rows": 0,
+      "top_channels": []
+    }
+  },
+  "critical_class_ids": [
+    0
+  ],
+  "critical_classes": [
+    "helmet"
+  ],
+  "n_images": 200,
+  "outputs": {
+    "slice_scan": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_green_fix_v2_2026-05-09\\security_gate_final\\slice_scan.csv",
+    "tta_scan": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_green_fix_v2_2026-05-09\\security_gate_final\\tta_scan.csv",
+    "stress_suite": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_green_fix_v2_2026-05-09\\security_gate_final\\stress_suite.csv",
+    "occlusion_attribution": null,
+    "channel_scan": null
+  }
+}

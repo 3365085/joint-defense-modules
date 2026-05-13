@@ -1,0 +1,131 @@
+{
+  "signals": {
+    "moire": {
+      "clean_mean": 0.06102381355031709,
+      "attack_mean": 0.029347585746944935,
+      "separation": -0.03167622780337215
+    },
+    "flow_gap": {
+      "clean_mean": 0.5711063258553551,
+      "attack_mean": 0.35845040919266896,
+      "separation": -0.21265591666268618
+    },
+    "color": {
+      "clean_mean": 0.31701449874103116,
+      "attack_mean": 0.32214675664223774,
+      "separation": 0.005132257901206583
+    },
+    "gradient": {
+      "clean_mean": 0.7426055394040982,
+      "attack_mean": 0.7820425321447096,
+      "separation": 0.03943699274061141
+    }
+  },
+  "clips": [
+    {
+      "clip": "adv_patch_attacked.mp4",
+      "frames": 600,
+      "n_rois_mean": 1.0066666666666666,
+      "moire_mean": 0.0,
+      "flow_gap_mean": 0.46891382852336394,
+      "color_mean": 0.44830548206965126,
+      "gradient_mean": 0.7259247506658236,
+      "moire_max": 0.0,
+      "flow_gap_max": 0.9363807439804077,
+      "color_max": 1.0,
+      "gradient_max": 0.7569422125816345,
+      "forward_ms_mean": 3.989765499912513,
+      "forward_ms_p95": 4.419029994824085
+    },
+    {
+      "clip": "clean_baseline.mp4",
+      "frames": 4548,
+      "n_rois_mean": 1.7302110817941954,
+      "moire_mean": 0.06102381355031709,
+      "flow_gap_mean": 0.5711063258553551,
+      "color_mean": 0.31701449874103116,
+      "gradient_mean": 0.7426055394040982,
+      "moire_max": 0.47061800956726074,
+      "flow_gap_max": 0.9975997805595398,
+      "color_max": 1.0,
+      "gradient_max": 0.9033899307250977,
+      "forward_ms_mean": 3.589593887412817,
+      "forward_ms_p95": 5.918444996495963
+    },
+    {
+      "clip": "glare_attacked.mp4",
+      "frames": 300,
+      "n_rois_mean": 1.0,
+      "moire_mean": 0.0,
+      "flow_gap_mean": 0.25817096992977895,
+      "color_mean": 0.6450455162922542,
+      "gradient_mean": 0.7977360145250956,
+      "moire_max": 0.0,
+      "flow_gap_max": 0.945190966129303,
+      "color_max": 0.8222963213920593,
+      "gradient_max": 0.8262635469436646,
+      "forward_ms_mean": 2.415454999936628,
+      "forward_ms_p95": 3.9934100015670997
+    },
+    {
+      "clip": "motion_blur_attacked.mp4",
+      "frames": 300,
+      "n_rois_mean": 2.74,
+      "moire_mean": 0.013702948391437531,
+      "flow_gap_mean": 0.3883886506881875,
+      "color_mean": 0.29006521979967753,
+      "gradient_mean": 0.8123962905009587,
+      "moire_max": 0.11038638651371002,
+      "flow_gap_max": 0.9012600779533386,
+      "color_max": 0.8310280442237854,
+      "gradient_max": 0.8365036249160767,
+      "forward_ms_mean": 3.373205999766166,
+      "forward_ms_p95": 5.465504998210236
+    },
+    {
+      "clip": "occlusion_attacked.mp4",
+      "frames": 300,
+      "n_rois_mean": 2.62,
+      "moire_mean": 0.09821492140491804,
+      "flow_gap_mean": 0.32027447088932,
+      "color_mean": 0.29802471823990345,
+      "gradient_mean": 0.8103075387080511,
+      "moire_max": 0.29357895255088806,
+      "flow_gap_max": 0.9439538717269897,
+      "color_max": 0.8493682742118835,
+      "gradient_max": 0.866448163986206,
+      "forward_ms_mean": 3.2788013334599477,
+      "forward_ms_p95": 4.342635001739836
+    },
+    {
+      "clip": "screen_spoof_attacked.mp4",
+      "frames": 2618,
+      "n_rois_mean": 1.8368983957219251,
+      "moire_mean": 0.026777551676636892,
+      "flow_gap_mean": 0.37634586457480945,
+      "color_mean": 0.017985466969810664,
+      "gradient_mean": 0.7398538209719909,
+      "moire_max": 0.3664211928844452,
+      "flow_gap_max": 0.8105356693267822,
+      "color_max": 0.6168566346168518,
+      "gradient_max": 0.8841769099235535,
+      "forward_ms_mean": 4.507007448393474,
+      "forward_ms_p95": 6.398319997606451
+    },
+    {
+      "clip": "visibility_degradation_attacked.mp4",
+      "frames": 300,
+      "n_rois_mean": 2.81,
+      "moire_mean": 0.03739009300867716,
+      "flow_gap_mean": 0.33860867055055377,
+      "color_mean": 0.23345413648212948,
+      "gradient_mean": 0.8060367774963378,
+      "moire_max": 0.16651198267936707,
+      "flow_gap_max": 0.9444514513015747,
+      "color_max": 0.8037523031234741,
+      "gradient_max": 0.8240736722946167,
+      "forward_ms_mean": 3.3931323334642607,
+      "forward_ms_p95": 4.554770005051978
+    }
+  ]
+}

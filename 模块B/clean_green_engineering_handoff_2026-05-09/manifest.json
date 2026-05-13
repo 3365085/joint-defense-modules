@@ -1,0 +1,46 @@
+{
+  "name": "clean_green_engineering_handoff_2026-05-09",
+  "created_for": "Model Security Gate current strongest engineering baseline",
+  "git_commit": "66957fb Reach green security gate baseline",
+  "final_model": "artifacts/current_best/best2_purified_semantic_fixed_2026-05-09.pt",
+  "poisoned_model": "repo/models/best_2_poisoned.pt",
+  "expected_status": "Security Gate Green, external max ASR about 0.0171 on included hard-suite val split",
+  "sections": {
+    "repo": {
+      "path": "repo",
+      "bytes": 23813818,
+      "mb": 22.711,
+      "files": 178
+    },
+    "artifacts": {
+      "path": "artifacts",
+      "bytes": 23732991,
+      "mb": 22.634,
+      "files": 6
+    },
+    "clean_val": {
+      "path": "data/helmet_head_yolo_val",
+      "bytes": 60700494,
+      "mb": 57.889,
+      "files": 801
+    },
+    "external_hard_suite_val": {
+      "path": "data/poison_benchmark_tuned_val",
+      "bytes": 52616585,
+      "mb": 50.179,
+      "files": 1005
+    },
+    "try_attack_data": {
+      "path": "data/try_attack_data",
+      "bytes": 686947,
+      "mb": 0.655,
+      "files": 7
+    },
+    "try_attack_data1": {
+      "path": "data/try_attack_data1",
+      "bytes": 703916,
+      "mb": 0.671,
+      "files": 6
+    }
+  }
+}

@@ -1,0 +1,6 @@
+path: D:/联合防御模块/模块B/clean_green_engineering_handoff_2026-05-09/data/helmet_head_yolo_val
+train: images/val
+val: images/val
+names:
+  0: helmet
+  1: head

@@ -1,0 +1,144 @@
+﻿pipeline: video_module_a
+
+inference:
+  backend: tensorrt
+  device: cuda:0
+  half: true
+  image_size: 640
+  confidence: 0.25
+  warmup_frames: 3
+  artifacts:
+    engine:
+      - baseline_training/runs/baseline_v2/weights/best_fp16_640.engine
+      - baseline_training/runs/baseline_v2/weights/best.engine
+    onnx:
+      - baseline_training/runs/baseline_v2/weights/best.onnx
+    pytorch:
+      - baseline_training/runs/baseline_v2/weights/best.pt
+      - baseline_training/runs/baseline_v2/weights/last.pt
+
+module_a:
+  require_gpu: true
+  device: cuda:0
+  frame_size: 640
+  keyframe_interval: 3
+  alert_window: 5
+  alert_trigger_count: 4
+  attack_state_hold_frames: 4
+  use_grid_when_no_roi: true
+  grid_roi_count: 4
+  roi_min_confidence: 0.25
+  roi_margin: 8
+  emit_roi_details: true
+  emit_roi_texture_details: false
+  emit_roi_temporal_details: true
+  emit_roi_motion_details: false
+  roi_temporal_burst_window: 5
+  roi_temporal_burst_trigger_count: 2
+  lbp_radius: 3
+  lbp_temporal_change_threshold: 0.25
+  texture_grid_size: 16
+  flow_backend: frame_diff_fast
+  flow_slow_backend: gpu_lk_lite_roi
+  target_flow_backend: flownetc_s
+  motion_grid_size: 16
+  motion_diff_threshold: 25.0
+  local_flow_ratio_trigger: 0.55
+  light_flow_enabled: true
+  light_flow_interval: 3
+  light_flow_size: 160
+  light_flow_window_size: 9
+  light_flow_grid_size: 16
+  light_flow_temporal_candidate: 0.025
+  light_flow_local_temporal_candidate: 0.18
+  light_flow_min_magnitude: 0.25
+  light_flow_residual_threshold: 0.75
+  light_flow_cell_ratio_threshold: 0.20
+  light_flow_score_region_normalizer: 8.0
+  light_flow_anomaly_trigger: 0.60
+  light_flow_score_trigger: 0.75
+  paired_light_flow_temporal_trigger: 0.55
+  static_image_enabled: true
+  static_image_target_labels:
+    - person
+    - helmet
+    - head
+  static_image_screen_labels:
+    - helmet
+    - head
+  static_image_patch_size: 64
+  static_image_min_similarity: 0.94
+  static_image_trigger_stable_count: 2
+  static_image_min_edge_mean: 0.038
+  static_image_screen_min_edge_mean: 0.018
+  static_image_min_center_motion: 0.0012
+  static_image_context_motion_threshold: 0.010
+  static_image_context_contrast_threshold: 1.6
+  static_image_min_roi_area: 8000
+  static_image_screen_min_roi_area: 450
+  static_image_screen_max_roi_area: 8000
+  static_image_screen_context_expand_ratio: 2.4
+  static_image_screen_min_context_edge_mean: 0.004
+  static_image_screen_min_context_std: 0.22
+  static_image_screen_min_line_score: 0.10
+  static_image_screen_max_roi_context_area_ratio: 0.42
+  static_image_screen_person_containment_threshold: 0.72
+  static_image_min_roi_confidence: 0.50
+  static_image_score_trigger: 0.80
+  static_image_edge_margin_px: 6
+  static_image_min_same_label_count: 2
+  static_image_max_person_area_ratio: 0.65
+  static_image_max_context_iou: 0.20
+  static_image_interval: 3
+  static_image_temporal_candidate: 0.015
+  static_image_local_temporal_candidate: 0.10
+  static_image_hold_frames: 5
+  source_authenticity_enabled: false
+  source_authenticity_interval: 3
+  source_authenticity_window: 30
+  source_authenticity_min_window: 8
+  source_authenticity_threshold: 0.40
+  source_authenticity_warning_window: 4
+  source_authenticity_warning_trigger_count: 2
+  source_authenticity_hold_frames: 10
+  blur_roi_energy_ratio_trigger: 0.55
+  blur_low_energy_ratio_trigger: 0.55
+  blur_low_energy_global_factor: 0.35
+  blur_min_roi_area: 900
+  blur_score_trigger: 0.32
+  paired_blur_temporal_trigger: 0.18
+  track_labels:
+    - person
+    - helmet
+    - head
+  track_iou_threshold: 0.12
+  track_center_distance_ratio: 0.55
+  track_high_confidence: 0.45
+  track_confidence_drop_trigger: 0.25
+  track_max_missing: 4
+  track_score_normalizer: 2.0
+  track_max_candidates_per_label: 4
+  track_max_tracks_per_label: 8
+  track_score_trigger: 0.50
+  paired_track_temporal_trigger: 0.18
+  paired_track_blur_trigger: 0.25
+  fusion_backend: classifier
+  classifier_artifact: experiments/configs/module_a_classifier_universal_yolov5_yolov8_v1.json
+  classifier_calibration_model: yolov8_v2
+  module_a_fusion_weights:
+    - 0.20
+    - 0.30
+    - 0.20
+    - 0.10
+    - 0.20
+  p_adv_threshold: 0.55
+  temporal_trigger: 0.03
+  local_temporal_trigger: 0.045
+  strong_temporal_trigger: 0.10
+  strong_local_temporal_trigger: 0.50
+  paired_local_temporal_trigger: 0.50
+  paired_local_flow_trigger: 0.60
+  benign_global_motion_filter_enabled: true
+  benign_global_motion_region_count_min: 500
+  benign_global_motion_overexposure_max: 0.02
+  glare_ratio_threshold: 0.06

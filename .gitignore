@@ -1,0 +1,26 @@
+﻿# Local environments and caches
+.pixi/
+**/.pixi/
+.pytest_cache/
+**/.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime outputs and diagnostics
+模块A/异常记录/
+模块A/baseline_training/
+模块B/**/outputs/
+模块B/**/runs/
+
+# Large local media that exceeds GitHub file limits
+模块A/samples/screen_spoof_attacked.mp4
+
+# Local logs/temp
+*.log
+DUMP*.tmp
+
+# Local training media outside module deliverables
+训练素材/

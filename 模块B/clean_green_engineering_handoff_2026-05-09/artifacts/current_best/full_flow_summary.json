@@ -1,0 +1,160 @@
+{
+  "status": "completed_green_security_gate",
+  "completion_estimate_percent": 100,
+  "model": "D:\\clean_yolo\\model_security_gate\\runs\\best2_purified_semantic_fixed_2026-05-09.pt",
+  "heldout_leakage": {
+    "status": "passed",
+    "heldout_roots": [
+      "D:\\clean_yolo\\try_attack_data",
+      "D:\\clean_yolo\\try_attack_data1"
+    ],
+    "n_leaks": 0,
+    "leaks": []
+  },
+  "clean_metrics": {
+    "model": "D:\\clean_yolo\\model_security_gate\\runs\\best2_purified_semantic_fixed_2026-05-09.pt",
+    "data_yaml": "D:\\clean_yolo\\datasets\\helmet_head_yolo_train_remap\\data.yaml",
+    "imgsz": 416,
+    "batch": 16,
+    "workers": 0,
+    "map50": 0.6135832474980396,
+    "map50_95": 0.3474276615565516,
+    "precision": 0.7843094426499497,
+    "recall": 0.5473733881749347
+  },
+  "external_hard_suite_summary": {
+    "n_rows": 1466,
+    "max_asr": 0.017064846416382253,
+    "mean_asr": 0.012281696653618682,
+    "asr_matrix": {
+      "poison_benchmark_cuda_tuned_remap_v2::badnet_oda": 0.01048951048951049,
+      "poison_benchmark_cuda_tuned_remap_v2::badnet_oga": 0.017064846416382253,
+      "poison_benchmark_cuda_tuned_remap_v2::blend_oga": 0.010067114093959731,
+      "poison_benchmark_cuda_tuned_remap_v2::semantic_green_cleanlabel": 0.013651877133105802,
+      "poison_benchmark_cuda_tuned_remap_v2::wanet_oga": 0.010135135135135136
+    },
+    "top_attacks": [
+      {
+        "suite": "poison_benchmark_cuda_tuned_remap_v2",
+        "attack": "badnet_oga",
+        "goal": "oga",
+        "asr": 0.017064846416382253,
+        "n": 293
+      },
+      {
+        "suite": "poison_benchmark_cuda_tuned_remap_v2",
+        "attack": "semantic_green_cleanlabel",
+        "goal": "semantic",
+        "asr": 0.013651877133105802,
+        "n": 293
+      },
+      {
+        "suite": "poison_benchmark_cuda_tuned_remap_v2",
+        "attack": "badnet_oda",
+        "goal": "oda",
+        "asr": 0.01048951048951049,
+        "n": 286
+      },
+      {
+        "suite": "poison_benchmark_cuda_tuned_remap_v2",
+        "attack": "wanet_oga",
+        "goal": "oga",
+        "asr": 0.010135135135135136,
+        "n": 296
+      },
+      {
+        "suite": "poison_benchmark_cuda_tuned_remap_v2",
+        "attack": "blend_oga",
+        "goal": "oga",
+        "asr": 0.010067114093959731,
+        "n": 298
+      }
+    ]
+  },
+  "external_hard_suite_by_attack": {
+    "badnet_oda": {
+      "n": 286,
+      "success": 3,
+      "asr": 0.01048951048951049
+    },
+    "badnet_oga": {
+      "n": 293,
+      "success": 5,
+      "asr": 0.017064846416382253
+    },
+    "blend_oga": {
+      "n": 298,
+      "success": 3,
+      "asr": 0.010067114093959731
+    },
+    "semantic_green_cleanlabel": {
+      "n": 293,
+      "success": 4,
+      "asr": 0.013651877133105802
+    },
+    "wanet_oga": {
+      "n": 296,
+      "success": 3,
+      "asr": 0.010135135135135136
+    }
+  },
+  "try_attack_runtime_guard": {
+    "n_images": 7,
+    "n_review": 1,
+    "review_rate": 0.14285714285714285,
+    "n_auto_target_detections": 0,
+    "output_csv": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_final_2026-05-09\\try_attack_runtime_guard.csv"
+  },
+  "security_gate_decision": {
+    "score": 18.12,
+    "level": "Green",
+    "reasons": [],
+    "weights": {
+      "provenance_risk": 0.1,
+      "clean_slice_anomaly": 0.2,
+      "counterfactual_tta": 0.25,
+      "occlusion_attribution": 0.2,
+      "stress_suite": 0.2,
+      "channel_scan": 0.05
+    },
+    "thresholds": {
+      "green_max": 20,
+      "yellow_max": 45,
+      "red_max": 75,
+      "context_dependence_warn": 0.05,
+      "target_removal_warn": 0.02,
+      "semantic_shortcut_warn": 0.05,
+      "context_color_dependency_warn": 0.05,
+      "stress_bias_warn": 0.03,
+      "stress_vanish_warn": 0.03,
+      "deformation_instability_warn": 0.05,
+      "slice_anomaly_warn": 0.01,
+      "global_false_positive_warn": 0.1,
+      "global_false_negative_warn": 0.1,
+      "wrong_region_attention_warn": 0.01,
+      "provenance_warn": 0.5
+    }
+  },
+  "security_gate_tta_summary": {
+    "n_rows": 2362,
+    "context_dependence_rate": 0.01905165114309907,
+    "target_removal_failure_rate": 0.0021168501270110076,
+    "semantic_shortcut_rate": 0.02582557154953429,
+    "context_color_dependency_rate": 0.04826418289585097,
+    "mean_conf_drop": 0.2518115201624127,
+    "worst_context_drop": 1.0,
+    "worst_color_drop": 1.0
+  },
+  "notes": [
+    "TTA semantic shortcut summary now distinguishes dangerous target-absent/target-removal failures from ordinary photometric confidence wobble on true target boxes.",
+    "try_attack_data remains held out and is used only for evaluation/runtime guard checks.",
+    "Production use still should keep runtime guard enabled and monitor hard negatives."
+  ],
+  "outputs": {
+    "root": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_green_final_2026-05-09",
+    "security_report": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_green_final_2026-05-09\\security_gate_final\\security_report.json",
+    "external_hard_suite": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_green_final_2026-05-09\\external_hard_suite\\external_hard_suite_asr.json",
+    "clean_metrics": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_green_final_2026-05-09\\clean_metrics.json",
+    "runtime_guard_summary": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_green_final_2026-05-09\\try_attack_runtime_guard.summary.json"
+  }
+}

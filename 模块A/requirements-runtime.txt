@@ -1,0 +1,5 @@
+PyYAML>=6.0
+opencv-python>=4.9
+onnxruntime-gpu>=1.18
+tensorrt>=10.0
+ultralytics>=8.3

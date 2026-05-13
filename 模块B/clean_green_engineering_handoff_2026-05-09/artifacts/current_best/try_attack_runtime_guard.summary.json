@@ -1,0 +1,7 @@
+{
+  "n_images": 7,
+  "n_review": 1,
+  "review_rate": 0.14285714285714285,
+  "n_auto_target_detections": 0,
+  "output_csv": "D:\\clean_yolo\\model_security_gate\\runs\\full_flow_final_2026-05-09\\try_attack_runtime_guard.csv"
+}

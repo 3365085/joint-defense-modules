@@ -1,0 +1,114 @@
+{
+  "config": "D:\\联合防御模块\\模块A\\experiments\\configs\\module_a_baseline.yaml",
+  "clean_n_frames": 4548,
+  "clean_p_adv_max": 0.9976,
+  "clean_p_adv_mean": 0.0037,
+  "attacked_clips": [
+    "glare_attacked.mp4",
+    "motion_blur_attacked.mp4",
+    "occlusion_attacked.mp4",
+    "visibility_degradation_attacked.mp4"
+  ],
+  "sweep": [
+    {
+      "threshold": 0.5,
+      "clean_false_positive_rate": 0.0022,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.5,
+        "motion_blur_attacked.mp4": 0.5167,
+        "occlusion_attacked.mp4": 0.56,
+        "visibility_degradation_attacked.mp4": 0.55
+      },
+      "attacked_detection_rate_mean": 0.5317
+    },
+    {
+      "threshold": 0.55,
+      "clean_false_positive_rate": 0.0022,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.5,
+        "motion_blur_attacked.mp4": 0.5133,
+        "occlusion_attacked.mp4": 0.56,
+        "visibility_degradation_attacked.mp4": 0.5433
+      },
+      "attacked_detection_rate_mean": 0.5292
+    },
+    {
+      "threshold": 0.6,
+      "clean_false_positive_rate": 0.002,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.5,
+        "motion_blur_attacked.mp4": 0.5133,
+        "occlusion_attacked.mp4": 0.56,
+        "visibility_degradation_attacked.mp4": 0.5367
+      },
+      "attacked_detection_rate_mean": 0.5275
+    },
+    {
+      "threshold": 0.65,
+      "clean_false_positive_rate": 0.002,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.5,
+        "motion_blur_attacked.mp4": 0.5133,
+        "occlusion_attacked.mp4": 0.56,
+        "visibility_degradation_attacked.mp4": 0.5333
+      },
+      "attacked_detection_rate_mean": 0.5267
+    },
+    {
+      "threshold": 0.7,
+      "clean_false_positive_rate": 0.002,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.5,
+        "motion_blur_attacked.mp4": 0.5133,
+        "occlusion_attacked.mp4": 0.56,
+        "visibility_degradation_attacked.mp4": 0.5333
+      },
+      "attacked_detection_rate_mean": 0.5267
+    },
+    {
+      "threshold": 0.75,
+      "clean_false_positive_rate": 0.0018,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.4967,
+        "motion_blur_attacked.mp4": 0.5133,
+        "occlusion_attacked.mp4": 0.56,
+        "visibility_degradation_attacked.mp4": 0.5333
+      },
+      "attacked_detection_rate_mean": 0.5258
+    },
+    {
+      "threshold": 0.8,
+      "clean_false_positive_rate": 0.0015,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.4933,
+        "motion_blur_attacked.mp4": 0.5133,
+        "occlusion_attacked.mp4": 0.56,
+        "visibility_degradation_attacked.mp4": 0.5333
+      },
+      "attacked_detection_rate_mean": 0.525
+    },
+    {
+      "threshold": 0.85,
+      "clean_false_positive_rate": 0.0013,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.4933,
+        "motion_blur_attacked.mp4": 0.51,
+        "occlusion_attacked.mp4": 0.56,
+        "visibility_degradation_attacked.mp4": 0.5167
+      },
+      "attacked_detection_rate_mean": 0.52
+    },
+    {
+      "threshold": 0.9,
+      "clean_false_positive_rate": 0.0013,
+      "attacked_detection_rate_per_clip": {
+        "glare_attacked.mp4": 0.4933,
+        "motion_blur_attacked.mp4": 0.51,
+        "occlusion_attacked.mp4": 0.5533,
+        "visibility_degradation_attacked.mp4": 0.5067
+      },
+      "attacked_detection_rate_mean": 0.5158
+    }
+  ],
+  "suggested_threshold_override": 0.9
+}

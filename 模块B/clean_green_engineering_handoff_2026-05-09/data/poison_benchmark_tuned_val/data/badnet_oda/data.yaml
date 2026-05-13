@@ -1,0 +1,6 @@
+path: .
+train: images/val
+val: images/val
+names:
+  0: helmet
+  1: head

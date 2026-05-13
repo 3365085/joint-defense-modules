@@ -3079,7 +3079,19 @@ class MonitorState:
                     frame_idx += 1
                     if realtime:
                         elapsed = time.perf_counter() - grabbed_at
-                        if elapsed < frame_period:
+                        if elapsed > frame_period * 1.25:
+                            # Latest-frame priority: when processing falls behind
+                            # the source cadence, discard buffered frames instead
+                            # of replaying them slowly. This preserves real-time
+                            # wall-clock behavior for MP4/RTSP/camera inputs.
+                            extra_drop = min(12, max(0, int(elapsed / max(frame_period, 1e-3)) - 1))
+                            for _ in range(extra_drop):
+                                try:
+                                    if not cap.grab():
+                                        break
+                                except Exception:
+                                    break
+                        elif elapsed < frame_period:
                             time.sleep(frame_period - elapsed)
         except Exception as exc:
             with self.condition:

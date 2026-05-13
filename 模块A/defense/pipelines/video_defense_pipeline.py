@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from defense.module_a import ModuleADetector, ModuleAInput
+from defense.module_a.backends.detector_backend import DetectionFrameResult
 from defense.module_a.backends import UltralyticsDetectorBackend
 from defense.module_a.roi_provider import DetectionROIProvider
 
@@ -71,10 +72,24 @@ class VideoDefensePipeline:
         )
         self.stream_source = stream_source
         self.frame_idx = 0
+        self._last_small_gray: np.ndarray | None = None
+        self._last_detections: Any | None = None
+        self._last_rois: list[Any] | None = None
+        self._last_detector_frame_idx: int = -1
+        self._temporal_reuse_threshold = float(
+            module_config.get("temporal_detector_reuse_threshold", 0.010)
+        )
+        self._temporal_reuse_max_gap = max(
+            1, int(module_config.get("temporal_detector_reuse_max_gap", 2))
+        )
 
     def reset(self) -> None:
         self.detector.reset()
         self.frame_idx = 0
+        self._last_small_gray = None
+        self._last_detections = None
+        self._last_rois = None
+        self._last_detector_frame_idx = -1
 
     def warmup(self, frames: int = 3) -> None:
         if frames <= 0:
@@ -85,6 +100,30 @@ class VideoDefensePipeline:
         self.reset()
 
     # ------------------------------------------------------------------ core
+
+    def _maybe_reuse_detections(self, frame_640: np.ndarray) -> tuple[Any | None, list[Any] | None, float, float]:
+        """Reuse the last detector output when the current frame barely changed.
+
+        Returns
+        -------
+        tuple
+            (detections_or_none, rois_or_none, detector_inference_ms, change_score)
+        """
+        if (
+            self._last_small_gray is None
+            or self._last_detections is None
+            or self._last_rois is None
+        ):
+            return None, None, 0.0, 1.0
+        gray = cv2.cvtColor(frame_640, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (160, 160), interpolation=cv2.INTER_AREA)
+        diff = cv2.absdiff(small, self._last_small_gray)
+        change_score = float(diff.mean() / 255.0)
+        gap = self.frame_idx - self._last_detector_frame_idx
+        if change_score <= self._temporal_reuse_threshold and gap <= self._temporal_reuse_max_gap:
+            return self._last_detections, self._last_rois, 0.0, change_score
+        self._last_small_gray = small
+        return None, None, 0.0, change_score
 
     def _run_detection(
         self,
@@ -105,10 +144,32 @@ class VideoDefensePipeline:
         """
         started = time.perf_counter()
         frame_640 = cv2.resize(frame, (640, 640))
-        detections = self.detector_backend.predict(frame_640)
-        rois = self.roi_provider.from_detections(
-            detections.boxes, detections.classes, detections.confidences
-        )
+        reused_detections, reused_rois, reused_detector_ms, change_score = self._maybe_reuse_detections(frame_640)
+        if reused_detections is not None and reused_rois is not None:
+            detections = DetectionFrameResult(
+                image=frame_640,
+                boxes=[list(box) for box in reused_detections.boxes],
+                classes=list(reused_detections.classes),
+                confidences=list(reused_detections.confidences),
+                names=reused_detections.names,
+                backend=reused_detections.backend,
+                artifact_path=reused_detections.artifact_path,
+                inference_ms=float(reused_detector_ms),
+                raw_result=None,
+            )
+            rois = reused_rois
+            detector_inference_ms = reused_detector_ms
+        else:
+            detections = self.detector_backend.predict(frame_640)
+            rois = self.roi_provider.from_detections(
+                detections.boxes, detections.classes, detections.confidences
+            )
+            gray_small = cv2.resize(cv2.cvtColor(frame_640, cv2.COLOR_BGR2GRAY), (160, 160), interpolation=cv2.INTER_AREA)
+            self._last_small_gray = gray_small
+            self._last_detections = detections
+            self._last_rois = rois
+            self._last_detector_frame_idx = self.frame_idx
+            detector_inference_ms = float(detections.inference_ms)
         module_result = self.detector.process(
             ModuleAInput(
                 frame=frame_640,
@@ -133,7 +194,7 @@ class VideoDefensePipeline:
             "confidences": [float(v) for v in detections.confidences[:20]],
             "backend": detections.backend,
             "artifact_path": detections.artifact_path,
-            "inference_ms": float(detections.inference_ms),
+            "inference_ms": float(detector_inference_ms),
         }
 
         # --- Triple-channel contract (p_adv / p_safety / p_synth) ---
@@ -176,7 +237,8 @@ class VideoDefensePipeline:
             info["p_synth"] = float(source_auth.get("p_synth"))
 
         info["detector_backend"] = detections.backend
-        info["detector_inference_ms"] = float(detections.inference_ms)
+        info["detector_inference_ms"] = float(detector_inference_ms)
+        info["detector_change_score"] = float(change_score)
 
         # --- Latency breakdown 预留结构（Requirements 5.1-5.6）---
         # 离线路径下 source_to_decode_ms / decode_to_process_ms / e2e_ms 没有真实

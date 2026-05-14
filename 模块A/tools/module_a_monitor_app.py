@@ -1072,7 +1072,7 @@ INDEX_HTML = r"""<!doctype html>
       setError("正在打开资源管理器...");
       $("browseBtn").disabled = true;
       try {
-        const data = await api("/api/pick-file", {mode: "video"});
+        const data = await api("/api/pick-file", {mode: "video", current_path: $("sourceValue").value || ""});
         if (data.path) {
           $("sourceValue").value = data.path;
           saveLastPaths();
@@ -1089,7 +1089,7 @@ INDEX_HTML = r"""<!doctype html>
       setError("正在打开模型文件选择器...");
       $("browseModelBtn").disabled = true;
       try {
-        const data = await api("/api/pick-file", {mode: "model"});
+        const data = await api("/api/pick-file", {mode: "model", current_path: $("customModelPath").value || ""});
         if (data.path) {
           $("customModelPath").value = data.path;
           saveLastPaths();
@@ -1529,7 +1529,8 @@ def _card_border(severity: str) -> str:
 
 def _build_p_adv_card(status: dict[str, Any]) -> dict[str, Any]:
     missing_reason = status.get("p_adv_missing_reason") or ""
-    score = status.get("p_adv")
+    score = status.get("p_adv_display", status.get("p_adv"))
+    score_value = _score_bar_ratio(score)
     alert_confirmed = bool(status.get("alert_confirmed", False))
     attack_state_active = bool(status.get("attack_state_active", False))
     reason_text = str(status.get("reason", ""))
@@ -1559,6 +1560,10 @@ def _build_p_adv_card(status: dict[str, Any]) -> dict[str, Any]:
     elif attack_state_active:
         state = "Warning"
         state_detail = "单帧触发命中，正在等待连续帧确认"
+        severity = "warning"
+    elif score_value >= 0.55:
+        state = "候选观察"
+        state_detail = "物理扰动概率升高，正在等待连续帧确认"
         severity = "warning"
     else:
         state = "OK"
@@ -1590,7 +1595,7 @@ def _build_p_safety_card(status: dict[str, Any]) -> dict[str, Any]:
     # ``info["details"]["module_a_features"]["static_media"]``.
     missing_reason = status.get("p_safety_missing_reason") or ""
     confirmed_score = status.get("a3b_score")
-    raw_live_score = status.get("a3b_live_score", confirmed_score)
+    raw_live_score = status.get("a3b_live_score_display", status.get("a3b_live_score", confirmed_score))
     triggered = bool(status.get("a3b_triggered", False))
     media_type = str(status.get("a3b_media_type", "normal"))
     trigger_count = int(status.get("a3b_trigger_count", 0))
@@ -2940,6 +2945,9 @@ class MonitorState:
                         else None,
                         "frame_idx": frame_idx,
                         "p_adv": float(p_adv_raw) if p_adv_raw is not None else None,
+                        "p_adv_display": float(info.get("p_adv_display", p_adv_raw or 0.0))
+                        if p_adv_raw is not None
+                        else None,
                         "p_adv_missing_reason": str(info.get("p_adv_missing_reason", "")),
                         "p_safety": info.get("p_safety"),
                         "p_safety_missing_reason": "静态媒介检测未启用"
@@ -2964,6 +2972,19 @@ class MonitorState:
                                     float(static_media_details.get("score", 0.0)),
                                     float(static_media_details.get("p_media", 0.0)),
                                     float(static_media_details.get("classifier_score", 0.0)),
+                                ),
+                            )
+                        ),
+                        "a3b_live_score_display": float(
+                            static_media_details.get(
+                                "live_score_display",
+                                static_media_details.get(
+                                    "live_score",
+                                    max(
+                                        float(static_media_details.get("score", 0.0)),
+                                        float(static_media_details.get("p_media", 0.0)),
+                                        float(static_media_details.get("classifier_score", 0.0)),
+                                    ),
                                 ),
                             )
                         ),
@@ -3326,8 +3347,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/pick-file":
                 mode = str(payload.get("mode", "video"))
+                current_path = str(payload.get("current_path", ""))
                 write_json_response(
-                    self, HTTPStatus.OK, {"ok": True, "path": pick_local_file(mode)}
+                    self, HTTPStatus.OK, {"ok": True, "path": pick_local_file(mode, current_path)}
                 )
                 return
             if parsed.path == "/api/test-source":
@@ -3437,17 +3459,29 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
 
-def pick_local_file(mode: str = "video") -> str:
+def pick_local_file(mode: str = "video", current_path: str = "") -> str:
     try:
         import tkinter as tk
         from tkinter import filedialog
     except Exception as exc:  # pragma: no cover - platform guard
         raise RuntimeError("当前环境无法打开本机文件选择窗口，请手动粘贴 MP4 路径。") from exc
 
-    if mode == "model":
-        initial_dir = PROJECT_ROOT / "baseline_training" / "runs"
-    else:
-        initial_dir = PROJECT_ROOT / "experiments"
+    current = Path(str(current_path).strip().strip("\"")).expanduser() if current_path else None
+    initial_dir: Path | None = None
+    if current is not None:
+        if current.is_file():
+            initial_dir = current.parent
+        elif current.is_dir():
+            initial_dir = current
+        elif str(current):
+            parent = current.parent
+            if parent.exists():
+                initial_dir = parent
+    if initial_dir is None:
+        if mode == "model":
+            initial_dir = PROJECT_ROOT / "baseline_training" / "runs"
+        else:
+            initial_dir = PROJECT_ROOT / "experiments"
     if not initial_dir.exists():
         initial_dir = PROJECT_ROOT
 

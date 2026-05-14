@@ -201,11 +201,19 @@ class VideoDefensePipeline:
         # 三路告警分路契约：每路独立写入，缺失时写 null + <branch>_missing_reason,
         # 不得用其他分路的值互填。参见 requirements.md 1.1 / 1.6。
         p_adv_value = getattr(module_result, "p_adv", None)
+        p_adv_display_value = (
+            info.get("details", {})
+            .get("module_a", {})
+            .get("p_adv_display")
+        )
         if p_adv_value is None:
             info["p_adv"] = None
             info["p_adv_missing_reason"] = "module_a_p_adv_unavailable"
         else:
             info["p_adv"] = float(p_adv_value)
+            info["p_adv_display"] = float(
+                p_adv_display_value if p_adv_display_value is not None else p_adv_value
+            )
 
         # p_safety 业务侧尚未接入 Module A pipeline，此处固定落 null + 原因。
         info["p_safety"] = None

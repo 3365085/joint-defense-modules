@@ -674,13 +674,26 @@ class FeatureBuilder:
                 and 0.15 <= t.target_area_ratio <= 1.25
             )
         )
+        x1, y1, x2, y2 = t.bbox
+        bbox_area = max(0.0, float(x2 - x1) * float(y2 - y1))
+        frame_area = 640.0 * 640.0
+        giant_background_candidate = bool(
+            bbox_area >= frame_area * 0.20
+            and (not target_related or t.target_area_ratio >= 1.80)
+        )
+        if giant_background_candidate:
+            target_related = False
+            p_media = min(p_media, 0.55)
         strong_media_evidence = (
             p_media >= 0.62
             and t.track_score >= 0.85
             and t.plane_score >= 0.35
             and not t.bg_suppressed
+            and not giant_background_candidate
         )
-        background_static_suppressed = bool(strong_media_evidence and not target_related)
+        background_static_suppressed = bool(
+            (strong_media_evidence and not target_related) or giant_background_candidate
+        )
 
         # Trigger threshold: require strong evidence from multiple signals.
         # track_score >= 0.7 ensures the candidate has been consistently tracked,
@@ -710,6 +723,7 @@ class FeatureBuilder:
             "target_related": bool(target_related),
             "strong_media_evidence": bool(strong_media_evidence),
             "background_static_suppressed": bool(background_static_suppressed),
+            "giant_background_candidate": bool(giant_background_candidate),
             "target_iou": float(t.target_iou),
             "target_proximity_score": float(t.target_proximity_score),
             "target_area_ratio": float(t.target_area_ratio),

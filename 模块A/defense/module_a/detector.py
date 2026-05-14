@@ -152,6 +152,10 @@ class ModuleADetector:
         )
         self.static_image_hold_remaining = 0
         self.static_image_hold_score = 0.0
+        self.a3b_display_alpha = float(module_config.get("a3b_display_alpha", 0.35))
+        self.a3b_display_score = 0.0
+        self.p_adv_display_alpha = float(module_config.get("p_adv_display_alpha", 0.35))
+        self.p_adv_display_score = 0.0
         self.static_media_replay_window = max(
             1, int(module_config.get("static_media_replay_window", 30))
         )
@@ -227,6 +231,10 @@ class ModuleADetector:
         self.static_media_occlusion_hold_remaining = 0
         self.static_media_occlusion_hold_score = 0.0
         self.static_media_occlusion_last_reason = "none"
+        self.static_media_display_alpha = float(module_config.get("static_media_display_alpha", 0.35))
+        self.a3b_display_score = 0.0
+        self.p_adv_display_score = 0.0
+        self.static_media_display_score = 0.0
         self.source_authenticity_enabled = bool(
             module_config.get("source_authenticity_enabled", False)
         )
@@ -261,8 +269,13 @@ class ModuleADetector:
             trigger_count=module_config.get("alert_trigger_count", 3),
             hold_frames=module_config.get("attack_state_hold_frames", 4),
         )
+        self.glare_ratio_threshold = float(module_config.get("glare_ratio_threshold", 0.06))
+        self.a3b_glare_suppress_frames = max(
+            0, int(module_config.get("a3b_glare_suppress_frames", 30))
+        )
+        self.a3b_glare_suppress_remaining = 0
         self.overexposure = GPUOverexposureDetector(
-            module_config.get("glare_ratio_threshold", 0.06)
+            self.glare_ratio_threshold
         )
         self.texture = GPULBPTextureAnalyzer(
             radius=module_config.get("lbp_radius", 3),
@@ -504,6 +517,10 @@ class ModuleADetector:
         self.static_media_occlusion_hold_remaining = 0
         self.static_media_occlusion_hold_score = 0.0
         self.static_media_occlusion_last_reason = "none"
+        self.a3b_display_score = 0.0
+        self.p_adv_display_score = 0.0
+        self.static_media_display_score = 0.0
+        self.a3b_glare_suppress_remaining = 0
 
     def process(self, item: ModuleAInput) -> ModuleAResult:
         started = time.perf_counter()
@@ -530,6 +547,13 @@ class ModuleADetector:
         # A1 — overexposure
         _t0 = time.perf_counter()
         overexposure = self.overexposure.compute(gray)
+        if (
+            bool(overexposure.get("is_glare", False))
+            or float(overexposure.get("ratio", 0.0)) >= self.glare_ratio_threshold
+        ):
+            self.a3b_glare_suppress_remaining = self.a3b_glare_suppress_frames
+        elif self.a3b_glare_suppress_remaining > 0:
+            self.a3b_glare_suppress_remaining -= 1
         a1_overexposure_ms = (time.perf_counter() - _t0) * 1000.0
 
         # A2 — LBP texture + temporal texture
@@ -586,6 +610,16 @@ class ModuleADetector:
                 rois if run_roi_pass else None,
                 context_rois=rois,
             )
+            if (
+                self.a3b_glare_suppress_remaining > 0
+            ) and bool(static_image.get("static_image_triggered", False)) and not bool(
+                static_image.get("p_media_triggered", False)
+            ):
+                static_image["static_image_triggered"] = False
+                static_image["static_image_score"] = min(
+                    float(static_image.get("static_image_score", 0.0)), 0.40
+                )
+                static_image["static_image_triggered_source"] = "physical_glare_suppressed"
             # Hold-last-value: when the ROI pass didn't run, the detector
             # returns zeros. Replace with the held score so downstream
             # fusion / display stays continuous.
@@ -605,7 +639,14 @@ class ModuleADetector:
                 float(static_image.get("p_media", 0.0)),
                 float(replay_state.get("p_media", 0.0)),
             )
-            static_image["static_image_live_score"] = live_score
+            self.static_media_display_score = self._ema(
+                self.static_media_display_score,
+                live_score,
+                self.static_media_display_alpha,
+            )
+            static_image["static_image_live_score_raw"] = live_score
+            static_image["static_image_live_score_display"] = float(self.static_media_display_score)
+            static_image["static_image_live_score"] = float(self.static_media_display_score)
             static_image["p_media_replay_state"] = replay_state
             static_image["p_media_fast_state"] = fast_state
             if fast_state["triggered"]:
@@ -720,6 +761,12 @@ class ModuleADetector:
                 float(fusion.get("p_adv", 0.0)),
                 float(classifier_result.get("classifier_p_adv", 0.0)),
             )
+        self.p_adv_display_score = self._ema(
+            self.p_adv_display_score,
+            float(fusion.get("p_adv", 0.0)),
+            self.p_adv_display_alpha,
+        )
+        fusion["p_adv_display"] = float(self.p_adv_display_score)
 
         # --- Target-anchored 判定（核心改动）---
         # 构建 static_image 信息供 target_anchored 使用
@@ -873,6 +920,16 @@ class ModuleADetector:
             timing_ms=timing_ms,
             details=details,
         )
+
+    @staticmethod
+    def _ema(previous: float, current: float, alpha: float) -> float:
+        """Fast-rise / slow-fall confidence smoothing for display scores."""
+        alpha = max(0.0, min(1.0, float(alpha)))
+        previous = float(previous) if previous is not None else 0.0
+        current = float(current)
+        if current >= previous:
+            return current
+        return previous + alpha * (current - previous)
 
     def _update_roi_temporal_burst(self, triggered: bool) -> bool:
         self.roi_temporal_history.append(1 if triggered else 0)
@@ -1229,10 +1286,16 @@ class ModuleADetector:
     ) -> dict[str, Any]:
         p_media = float(static_image.get("p_media", 0.0) or 0.0)
         live_score = float(static_image.get("static_image_live_score", p_media) or 0.0)
+        confirmed_media_lock = bool(
+            replay_state.get("triggered", False) or fast_state.get("triggered", False)
+        )
         triggered_now = bool(
-            static_image.get("static_image_triggered", False)
-            or replay_state.get("triggered", False)
-            or fast_state.get("triggered", False)
+            confirmed_media_lock
+            and (
+                static_image.get("static_image_triggered", False)
+                or replay_state.get("triggered", False)
+                or fast_state.get("triggered", False)
+            )
         )
         bbox_area = max(
             float(replay_state.get("bbox_area", 0.0) or 0.0),
@@ -1476,7 +1539,8 @@ class ModuleADetector:
             },
             "static_image": {
                 "score": float(motion.get("static_image_score", 0.0)),
-                "live_score": float(motion.get("static_image_live_score", motion.get("static_image_score", 0.0))),
+                "live_score": float(motion.get("static_image_live_score_raw", motion.get("static_image_score", 0.0))),
+                "live_score_display": float(motion.get("static_image_live_score_display", motion.get("static_image_live_score", motion.get("static_image_score", 0.0)))),
                 "triggered": bool(motion.get("static_image_triggered", False)),
                 "trigger_count": int(motion.get("static_image_trigger_count", 0)),
                 "patch_similarity": float(motion.get("static_image_patch_similarity", 0.0)),
@@ -1628,6 +1692,8 @@ class ModuleADetector:
             },
             "fusion": {
                 "p_adv": float(fusion["p_adv"]),
+                "p_adv_display": float(fusion.get("p_adv_display", fusion["p_adv"])),
+                "p_adv_raw": float(fusion["p_adv"]),
                 "threshold": float(fusion["threshold"]),
                 "backend": self.fusion_backend,
                 "reason": ",".join(fusion["reason_codes"]),
@@ -1782,6 +1848,8 @@ class ModuleADetector:
             },
             "physical_channel": {
                 "p_adv": float(fusion["p_adv"]),
+                "p_adv_display": float(fusion.get("p_adv_display", fusion["p_adv"])),
+                "p_adv_raw": float(fusion["p_adv"]),
                 "suspicious": bool(fusion["is_suspicious"]),
                 "reason_codes": list(fusion["reason_codes"]),
             },
@@ -1795,6 +1863,8 @@ class ModuleADetector:
             "module_a_features": feature_details,
             "module_a": {
                 "p_adv": float(fusion["p_adv"]),
+                "p_adv_display": float(fusion.get("p_adv_display", fusion["p_adv"])),
+                "p_adv_raw": float(fusion["p_adv"]),
                 "reason_codes": list(fusion["reason_codes"]),
                 "single_frame_suspicious": bool(fusion["is_suspicious"]),
             },

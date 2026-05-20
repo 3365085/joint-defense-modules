@@ -1,0 +1,1838 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Module A Monitor</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101214;
+      --panel: #181c20;
+      --panel-2: #20262b;
+      --line: #353d45;
+      --text: #f4f7fa;
+      --muted: #a9b4bf;
+      --accent: #46d39a;
+      --danger: #ff4d5e;
+      --warn: #ffc857;
+      --blue: #6bb8ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .app {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 16px;
+      min-height: 100vh;
+      padding: 16px;
+      align-items: start;
+    }
+    .videoShell, .side {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .videoShell {
+      min-width: 0;
+      align-self: start;
+    }
+    .videoHeader, .panelHeader {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 52px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-2);
+    }
+    .title {
+      font-size: 16px;
+      font-weight: 650;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+    .pill {
+      min-width: 74px;
+      text-align: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .pill.live { color: var(--accent); border-color: rgba(70, 211, 154, .45); }
+    .pill.alert { color: var(--danger); border-color: rgba(255, 77, 94, .6); }
+    .stage {
+      --stage-aspect: 16 / 9;
+      position: relative;
+      display: grid;
+      place-items: center;
+      min-height: 360px;
+      max-height: calc(100vh - 86px);
+      aspect-ratio: var(--stage-aspect);
+      background: #080a0c;
+      overflow: hidden;
+    }
+    .stage img,
+    .stage video,
+    .stage canvas {
+      grid-area: 1 / 1;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center center;
+      display: none;
+    }
+    .stage img[src] { display: block; }
+    .stage video { pointer-events: none; user-select: none; }
+    .stage video.activePreview { display: block; }
+    .stage canvas.activePreview {
+      display: block;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .empty {
+      display: grid;
+      gap: 8px;
+      place-items: center;
+      color: var(--muted);
+      font-size: 14px;
+      padding: 20px;
+      text-align: center;
+    }
+    .empty strong {
+      color: var(--text);
+      font-size: 18px;
+    }
+    .empty .hint {
+      max-width: 360px;
+      line-height: 1.7;
+    }
+    .side {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      max-height: calc(100vh - 32px);
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-gutter: stable;
+    }
+    .side > .panelHeader,
+    .side > .panel,
+    .side > .events {
+      flex: 0 0 auto;
+    }
+    .panel {
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    label {
+      display: block;
+      margin: 10px 0 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    input, select, button {
+      width: 100%;
+      height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #11161b;
+      color: var(--text);
+      font-size: 13px;
+      padding: 0 10px;
+      min-width: 0;
+    }
+    input { overflow: hidden; text-overflow: ellipsis; }
+    button {
+      cursor: pointer;
+      font-weight: 650;
+      background: #242c34;
+    }
+    button.primary { background: #1b5f46; border-color: #2a8a68; }
+    button.danger { background: #5e1d29; border-color: #9d3545; }
+    button.secondary { min-width: 86px; background: #27313a; border-color: #46535f; }
+    button:disabled { cursor: wait; opacity: .68; }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .fieldRow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .fieldRow.single { grid-template-columns: 1fr; }
+    .controlBar {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #11161b;
+    }
+    .controlBar .wide { grid-column: 1 / -1; }
+    .controlBar input[type="range"] {
+      padding: 0;
+      height: 28px;
+    }
+    .controlMeta {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .sourceHint {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .connectStatus {
+      min-height: 20px;
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .connectStatus.ok { color: var(--accent); }
+    .connectStatus.bad { color: var(--danger); }
+    .connectStatus.testing { color: var(--warn); }
+    .toggleGrid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #11161b;
+    }
+    .toggleLine {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 26px;
+      margin: 0;
+      color: var(--text);
+      font-size: 13px;
+    }
+    .toggleLine input {
+      width: 16px;
+      height: 16px;
+      flex: 0 0 auto;
+    }
+    .verdict {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+      background: #11161b;
+    }
+    .verdict b {
+      display: block;
+      font-size: 18px;
+      margin-bottom: 4px;
+    }
+    .verdict span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .verdict.alert {
+      border-color: rgba(255, 77, 94, .65);
+      background: rgba(255, 77, 94, .08);
+    }
+    .verdict.live {
+      border-color: rgba(70, 211, 154, .5);
+      background: rgba(70, 211, 154, .07);
+    }
+    .verdict.ppe-warn {
+      border-color: rgba(255, 200, 87, .72);
+      background: rgba(255, 200, 87, .09);
+    }
+    .verdict.ppe-ok {
+      border-color: rgba(107, 184, 255, .45);
+      background: rgba(107, 184, 255, .07);
+    }
+    /* ---------------------------------------------------------------
+       Three-card branch panel (Legacy visual style compatibility).
+
+       Each branch (p_adv / A3b) gets an independent card
+       with: title, score display, score bar, state label, reason text,
+       and a highlight border controlled by the card-<severity> class.
+    --------------------------------------------------------------- */
+    .branchCards {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .branchCard {
+      border: 2px solid var(--line);
+      border-radius: 10px;
+      padding: 12px 12px 10px;
+      background: #11161b;
+      transition: border-color .15s ease-in-out, background-color .15s ease-in-out;
+    }
+    .branchCard.card-idle {
+      border-color: var(--line);
+    }
+    .branchCard.card-warning {
+      border-color: rgba(255, 200, 87, .72);
+      background: rgba(255, 200, 87, .07);
+    }
+    .branchCard.card-confirmed {
+      border-color: rgba(255, 77, 94, .72);
+      background: rgba(255, 77, 94, .10);
+    }
+    .branchCard.card-suppressed {
+      border-color: rgba(107, 184, 255, .55);
+      background: rgba(107, 184, 255, .06);
+    }
+    .branchCard.card-missing {
+      border-color: rgba(169, 180, 191, .30);
+      background: #10141a;
+      opacity: .85;
+    }
+    .branchCard .cardHeader {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .branchCard .cardTitle {
+      font-size: 14px;
+      font-weight: 650;
+      color: var(--text);
+    }
+    .branchCard .cardState {
+      font-size: 12px;
+      color: var(--muted);
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #181d22;
+    }
+    .branchCard.card-warning .cardState {
+      color: #ffd48a;
+      border-color: rgba(255, 200, 87, .55);
+    }
+    .branchCard.card-confirmed .cardState {
+      color: #ffd0d5;
+      border-color: rgba(255, 77, 94, .65);
+    }
+    .branchCard.card-suppressed .cardState {
+      color: #cfe7ff;
+      border-color: rgba(107, 184, 255, .55);
+    }
+    .branchCard.card-missing .cardState {
+      color: var(--muted);
+    }
+    .branchCard .cardScoreRow {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin: 4px 0;
+    }
+    .branchCard .cardScore {
+      font-size: 22px;
+      line-height: 1.1;
+      font-weight: 650;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .branchCard .cardBadges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .branchCard .cardBadge {
+      font-size: 11px;
+      color: #cfe7ff;
+      border: 1px solid rgba(107, 184, 255, .45);
+      background: rgba(107, 184, 255, .08);
+      padding: 2px 7px;
+      border-radius: 999px;
+    }
+    .branchCard .cardBar {
+      position: relative;
+      width: 100%;
+      height: 6px;
+      border-radius: 4px;
+      background: #1d242b;
+      overflow: hidden;
+      margin-top: 2px;
+    }
+    .branchCard .cardBarFill {
+      position: absolute;
+      top: 0; left: 0; bottom: 0;
+      width: 0%;
+      background: var(--muted);
+      transition: width .15s ease-out, background-color .15s ease-out;
+    }
+    .branchCard.card-warning .cardBarFill { background: var(--warn); }
+    .branchCard.card-confirmed .cardBarFill { background: var(--danger); }
+    .branchCard.card-suppressed .cardBarFill { background: var(--blue); }
+    .branchCard.card-idle .cardBarFill { background: var(--accent); }
+    .branchCard.card-missing .cardBarFill { background: transparent; }
+    .branchCard .cardDetail {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.55;
+      margin-top: 6px;
+      overflow-wrap: anywhere;
+    }
+    .branchCard .cardReason {
+      font-size: 12px;
+      color: var(--text);
+      line-height: 1.55;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .metric {
+      min-height: 62px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #11161b;
+    }
+    .metric b {
+      display: block;
+      font-size: 20px;
+      line-height: 24px;
+    }
+    .metric span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .events {
+      overflow: visible;
+      max-height: none;
+      min-height: 0;
+      padding: 10px 14px 14px;
+    }
+    .event {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      margin-bottom: 8px;
+      background: #11161b;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .event.alert { border-color: rgba(255, 77, 94, .48); }
+    .event.ppe { border-color: rgba(255, 200, 87, .58); }
+    .event strong {
+      display: block;
+      color: var(--text);
+      margin-bottom: 3px;
+      font-size: 14px;
+    }
+    .event .main {
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.5;
+      margin: 6px 0 8px;
+    }
+    .event .sub {
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 7px;
+      color: #dce7f2;
+      background: #20262b;
+      font-size: 11px;
+    }
+    .chip.danger { color: #ffd9dd; border-color: rgba(255,77,94,.5); }
+    .chip.warn { color: #fff0c4; border-color: rgba(255,200,87,.58); }
+    .evidenceLinks {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .evidenceLinks a, .evidenceLinks span {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 5px 8px;
+      color: #cfe5ff;
+      text-decoration: none;
+      background: #17212a;
+      font-size: 12px;
+    }
+    .evidenceLinks span { color: var(--muted); }
+    details {
+      margin-top: 8px;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+    summary { cursor: pointer; }
+    code {
+      display: block;
+      margin-top: 6px;
+      color: #b8c7d6;
+      line-height: 1.45;
+    }
+    .err {
+      margin-top: 10px;
+      min-height: 18px;
+      color: var(--danger);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 980px) {
+      .app {
+        grid-template-columns: 1fr;
+        gap: 10px;
+        min-height: auto;
+        padding: 8px;
+      }
+      .videoHeader, .panelHeader {
+        min-height: 46px;
+        padding: 8px 10px;
+      }
+      .title { font-size: 15px; }
+      .pill {
+        min-width: auto;
+        padding: 4px 8px;
+      }
+      .stage {
+        min-height: 210px;
+        max-height: min(70vh, 620px);
+      }
+      .panel { padding: 10px; }
+      .events { padding: 8px 10px 12px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    /* Collapsible section styles */
+    .collapsible-header {
+      cursor: pointer;
+      user-select: none;
+    }
+    .collapsible-header .collapse-icon {
+      display: inline-block;
+      transition: transform .15s ease;
+      font-size: 11px;
+    }
+    .collapsible-header.collapsed .collapse-icon {
+      transform: rotate(-90deg);
+    }
+    .collapsible-content {
+      display: block;
+      max-height: none;
+      overflow: visible;
+    }
+    .collapsible-content.collapsed {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="videoShell">
+      <div class="videoHeader">
+        <div class="title">模块A监控台</div>
+        <div id="statePill" class="pill">未运行</div>
+      </div>
+      <div class="stage">
+        <img id="stream" alt="实时检测画面" />
+        <canvas id="overlayCanvas"></canvas>
+        <div id="empty" class="empty">
+          <strong>等待输入源</strong>
+          <div class="hint">选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。</div>
+        </div>
+      </div>
+    </section>
+    <aside class="side">
+      <div class="panelHeader">
+        <div class="title">输入源</div>
+        <div id="profilePill" class="pill">全速GPU</div>
+      </div>
+      <section class="panel">
+        <label>输入类型</label>
+        <select id="sourceType">
+          <option value="file">MP4 文件路径</option>
+          <option value="rtsp">RTSP / HTTP 视频流</option>
+          <option value="camera">本机摄像头编号</option>
+        </select>
+        <label id="sourceValueLabel">MP4 文件</label>
+        <div id="pathRow" class="fieldRow">
+          <input id="sourceValue" value="D:\security_project_d\素材\手机随意录制的视频\固定镜头室外视频.mp4" />
+          <button class="secondary" id="browseBtn" type="button">浏览</button>
+          <button class="secondary" id="testSourceBtn" type="button" style="display:none;">连通检测</button>
+        </div>
+        <div id="cameraRow" class="fieldRow" style="display:none;">
+          <select id="cameraSelect"></select>
+          <button class="secondary" id="scanBtn" type="button">扫描</button>
+        </div>
+        <div id="sourceHint" class="sourceHint">点击“浏览”可打开资源管理器选择本机 MP4，也可以手动粘贴路径。</div>
+        <div id="connectionStatus" class="connectStatus"></div>
+        <label>算力档位</label>
+        <select id="profile">
+          <option value="desktop_rtx">全速GPU（TensorRT）</option>
+          <option value="desktop_debug_onnx">均衡GPU（ONNX调试）</option>
+          <option value="edge_fast">边缘ONNX（兼容）</option>
+        </select>
+        <label>检测模型</label>
+        <div class="toggleGrid">
+          <label class="toggleLine">
+            <input id="enableCustomModel" type="checkbox" />
+            使用自定义模型
+          </label>
+        </div>
+        <div id="customModelPanel" style="display:none;">
+          <label>模型文件</label>
+          <div class="fieldRow">
+            <input id="customModelPath" value="" placeholder="选择 .engine / .onnx / .pt" />
+            <button class="secondary" id="browseModelBtn" type="button">浏览</button>
+          </div>
+          <label>模型后端</label>
+          <select id="customModelBackend">
+            <option value="auto">自动识别后端</option>
+            <option value="tensorrt">TensorRT Engine</option>
+            <option value="onnx">ONNX Runtime</option>
+            <option value="pytorch">PyTorch</option>
+          </select>
+          <label>模型类型</label>
+          <select id="customModelFamily">
+            <option value="ultralytics">Ultralytics YOLOv8/YOLO11</option>
+            <option value="yolov5">原版 YOLOv5</option>
+          </select>
+          <div class="sourceHint">自定义模型只替换目标检测器，A1-A4 和 A3b 静态媒介检测仍使用当前模块参数。</div>
+        </div>
+        <div class="sourceHint">
+          <span id="realtimeText">MP4预览固定为 1.0x；检测由后端输入源异步处理。</span>
+        </div>
+
+        <section class="panel" id="modelSecurityPanel" data-testid="model-security-panel" style="margin-top:12px;">
+          <div class="panelHeader" style="padding:0 0 8px 0;">
+            <div class="title">Model Security</div>
+            <div id="modelSecurityPill" class="pill">unknown</div>
+          </div>
+          <div class="sourceHint" id="modelSecuritySummary">模型可信状态尚未检查。</div>
+          <div class="metrics" style="grid-template-columns: repeat(2, 1fr); margin-top:10px;">
+            <div class="metric"><b id="modelSecurityRisk">--</b><span>risk score</span></div>
+            <div class="metric"><b id="modelSecurityScanTime">--</b><span>last scan</span></div>
+          </div>
+          <div class="sourceHint" id="modelSecurityFingerprint" style="word-break:break-all; margin-top:8px;">fingerprint: --</div>
+          <div class="row" style="margin-top:10px;">
+            <button class="secondary" id="runModelSecurityScanBtn" type="button">Run B Scan</button>
+            <button class="secondary" id="viewModelSecurityReportBtn" type="button">View Report</button>
+          </div>
+        </section>
+        <label>画面叠加</label>
+        <div class="toggleGrid">
+          <label class="toggleLine"><input id="showBoxes" type="checkbox" checked />显示目标框和置信度</label>
+          <label class="toggleLine"><input id="showModuleHud" type="checkbox" checked />显示模块A状态文字</label>
+          <label class="toggleLine"><input id="showPpeHud" type="checkbox" checked />显示安全帽画面提示</label>
+        </div>
+        <label>检测功能</label>
+        <div class="toggleGrid">
+          <label class="toggleLine"><input id="enableStaticImage" type="checkbox" checked />翻拍/假目标检测（A3b）</label>
+        </div>
+        <div class="row">
+          <button class="primary" id="startBtn">开始检测</button>
+          <button class="danger" id="stopBtn">停止</button>
+        </div>
+        <div class="controlBar" id="runControls">
+          <button class="secondary" id="playPauseBtn" type="button">暂停</button>
+          <select id="speedSelect">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1.0x</option>
+            <option value="1.5">1.5x</option>
+            <option value="2">2.0x</option>
+          </select>
+          <input class="wide" id="seekSlider" type="range" min="0" max="0" step="0.1" value="0" />
+          <div class="controlMeta wide">
+            <span id="clockText">0.0s / 0.0s</span>
+            <span id="pipelineText">idle</span>
+          </div>
+        </div>
+        <div class="err" id="error"></div>
+      </section>
+      <section class="panel">
+        <div id="branchCards" class="branchCards" data-testid="branch-cards">
+          <div class="branchCard card-idle" data-branch="p_adv" data-testid="branch-card-p_adv">
+            <div class="cardHeader">
+              <div class="cardTitle">物理对抗扰动（p_adv）</div>
+              <div class="cardState">系统待机</div>
+            </div>
+            <div class="cardScoreRow">
+              <div class="cardScore">--</div>
+              <div class="cardBadges"></div>
+            </div>
+            <div class="cardBar"><div class="cardBarFill" style="width:0%"></div></div>
+            <div class="cardDetail">尚未开始检测。</div>
+            <div class="cardReason"></div>
+          </div>
+          <div class="branchCard card-idle" data-branch="p_safety" data-testid="branch-card-p_safety">
+            <div class="cardHeader">
+              <div class="cardTitle">翻拍/假目标检测（A3b）</div>
+              <div class="cardState">系统待机</div>
+            </div>
+            <div class="cardScoreRow">
+              <div class="cardScore">--</div>
+              <div class="cardBadges"></div>
+            </div>
+            <div class="cardBar"><div class="cardBarFill" style="width:0%"></div></div>
+            <div class="cardDetail">检测画面中是否出现屏幕翻拍、照片等非真人目标。</div>
+            <div class="cardReason"></div>
+          </div>
+        </div>
+        <div class="metrics">
+          <div class="metric"><b id="frame">0</b><span>当前帧</span></div>
+          <div class="metric"><b id="pAdv">0.000</b><span>攻击概率</span></div>
+          <div class="metric"><b id="timing">0.0</b><span>处理耗时 ms</span></div>
+          <div class="metric"><b id="alerts">0</b><span>模块A告警</span></div>
+          <div class="metric"><b id="ppeAlerts">0</b><span>安全帽告警</span></div>
+          <div class="metric"><b id="sourceAlerts">0</b><span>A3b警告</span></div>
+          <div class="metric"><b id="ppeCounts">0/0</b><span>人员/安全帽</span></div>
+        </div>
+      </section>
+      <div class="panelHeader collapsible-header" onclick="toggleSection(this)">
+        <div class="title"><span class="collapse-icon">▼</span> 模块A扰动告警</div>
+        <div id="backendPill" class="pill">-</div>
+      </div>
+      <section class="events collapsible-content" id="events"></section>
+      <div class="panelHeader collapsible-header" onclick="toggleSection(this)">
+        <div class="title"><span class="collapse-icon">▼</span> 安全帽业务告警</div>
+        <div id="ppePill" class="pill">独立通道</div>
+      </div>
+      <section class="events collapsible-content" id="ppeEvents"></section>
+      <div class="panelHeader collapsible-header" onclick="toggleSection(this)">
+        <div class="title"><span class="collapse-icon">▼</span> A3b警告记录</div>
+        <div id="sourcePill" class="pill">A3b通道</div>
+      </div>
+      <section class="events collapsible-content" id="sourceEvents"></section>
+    </aside>
+  </main>  <script src="/static/overlay_timeline.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let streamNonce = 0;
+    let cameraDevicesLoaded = false;
+    let lastOverlayStatus = null;
+    let overlayTimeline = new OverlayTimeline({ maxItems: 600 });
+    let overlayLoopStarted = false;
+    let startInFlight = false;
+    let previewStarting = false;
+    let overlayPollStarted = false;
+    let overlayPollingRunId = 0;
+    let lastOverlaySeq = 0;
+    let activePreviewRunId = 0;
+    let seekControlInFlight = false;
+    let lastControlRunId = 0;
+    let refreshTimer = null;
+    let customModelDraftDirty = false;
+    const refreshIntervals = { running: 300, idle: 1200, error: 2000 };
+    function toggleSection(headerEl) {
+      headerEl.classList.toggle("collapsed");
+      const content = headerEl.nextElementSibling;
+      if (content) content.classList.toggle("collapsed");
+    }
+
+    const profileLabels = {
+      desktop_rtx: "全速GPU",
+      desktop_debug_onnx: "均衡GPU",
+      edge_fast: "边缘ONNX",
+    };
+
+    function profileLabel(value) {
+      return profileLabels[value] || value || "-";
+    }
+    function setError(text) {
+      $("error").textContent = text || "";
+    }
+
+    function escapeHtml(text) {
+      return String(text || "").replace(/[&<>"]/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+      }[ch] || ch));
+    }
+
+    function showEmpty(title, hint) {
+      const node = $("empty");
+      node.style.display = "grid";
+      node.innerHTML = `<strong>${escapeHtml(title)}</strong><div class="hint">${escapeHtml(hint || "")}</div>`;
+    }
+
+    function setStageAspect(width, height) {
+      const w = Number(width);
+      const h = Number(height);
+      if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return false;
+      const aspect = Math.max(0.25, Math.min(6, w / h));
+      $("empty").parentElement.style.setProperty("--stage-aspect", `${aspect}`);
+      return true;
+    }
+
+    function resetStageAspect() {
+      setStageAspect(16, 9);
+    }
+
+    function updateStageAspectFromMedia(media) {
+      if (!media) return false;
+      const width = Number(media.videoWidth || media.naturalWidth || 0);
+      const height = Number(media.videoHeight || media.naturalHeight || 0);
+      return setStageAspect(width, height);
+    }
+
+    function syncActiveStageAspect() {
+      const stream = $("stream");
+      if (stream.getAttribute("src") && updateStageAspectFromMedia(stream)) return;
+    }
+
+    function setConnectionStatus(text, state) {
+      const node = $("connectionStatus");
+      node.textContent = text || "";
+      node.className = "connectStatus " + (state || "");
+    }
+
+    function reasonTags(reason) {
+      const text = reason || "";
+      const tags = [];
+      const add = (key, label) => { if (text.includes(key) && !tags.includes(label)) tags.push(label); };
+      add("overexposure", "强光/过曝");
+      add("temporal_texture_change", "时序纹理突变");
+      add("local_temporal_texture_change", "局部纹理突变");
+      add("motion_artifact", "运动伪影");
+      add("paired_temporal_flow_change", "光流不一致");
+      add("light_flow", "轻光流异常");
+      add("blur", "清晰度退化");
+      add("track_consistency_drop", "目标轨迹异常");
+      add("classifier_adv", "分类器确认");
+      return tags.length ? tags : ["模块A确认"];
+    }
+
+    function reasonSummary(reason) {
+      const tags = reasonTags(reason);
+      const core = tags.filter((tag) => tag !== "分类器确认");
+      if (!reason) return "模块A已连续触发，建议复核该时间段。";
+      return "检测到" + core.slice(0, 3).join("、") + "，已形成连续帧确认告警。";
+    }
+
+    function reasonText(reason) {
+      if (!reason) return "";
+      return reasonTags(reason).join("、");
+    }
+
+    function stateText(status) {
+      if (status.alert_confirmed) return ["确认告警", "检测到疑似物理扰动，建议复核画面与事件列表。", "alert"];
+      if (status.running && !status.detector_ready) return ["初始化中", "正在加载检测器。", ""];
+      if (status.running && status.playback_paused) return ["已暂停", "后端源时钟已暂停，检测队列保持 latest-only。", ""];
+      if (status.running && status.preview_mode === "source_waiting_for_frames") return ["等待帧", "输入源暂时无新帧，预览线程不会阻塞检测。", ""];
+      if (status.running && !status.first_detection_ready) return ["首帧检测", "后端预览已启动，检测线程正在生成首个结果。", ""];
+      if (status.running) return ["检测中", "视频流正在分析，暂无确认告警。", "live"];
+      if (status.source_ended) return ["播放结束", "MP4 已到达末尾，可重新开始检测。", ""];
+      if ((status.frame_idx || 0) > 0) return ["已停止", "上一次检测已结束，可切换输入源重新开始。", ""];
+      return ["系统待机", "尚未开始检测。", ""];
+    }
+    function stopOverlayPolling() {
+      overlayPollingRunId = 0;
+      overlayPollStarted = false;
+    }
+
+    function resetOverlayTimeline() {
+      if (overlayTimeline && typeof overlayTimeline.clear === "function") overlayTimeline.clear();
+      lastOverlayStatus = null;
+      lastOverlaySeq = 0;
+    }
+
+    function syncOverlayTimingFromStatus(status) {
+      if (!status) return;
+      overlayMaxAgeMs = Number(status.overlay_max_age_ms || overlayMaxAgeMs || 950);
+      overlayMatchWindowMs = Number(status.overlay_match_window_ms || overlayMatchWindowMs || 180);
+      overlayHoldMs = Number(status.overlay_hold_ms || overlayHoldMs || 550);
+      overlayInterpolateMs = Number(status.overlay_interpolate_ms || overlayInterpolateMs || 400);
+    }
+
+    function hideAllPreview() {
+      stopOverlayPolling();
+      resetOverlayTimeline();
+      previewStarting = false;
+      activePreviewRunId = 0;
+      $("stream").removeAttribute("src");
+      $("stream").removeAttribute("data-run-id");
+      $("stream").style.display = "none";
+      $("overlayCanvas").classList.remove("activePreview");
+      const ctx = $("overlayCanvas").getContext("2d");
+      ctx.clearRect(0, 0, $("overlayCanvas").width, $("overlayCanvas").height);
+      resetStageAspect();
+    }
+
+    function stopEndedPreview() {
+      stopOverlayPolling();
+      previewStarting = false;
+      activePreviewRunId = 0;
+      $("stream").removeAttribute("src");
+      $("stream").removeAttribute("data-run-id");
+      $("stream").style.display = "none";
+      $("overlayCanvas").classList.remove("activePreview");
+    }
+
+    function startMjpegPreview(previewStatus) {
+      resetOverlayTimeline();
+      streamNonce += 1;
+      const runId = Number(previewStatus?.run_id || lastOverlayStatus?.run_id || 0);
+      activePreviewRunId = runId;
+      $("empty").style.display = "none";
+      $("overlayCanvas").classList.remove("activePreview");
+      const sizingStatus = previewStatus || lastOverlayStatus || {};
+      if (sizingStatus.preview_width && sizingStatus.preview_height) {
+        setStageAspect(Number(sizingStatus.preview_width), Number(sizingStatus.preview_height));
+      } else {
+        resetStageAspect();
+      }
+      const streamPath = runId
+        ? `/api/runs/${runId}/preview.mjpg?nonce=${streamNonce}`
+        : `/stream.mjpg?nonce=${streamNonce}`;
+      $("stream").setAttribute("data-run-id", String(runId || ""));
+      $("stream").src = streamPath;
+      $("stream").style.display = "block";
+      if (runId) startOverlayPolling(runId);
+    }
+
+    function ensurePreview(status) {
+      const runId = Number(status?.run_id || 0);
+      const streamRunId = Number($("stream").getAttribute("data-run-id") || activePreviewRunId || 0);
+      const streamActive = !!$("stream").getAttribute("src") && (!runId || !streamRunId || streamRunId === runId);
+      if ($("stream").getAttribute("src") && runId && streamRunId && streamRunId !== runId) {
+        $("stream").removeAttribute("src");
+        $("stream").removeAttribute("data-run-id");
+        activePreviewRunId = 0;
+      }
+      if (!(status.running || (status.frame_idx || 0) > 0 || status.source_ended)) return;
+
+      if (status.source_ended) {
+        stopEndedPreview();
+        showEmpty("播放结束", "MP4 已到达末尾，检测资源已释放，可重新开始检测。");
+        return;
+      }
+
+      if (status.running && !status.ready_for_preview) {
+        if (!streamActive) {
+        showEmpty("正在初始化检测", "正在加载模型/引擎并等待首帧检测结果；不会先播放没有检测框的视频。");
+        }
+        return;
+      }
+
+      if (!streamActive && (status.running || status.ready_for_preview)) {
+        startMjpegPreview(status);
+      }
+    }
+
+    function resizeOverlayCanvas() {
+      syncActiveStageAspect();
+      const canvas = $("overlayCanvas");
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.round(rect.width * dpr));
+      const height = Math.max(1, Math.round(rect.height * dpr));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      return { width, height, dpr };
+    }
+
+    function appendOverlayStatus(status) {
+      if (!status || !Array.isArray(status.ppe_tracks)) return;
+      const videoTime = Number(status.video_time_s);
+      if (!Number.isFinite(videoTime)) return;
+      const seq = Number(status.overlay_seq ?? status.frame_idx ?? 0);
+      const record = Object.assign({}, status, {
+        seq,
+        overlay_seq: seq,
+        video_time_s: videoTime,
+        ppe_tracks: status.ppe_tracks || [],
+        frame_idx: Number(status.frame_idx || 0),
+        timing_ms: Number(status.timing_ms || 0),
+        p_adv: Number(status.p_adv || 0),
+        ppe_person_count: Number(status.ppe_person_count || 0),
+        ppe_helmet_count: Number(status.ppe_helmet_count || 0),
+        ppe_head_count: Number(status.ppe_head_count || 0),
+        ppe_missing_helmet_count: Number(status.ppe_missing_helmet_count || 0),
+        display_options: status.display_options || {},
+      });
+      overlayTimeline.push(record);
+    }
+
+    function latestOverlayStatusRecord() {
+      const items = Array.isArray(overlayTimeline.items) ? overlayTimeline.items : [];
+      if (!items.length) return null;
+      return items.reduce((best, item) => {
+        const bestSeq = Number(best?.overlay_seq ?? best?.seq ?? -1);
+        const itemSeq = Number(item?.overlay_seq ?? item?.seq ?? -1);
+        return itemSeq >= bestSeq ? item : best;
+      }, null);
+    }
+
+    function mergeOverlayStatusForPanel(status) {
+      const base = status || {};
+      const latest = latestOverlayStatusRecord();
+      if (!latest) return base;
+      const runId = Number(base.run_id || activePreviewRunId || 0);
+      const latestRunId = Number(latest.run_id || 0);
+      if (runId && latestRunId && latestRunId !== runId) return base;
+      const statusSeq = Number(base.overlay_seq || 0);
+      const latestSeq = Number(latest.overlay_seq || latest.seq || 0);
+      const statusFrame = Number(base.frame_idx || 0);
+      const latestFrame = Number(latest.frame_idx || 0);
+      if (latestSeq < statusSeq && latestFrame <= statusFrame) return base;
+      const merged = Object.assign({}, base, latest, {
+        run_id: runId || latestRunId,
+        running: base.source_ended ? false : (base.running || activePreviewRunId === (runId || latestRunId)),
+        source_ended: !!base.source_ended,
+        recent_events: base.recent_events || [],
+        recent_ppe_events: base.recent_ppe_events || [],
+        recent_source_auth_events: base.recent_source_auth_events || [],
+        source_duration_s: base.source_duration_s || latest.source_duration_s || 0,
+        source_frame_count: base.source_frame_count || latest.source_frame_count || 0,
+        preview_seq: base.preview_seq || 0,
+        preview_fps: base.preview_fps || 0,
+        display_options: base.display_options || latest.display_options || {},
+        feature_options: base.feature_options || {},
+        custom_model: base.custom_model || {},
+        error: base.error || "",
+      });
+      if (!Array.isArray(merged.branch_cards) || !merged.branch_cards.length) {
+        merged.branch_cards = base.branch_cards || [];
+      }
+      return merged;
+    }
+
+    function selectOverlayRecord(videoTime) {
+      if (!Number.isFinite(videoTime)) return null;
+      return overlayTimeline.select(videoTime, {
+        matchWindowSec: Math.max(0.02, Number(overlayMatchWindowMs || 180) / 1000.0),
+        interpolateSec: Math.max(0, Number(overlayInterpolateMs || 400) / 1000.0),
+        holdSec: Math.max(0, Number(overlayHoldMs || 550) / 1000.0),
+        maxAgeSec: Math.max(0.12, Number(overlayMaxAgeMs || 950) / 1000.0),
+      });
+    }
+
+    function ensureOverlayLoop() {
+      if (overlayLoopStarted) return;
+      overlayLoopStarted = true;
+      const tick = () => {
+        drawOverlay(null);
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+
+    function startOverlayPolling(runId) {
+      const rid = Number(runId || 0);
+      if (!rid) return;
+      if (overlayPollStarted && overlayPollingRunId === rid) return;
+      stopOverlayPolling();
+      overlayPollStarted = true;
+      overlayPollingRunId = rid;
+      const poll = async () => {
+        if (overlayPollingRunId !== rid) {
+          overlayPollStarted = false;
+          return;
+        }
+        try {
+          const data = await api(`/api/overlay?since_seq=${lastOverlaySeq}`);
+          const payload = data.overlay || {};
+          if (Number(payload.run_id || 0) !== rid) {
+            resetOverlayTimeline();
+          } else {
+            const records = Array.isArray(payload.records) ? payload.records : [];
+            records.forEach((record) => {
+              appendOverlayStatus(record);
+              lastOverlaySeq = Math.max(lastOverlaySeq, Number(record.overlay_seq || record.seq || 0));
+            });
+          }
+        } catch (_) {
+          // Keep the render loop alive; status polling will surface errors.
+        } finally {
+          if (overlayPollingRunId === rid) setTimeout(poll, 60);
+        }
+      };
+      poll();
+    }
+
+    function drawOverlay(status) {
+      lastOverlayStatus = status || lastOverlayStatus;
+      if (status) appendOverlayStatus(status);
+      const canvas = $("overlayCanvas");
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    // Legacy visual style compatibility 鈥?render the two branch cards
+    // (p_adv / p_safety) from the status.branch_cards payload
+    // emitted by build_branch_cards() in Python. Each card is selected by
+    // its data-branch attribute so the Python contract and the HTML skeleton
+    // stay in lock-step without ad-hoc DOM lookup per branch.
+    function renderBranchCards(cards) {
+      if (!Array.isArray(cards)) return;
+      const container = $("branchCards");
+      if (!container) return;
+      cards.forEach((card) => {
+        const node = container.querySelector(
+          `.branchCard[data-branch="${card.branch}"]`
+        );
+        if (!node) return;
+        const borderClass = card.border_class || "card-idle";
+        node.className = "branchCard " + borderClass;
+        const titleEl = node.querySelector(".cardTitle");
+        if (titleEl) titleEl.textContent = card.title || "";
+        const stateEl = node.querySelector(".cardState");
+        if (stateEl) stateEl.textContent = card.state || "";
+        const scoreEl = node.querySelector(".cardScore");
+        if (scoreEl) scoreEl.textContent = card.score_display || "--";
+        const fillEl = node.querySelector(".cardBarFill");
+        if (fillEl) {
+          const ratio = Math.max(0, Math.min(1, Number(card.score_bar_ratio) || 0));
+          fillEl.style.width = (ratio * 100).toFixed(1) + "%";
+        }
+        const detailEl = node.querySelector(".cardDetail");
+        if (detailEl) detailEl.textContent = card.state_detail || "";
+        const reasonEl = node.querySelector(".cardReason");
+        if (reasonEl) {
+          reasonEl.textContent = card.reason_text
+            ? "最近原因：" + card.reason_text
+            : "";
+        }
+        const badgesEl = node.querySelector(".cardBadges");
+        if (badgesEl) {
+          const badges = Array.isArray(card.badges) ? card.badges : [];
+          badgesEl.innerHTML = badges
+            .map((b) => `<span class="cardBadge">${b}</span>`)
+            .join("");
+        }
+      });
+    }
+
+    function evidenceLinks(evt) {
+      if (!evt.evidence_saved) {
+        return '<div class="evidenceLinks"><span>证据保存中，事件结束后生成视频和帧。</span></div>';
+      }
+      const links = [];
+      if (evt.evidence_clip_url) {
+        links.push(`<a href="${evt.evidence_clip_url}" target="_blank">查看证据视频</a>`);
+      }
+      if (evt.evidence_representative_url) {
+        links.push(`<a href="${evt.evidence_representative_url}" target="_blank">查看代表帧</a>`);
+      }
+      if (evt.evidence_frames_dir) {
+        links.push(`<span>逐帧已保存 ${evt.evidence_saved_frame_count || 0} 张</span>`);
+      }
+      return `<div class="evidenceLinks">${links.join("") || "<span>证据已保存</span>"}</div>`;
+    }
+
+    function a3bDetails(evt) {
+      const detail = evt.a3b_detail || {};
+      if (!detail || Object.keys(detail).length === 0) return "";
+      const replay = detail.replay || {};
+      const fast = detail.fast || {};
+      const bits = [];
+      if (detail.media_type) bits.push(`类型 ${detail.media_type}`);
+      if (Number.isFinite(Number(detail.live_score))) bits.push(`观察值 ${Number(detail.live_score).toFixed(3)}`);
+      if (Number.isFinite(Number(detail.score))) bits.push(`确认值 ${Number(detail.score).toFixed(3)}`);
+      if (detail.triggered_source) bits.push(`来源 ${a3bSourceText(detail.triggered_source)}`);
+      if (fast.window) bits.push(`快速 ${fast.votes || 0}/${fast.trigger_count || fast.window}`);
+      if (replay.window) bits.push(`持续 ${replay.votes || 0}/${replay.trigger_count || replay.window}`);
+      if (Number.isFinite(Number(replay.bbox_area))) bits.push(`候选面积 ${Number(replay.bbox_area).toFixed(0)}`);
+      if (Number.isFinite(Number(replay.target_iou))) bits.push(`目标IoU ${Number(replay.target_iou).toFixed(2)}`);
+      return bits.length ? `<div class="sub">A3b细节：${bits.join(" · ")}</div>` : "";
+    }
+    function moduleAToken() {
+      try { return localStorage.getItem("moduleAToken") || ""; } catch (_) { return ""; }
+    }
+
+    function authHeaders(base = {}) {
+      const headers = Object.assign({}, base || {});
+      const token = moduleAToken();
+      if (token) headers["X-Module-A-Token"] = token;
+      return headers;
+    }
+
+    async function api(path, body, options = {}) {
+      const res = await fetch(path, {
+        method: body ? "POST" : "GET",
+        headers: body ? authHeaders({"Content-Type": "application/json"}) : authHeaders({}),
+        body: body ? JSON.stringify(body) : undefined,
+        signal: options.signal,
+      });
+      const data = await res.json();
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || res.statusText);
+      }
+      return data;
+    }
+
+    function currentSourceValue() {
+      if ($("sourceType").value === "camera") {
+        return $("cameraSelect").value || "0";
+      }
+      return $("sourceValue").value;
+    }
+
+    function drawingOptions() {
+      return {
+        show_boxes: $("showBoxes").checked,
+        show_module_hud: $("showModuleHud").checked,
+        show_ppe_hud: $("showPpeHud").checked,
+      };
+    }
+
+    function featureOptions() {
+      return {
+        static_image_enabled: $("enableStaticImage").checked,
+      };
+    }
+
+    function customModelOptions() {
+      inferCustomModelSelection();
+      return {
+        enabled: $("enableCustomModel").checked,
+        path: $("customModelPath").value,
+        backend: $("customModelBackend").value,
+        model_family: $("customModelFamily").value,
+      };
+    }
+
+    function setCustomModelDraftDirty() {
+      customModelDraftDirty = true;
+      saveLastPaths();
+    }
+
+    function syncCustomModelPanelVisibility() {
+      $("customModelPanel").style.display = $("enableCustomModel").checked ? "block" : "none";
+    }
+
+    function applyRuntimeCustomModelStatus(customStatus) {
+      if (customModelDraftDirty) return;
+      if (!customStatus || typeof customStatus !== "object") return;
+      $("enableCustomModel").checked = customStatus.enabled === true;
+      if (customStatus.path) $("customModelPath").value = customStatus.path;
+      $("customModelBackend").value = customStatus.backend || "auto";
+      $("customModelFamily").value = customStatus.model_family || "ultralytics";
+      inferCustomModelSelection();
+      syncCustomModelPanelVisibility();
+    }
+
+    function inferCustomModelSelection() {
+      const path = ($("customModelPath").value || "").trim().toLowerCase();
+      if (!path || $("customModelBackend").value !== "auto") return;
+      if (path.endsWith(".engine")) {
+        $("customModelBackend").value = "tensorrt";
+        $("customModelFamily").value = "yolov5";
+      } else if (path.endsWith(".onnx")) {
+        $("customModelBackend").value = "onnx";
+        $("customModelFamily").value = "yolov5";
+      } else if (path.endsWith(".pt") || path.endsWith(".pth")) {
+        $("customModelBackend").value = "pytorch";
+        $("customModelFamily").value = "yolov5";
+      }
+    }
+
+    function updateStartButtonState(status) {
+      if (startInFlight) return;
+      const button = $("startBtn");
+      const runId = Number(status?.run_id || 0);
+      const streamRunId = Number($("stream").getAttribute("data-run-id") || activePreviewRunId || 0);
+      const streamActive = !!$("stream").getAttribute("src") && (!runId || !streamRunId || streamRunId === runId);
+      const running = !!status?.running;
+      if (running && streamActive) {
+        button.disabled = true;
+        button.textContent = "检测中";
+      } else if (running && status?.ready_for_preview) {
+        button.disabled = previewStarting;
+        button.textContent = previewStarting ? "恢复中" : "恢复画面";
+      } else {
+        button.disabled = false;
+        button.textContent = "开始检测";
+      }
+    }
+
+    function fmtSeconds(value) {
+      const seconds = Math.max(0, Number(value || 0));
+      const whole = Math.floor(seconds);
+      const min = Math.floor(whole / 60);
+      const sec = whole % 60;
+      return `${min}:${String(sec).padStart(2, "0")}`;
+    }
+
+    function updateRunControls(status) {
+      const running = !!status?.running;
+      const isFile = (status?.source_type || $("sourceType").value) === "file";
+      const duration = Number(status?.source_duration_s || 0);
+      const rawSourceTime = Number(status?.source_time_s || 0);
+      const sourceTime = status?.source_ended && duration > 0
+        ? Math.min(Math.max(rawSourceTime, 0), duration)
+        : rawSourceTime;
+      const showProgressControls = isFile && duration > 0 && running;
+      $("runControls").style.display = showProgressControls ? "grid" : "none";
+      if (!showProgressControls) {
+        $("playPauseBtn").disabled = true;
+        $("speedSelect").disabled = true;
+        $("seekSlider").disabled = true;
+        $("seekSlider").max = "0";
+        if (!seekControlInFlight) $("seekSlider").value = "0";
+        $("clockText").textContent = "0:00 / 0:00";
+        $("pipelineText").textContent = running ? (status?.detector_pipeline_mode || "running") : "idle";
+        lastControlRunId = Number(status?.run_id || lastControlRunId || 0);
+        return;
+      }
+      $("runControls").style.opacity = "1";
+      $("playPauseBtn").disabled = !running || !isFile;
+      $("playPauseBtn").textContent = status?.playback_paused ? "继续" : "暂停";
+      $("speedSelect").disabled = !running || !isFile;
+      $("speedSelect").value = String(Number(status?.playback_speed || 1));
+      $("seekSlider").disabled = !running || !!status?.source_ended;
+      $("seekSlider").max = duration > 0 ? String(duration) : "0";
+      if (!seekControlInFlight) $("seekSlider").value = String(Math.min(sourceTime, duration || sourceTime));
+      $("clockText").textContent = `${fmtSeconds(sourceTime)} / ${fmtSeconds(duration)}`;
+      const dropped = Number(status?.dropped_detection_frames || 0);
+      const previewFps = status?.source_ended ? "0.0" : Number(status?.preview_fps || 0).toFixed(1);
+      const pipelineMode = status?.source_ended ? "ended" : (status?.detector_pipeline_mode || "idle");
+      $("pipelineText").textContent = `${pipelineMode} · ${previewFps}fps · drop ${dropped}`;
+      lastControlRunId = Number(status?.run_id || lastControlRunId || 0);
+    }
+
+    async function controlRun(action, payload = {}) {
+      const runId = Number(lastControlRunId || lastOverlayStatus?.run_id || 0);
+      if (!runId) return;
+      const data = await api(`/api/runs/${runId}/control`, { action, ...payload });
+      const status = data.status || {};
+      lastOverlayStatus = status;
+      updateRunControls(status);
+      updateStartButtonState(status);
+      return status;
+    }
+
+    function loadLastPaths() {
+      try {
+        const source = localStorage.getItem("moduleA.lastSourcePath");
+        const model = localStorage.getItem("moduleA.lastModelPath");
+        const modelEnabled = localStorage.getItem("moduleA.lastCustomModelEnabled");
+        if (source) $("sourceValue").value = source;
+        if (model) $("customModelPath").value = model;
+        inferCustomModelSelection();
+        if (modelEnabled === "true") {
+          $("enableCustomModel").checked = true;
+        }
+        if (model || modelEnabled === "true") customModelDraftDirty = true;
+        syncCustomModelPanelVisibility();
+      } catch (_) {}
+    }
+
+
+    function renderModelSecurity(ms) {
+      ms = ms || {};
+      const status = ms.status || "unknown";
+      const pill = $("modelSecurityPill");
+      if (!pill) return;
+      pill.textContent = status;
+      const risk = ms.risk_score;
+      $("modelSecurityRisk").textContent = (risk === null || risk === undefined) ? "--" : Number(risk).toFixed(3);
+      $("modelSecurityScanTime").textContent = ms.last_scan_time ? String(ms.last_scan_time).replace("T", " ").slice(0, 19) : "--";
+      const fp = ms.fingerprint || "--";
+      $("modelSecurityFingerprint").textContent = "fingerprint: " + fp;
+      const modelPath = ms.model_path ? " · " + ms.model_path : "";
+      $("modelSecuritySummary").textContent = `B模块状态 ${status}${ms.scanning ? "，后台扫描中" : ""}${modelPath}`;
+      pill.className = "pill " + ((status === "trusted") ? "live" : (status === "suspicious" || status === "blocked" || status === "error") ? "alert" : "");
+    }
+
+    async function refreshModelSecurity() {
+      try {
+        const data = await api(`/api/model-security/status?profile=${encodeURIComponent($("profile").value || "default")}`);
+        renderModelSecurity(data.model_security || {});
+      } catch (err) {
+        renderModelSecurity({status:"error", error: err.message});
+      }
+    }
+
+    function saveLastPaths() {
+      try {
+        if ($("sourceValue").value) localStorage.setItem("moduleA.lastSourcePath", $("sourceValue").value);
+        if ($("customModelPath").value) localStorage.setItem("moduleA.lastModelPath", $("customModelPath").value);
+        localStorage.setItem("moduleA.lastCustomModelEnabled", $("enableCustomModel").checked ? "true" : "false");
+      } catch (_) {}
+    }
+
+    async function syncDrawingOptions() {
+      await api("/api/display-options", { display_options: drawingOptions() });
+    }
+
+    function updateSourceControls() {
+      const type = $("sourceType").value;
+      const fileMode = type === "file";
+      $("pathRow").style.display = type === "camera" ? "none" : "grid";
+      $("cameraRow").style.display = type === "camera" ? "grid" : "none";
+      $("browseBtn").style.display = type === "file" ? "block" : "none";
+      $("testSourceBtn").style.display = type === "rtsp" ? "block" : "none";
+      $("pathRow").className = type === "file" || type === "rtsp" ? "fieldRow" : "fieldRow single";
+      $("realtimeText").textContent = type === "file"
+        ? "MP4预览固定为 1.0x；检测由后端输入源异步处理。"
+        : "实时流使用后端预览流；检测慢时只丢旧检测帧。";
+      setConnectionStatus("", "");
+      if (type === "file") {
+        $("sourceValueLabel").textContent = "MP4 文件";
+        $("sourceHint").textContent = "点击“浏览”可打开资源管理器选择本机 MP4，也可以手动粘贴路径。";
+      } else if (type === "rtsp") {
+        $("sourceValueLabel").textContent = "RTSP / HTTP 地址";
+        $("sourceHint").textContent = "输入摄像头或视频服务地址，先点“连通检测”，通过后再开始检测。";
+      } else {
+        $("sourceValueLabel").textContent = "本机摄像头";
+        $("sourceHint").textContent = "点击“扫描”识别本机可打开的摄像头，然后从列表选择。";
+        if (!cameraDevicesLoaded) scanCameras();
+      }
+    }
+    async function pickFile() {
+      setError("姝ｅ湪鎵撳紑璧勬簮绠＄悊鍣?..");
+      $("browseBtn").disabled = true;
+      try {
+        const data = await api("/api/pick-file", {mode: "video", current_path: $("sourceValue").value || ""});
+        if (data.path) {
+          $("sourceValue").value = data.path;
+          saveLastPaths();
+          setError("");
+        }
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        $("browseBtn").disabled = false;
+      }
+    }
+
+    async function pickModelFile() {
+      setError("正在打开模型文件选择器...");
+      $("browseModelBtn").disabled = true;
+      try {
+        const data = await api("/api/pick-file", {mode: "model", current_path: $("customModelPath").value || ""});
+        if (data.path) {
+          $("customModelPath").value = data.path;
+          $("customModelBackend").value = "auto";
+          inferCustomModelSelection();
+          setCustomModelDraftDirty();
+          setError("");
+        }
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        $("browseModelBtn").disabled = false;
+      }
+    }
+
+    async function scanCameras() {
+      setError("正在扫描本机摄像头...");
+      setConnectionStatus("", "");
+      $("scanBtn").disabled = true;
+      $("cameraSelect").innerHTML = '<option value="">扫描中...</option>';
+      try {
+        const data = await api("/api/cameras");
+        const devices = data.devices || [];
+        cameraDevicesLoaded = true;
+        if (!devices.length) {
+      $("cameraSelect").innerHTML = '<option value="">扫描中...</option>';
+          setError("未发现可打开摄像头，请确认摄像头未被其他软件占用。");
+          return;
+        }
+        $("cameraSelect").innerHTML = devices.map((device) => {
+          const detail = device.width && device.height ? ` 路 ${device.width}x${device.height}` : "";
+          return `<option value="${device.index}">${device.name}${detail}</option>`;
+        }).join("");
+        setError("");
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        $("scanBtn").disabled = false;
+      }
+    }
+
+    async function testSource() {
+      setError("");
+      setConnectionStatus("正在检测连通性...", "testing");
+      $("testSourceBtn").disabled = true;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000);
+        const res = await fetch("/api/test-source", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            source_type: $("sourceType").value,
+            source: currentSourceValue(),
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        const data = await res.json();
+        if (!res.ok || data.ok === false) {
+          throw new Error(data.error || res.statusText);
+        }
+        if (data.reachable) {
+          setConnectionStatus(data.message || "连接可用。", "ok");
+        } else {
+          setConnectionStatus(data.message || "连接不可用。", "bad");
+        }
+      } catch (err) {
+        if (err.name === "AbortError") {
+          setConnectionStatus("连通检测超时（15秒），请检查地址是否正确。", "bad");
+        } else {
+          setConnectionStatus(err.message || "Failed to fetch", "bad");
+        }
+      } finally {
+        $("testSourceBtn").disabled = false;
+      }
+    }
+
+    $("sourceType").onchange = updateSourceControls;
+    $("browseBtn").onclick = pickFile;
+    $("browseModelBtn").onclick = pickModelFile;
+    $("scanBtn").onclick = scanCameras;
+    $("testSourceBtn").onclick = testSource;
+    $("playPauseBtn").onclick = async () => {
+      try {
+        const paused = !!lastOverlayStatus?.playback_paused;
+        await controlRun(paused ? "play" : "pause");
+      } catch (err) {
+        setError(err.message);
+      }
+    };
+    $("speedSelect").onchange = async () => {
+      try {
+        await controlRun("set_speed", { speed: Number($("speedSelect").value || 1) });
+      } catch (err) {
+        setError(err.message);
+      }
+    };
+    $("seekSlider").oninput = () => {
+      const duration = Number($("seekSlider").max || 0);
+      $("clockText").textContent = `${fmtSeconds($("seekSlider").value)} / ${fmtSeconds(duration)}`;
+    };
+    $("seekSlider").onchange = async () => {
+      seekControlInFlight = true;
+      try {
+        await controlRun("seek", { source_time_s: Number($("seekSlider").value || 0) });
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        seekControlInFlight = false;
+      }
+    };
+    $("enableCustomModel").onchange = () => {
+      setCustomModelDraftDirty();
+      syncCustomModelPanelVisibility();
+      inferCustomModelSelection();
+    };
+    $("customModelPath").onchange = () => {
+      $("customModelBackend").value = "auto";
+      inferCustomModelSelection();
+      setCustomModelDraftDirty();
+    };
+    $("customModelBackend").onchange = setCustomModelDraftDirty;
+    $("customModelFamily").onchange = setCustomModelDraftDirty;
+    $("cameraSelect").onchange = () => {};
+    $("stream").addEventListener("load", () => {
+      updateStageAspectFromMedia($("stream"));
+      drawOverlay(lastOverlayStatus || {});
+    });
+    window.addEventListener("resize", () => {
+      syncActiveStageAspect();
+      drawOverlay(lastOverlayStatus || {});
+    });
+    ["showBoxes", "showModuleHud", "showPpeHud"].forEach((id) => {
+      $(id).onchange = async () => {
+        try {
+          await syncDrawingOptions();
+        } catch (err) {
+          setError(err.message);
+        }
+      };
+    });
+
+
+    $("runModelSecurityScanBtn").onclick = async () => {
+      setError("正在启动B模块快速扫描...");
+      $("runModelSecurityScanBtn").disabled = true;
+      try {
+        const data = await api("/api/model-security/scan", {
+          scan_type: "quick",
+          background: true,
+          profile: $("profile").value,
+          custom_model: customModelOptions(),
+        });
+        renderModelSecurity(data.model_security || {});
+        setError("B模块后台扫描已启动。预览和A模块检测不会被阻塞。");
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        $("runModelSecurityScanBtn").disabled = false;
+      }
+    };
+
+    $("viewModelSecurityReportBtn").onclick = async () => {
+      try {
+        const data = await api("/api/model-security/report");
+        const text = JSON.stringify(data.report || {}, null, 2);
+        const w = window.open("", "_blank");
+        if (w) {
+          w.document.write(`<pre style="white-space:pre-wrap;font-family:monospace;">${text.replace(/[&<>]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}</pre>`);
+        } else {
+          setError(text.slice(0, 4000));
+        }
+      } catch (err) {
+        setError(err.message);
+      }
+    };
+
+    $("startBtn").onclick = async () => {
+      if (startInFlight) return;
+      setError("");
+      startInFlight = true;
+      const oldText = $("startBtn").textContent;
+      $("startBtn").disabled = true;
+      $("startBtn").textContent = "初始化中";
+      try {
+        const current = await api("/api/status");
+        const currentStatus = current.status || {};
+        if (currentStatus.running) {
+          lastOverlayStatus = currentStatus;
+          ensurePreview(currentStatus);
+          updateStartButtonState(currentStatus);
+          return;
+        }
+        hideAllPreview();
+        showEmpty("正在初始化检测", "正在加载模型/引擎并等待首帧检测结果；不会先播放没有检测框的视频。");
+        await syncDrawingOptions();
+        const sourceType = $("sourceType").value;
+        const body = {
+          source_type: sourceType,
+          source: currentSourceValue(),
+          profile: $("profile").value,
+          realtime: true,
+          feature_options: featureOptions(),
+          custom_model: customModelOptions(),
+          ready_timeout_s: 45,
+        };
+        saveLastPaths();
+        const data = await api("/api/start", body);
+        const status = data.status || {};
+        lastOverlayStatus = status;
+        updateRunControls(status);
+        updateStartButtonState(status);
+        startMjpegPreview(status);
+        scheduleRefresh(0);
+      } catch (err) {
+        setError(err.message);
+        showEmpty("启动失败", err.message || "检测启动失败，请检查输入源和模型。");
+      } finally {
+        startInFlight = false;
+        try {
+          const latest = await api("/api/status");
+          updateStartButtonState(latest.status || {});
+        } catch (_) {
+          $("startBtn").disabled = false;
+          $("startBtn").textContent = oldText;
+        }
+      }
+    };
+
+    $("stopBtn").onclick = async () => {
+      setError("");
+      $("stopBtn").disabled = true;
+      try {
+        stopOverlayPolling();
+        previewStarting = false;
+        const data = await api("/api/stop", {});
+        const stoppedStatus = data.status || {};
+        hideAllPreview();
+        lastOverlayStatus = stoppedStatus;
+        updateRunControls(stoppedStatus);
+        updateStartButtonState(stoppedStatus);
+        showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
+        scheduleRefresh(0);
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        $("stopBtn").disabled = false;
+      }
+    };
+
+    async function refresh() {
+      let nextRefreshMs = refreshIntervals.idle;
+      try {
+        const data = await api("/api/status");
+        let status = data.status || {};
+        status = mergeOverlayStatusForPanel(status);
+        if (status.source_ended) stopOverlayPolling();
+        nextRefreshMs = status.running ? refreshIntervals.running : refreshIntervals.idle;
+        const pill = $("statePill");
+        const [title, text, stateClass] = stateText(status);
+        pill.textContent = title;
+        pill.className = "pill " + stateClass;
+        renderBranchCards(status.branch_cards || []);
+        renderModelSecurity(status.model_security || {});
+        $("profilePill").textContent = profileLabel(status.profile || $("profile").value);
+        $("backendPill").textContent = status.backend || "-";
+        $("frame").textContent = status.frame_idx ?? 0;
+        $("pAdv").textContent = Number(status.p_adv || 0).toFixed(3);
+        $("timing").textContent = Number(status.timing_ms || 0).toFixed(1);
+        $("alerts").textContent = status.alert_event_count || 0;
+        $("ppeAlerts").textContent = status.ppe_event_count || 0;
+        $("ppeCounts").textContent = `${status.ppe_person_count || 0}/${status.ppe_helmet_count || 0}`;
+        $("ppePill").textContent = status.ppe_warning ? "未戴帽" : "业务通道";
+        $("ppePill").className = "pill " + (status.ppe_warning ? "alert" : "");
+        const featureStatus = status.feature_options || {};
+        if (status.running) {
+          $("enableStaticImage").checked = featureStatus.static_image_enabled !== false;
+          applyRuntimeCustomModelStatus(status.custom_model || {});
+        }
+        const displayOptions = status.display_options || {};
+        $("showBoxes").checked = displayOptions.show_boxes !== false;
+        $("showModuleHud").checked = displayOptions.show_module_hud !== false;
+        $("showPpeHud").checked = displayOptions.show_ppe_hud !== false;
+        syncOverlayTimingFromStatus(status);
+        ensurePreview(status);
+        if (!status.source_ended) drawOverlay(status);
+        updateRunControls(status);
+        updateStartButtonState(status);
+        if (status.error) {
+          setError(status.error);
+        } else if (status.running && $("error").textContent === "Failed to fetch") {
+          setError("");
+        }
+        const events = status.recent_events || [];
+        $("events").innerHTML = events.map((evt) => {
+          const tags = reasonTags(evt.reason);
+          const eventId = evt.event_id ?? "-";
+          const startFrame = evt.trigger_frame ?? evt.started_frame ?? 0;
+          const endFrame = evt.last_alert_frame ?? evt.last_warning_frame ?? evt.last_active_frame ?? startFrame;
+          const peak = Number(evt.peak_p_adv ?? evt.peak_score ?? evt.max_score ?? 0);
+          return `
+          <div class="event alert">
+            <strong>告警 #${eventId}</strong>
+            <div class="main">${reasonSummary(evt.reason)}</div>
+            <div class="sub">帧 ${startFrame} - ${endFrame} · 峰值分数 ${peak.toFixed(3)}</div>
+            <div class="chips">
+              <span class="chip danger">高风险</span>
+              ${tags.map((tag) => `<span class="chip">${tag}</span>`).join("")}
+            </div>
+            ${a3bDetails(evt)}
+            ${evidenceLinks(evt)}
+            <details>
+              <summary>技术细节</summary>
+              <code>${evt.reason || "module_a"}</code>
+            </details>
+          </div>
+        `;
+        }).join("") || '<div class="empty"><strong>暂无确认告警</strong><div class="hint">一旦连续帧触发，告警会出现在这里。</div></div>';
+        const ppeEvents = status.recent_ppe_events || [];
+        $("ppeEvents").innerHTML = ppeEvents.map((evt) => {
+          const eventId = evt.event_id ?? "-";
+          const startFrame = evt.trigger_frame ?? evt.started_frame ?? 0;
+          const endFrame = evt.last_warning_frame ?? evt.last_alert_frame ?? evt.last_active_frame ?? startFrame;
+          const personCount = evt.person_count ?? evt.ppe_person_count ?? 0;
+          const headCount = evt.head_count ?? evt.ppe_head_count ?? 0;
+          const helmetCount = evt.helmet_count ?? evt.ppe_helmet_count ?? 0;
+          return `
+          <div class="event ppe">
+            <strong>安全帽告警 #${eventId}</strong>
+            <div class="main">检测到人员未佩戴安全帽，已按连续帧规则确认。</div>
+            <div class="sub">帧 ${startFrame} - ${endFrame} · 人员 ${personCount} · 裸头 ${headCount} · 安全帽 ${helmetCount}</div>
+            <div class="chips">
+              <span class="chip warn">业务安全</span>
+              <span class="chip">未戴安全帽</span>
+              <span class="chip">独立于模块A</span>
+            </div>
+            ${evidenceLinks(evt)}
+          </div>
+        `;
+        }).join("") || '<div class="empty"><strong>暂无安全帽告警</strong><div class="hint">该通道只判断人员是否佩戴安全帽，不代表物理扰动。</div></div>';
+        const completedSourceEvents = status.recent_source_auth_events || [];
+        const activeSourceEvent = status.a3b_triggered ? [{
+          active: true,
+          event_id: "实时",
+          trigger_frame: status.frame_idx || 0,
+          last_warning_frame: status.frame_idx || 0,
+          peak_a3b_score: status.a3b_event_score ?? status.a3b_observed_score ?? status.a3b_display_score ?? status.a3b_score ?? 0,
+          reason: status.a3b_triggered_source || status.a3b_reason || "实时疑似",
+        }] : null;
+        const sourceEvents = activeSourceEvent ? [activeSourceEvent, ...completedSourceEvents] : completedSourceEvents;
+        $("sourceAlerts").textContent = sourceEvents.length || 0;
+        $("sourcePill").textContent = sourceEvents.length ? "A3b警告" : "A3b通道";
+        $("sourcePill").className = "pill " + (sourceEvents.length ? "alert" : "");
+        $("sourceEvents").innerHTML = sourceEvents.map((evt) => {
+          const eventId = evt.event_id ?? "-";
+          const startFrame = evt.trigger_frame ?? evt.started_frame ?? 0;
+          const endFrame = evt.last_warning_frame ?? evt.last_active_frame ?? evt.last_alert_frame ?? startFrame;
+          const peak = Number(evt.peak_a3b_score ?? evt.a3b_event_score ?? evt.peak_score ?? evt.max_score ?? 0);
+          return `
+          <div class="event alert">
+            <strong>${evt.active ? "A3b实时告警" : `A3b警告 #${eventId}`}</strong>
+            <div class="main">${evt.active ? "检测到可疑翻拍/假目标迹象，正在持续确认。" : "检测到可疑翻拍/假目标迹象，已记录为 A3b 警告。"}</div>
+            <div class="sub">帧 ${startFrame} - ${endFrame} · 峰值分数 ${peak.toFixed(3)}</div>
+            <div class="chips">
+              <span class="chip danger">A3b</span>
+              <span class="chip">${evt.reason || "连续帧异常"}</span>
+              <span class="chip">警告记录</span>
+            </div>
+            ${evt.active ? "" : evidenceLinks(evt)}
+          </div>
+        `;
+        }).join("") || '<div class="empty"><strong>暂无 A3b 警告记录</strong><div class="hint">该区域仅展示 A3b 相关警告。</div></div>';      } catch (err) {
+        setError(err.message);
+        nextRefreshMs = refreshIntervals.error;
+      } finally {
+        scheduleRefresh(nextRefreshMs);
+      }
+    }
+
+    function scheduleRefresh(delayMs) {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(refresh, delayMs);
+    }
+
+    loadLastPaths();
+    updateSourceControls();
+        showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
+    refreshModelSecurity();
+    refresh();
+  </script>
+</body>
+</html>
+
+
+
+
+

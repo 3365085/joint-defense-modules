@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import copy
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+from .config_schema import validate_runtime_config
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - PyYAML is part of runtime deps, fallback keeps tests light.
+    yaml = None
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "module_a_runtime.yaml"
+DEFAULT_WORKSPACE_ROOT = PROJECT_ROOT.parent
+DEFAULT_MATERIAL_ROOT = DEFAULT_WORKSPACE_ROOT / "素材"
+
+
+def project_root() -> Path:
+    return PROJECT_ROOT
+
+
+def workspace_root() -> Path:
+    """Return the outer workspace that owns shared assets and the Pixi env."""
+    for env_name in ("MODULE_A_WORKSPACE_ROOT", "SECURITY_PROJECT_ROOT"):
+        value = os.environ.get(env_name)
+        if value:
+            return Path(value).expanduser()
+
+    parent = DEFAULT_WORKSPACE_ROOT
+    workspace_markers = (".pixi", "素材", "训练素材", "模型和素材")
+    if any((parent / marker).exists() for marker in workspace_markers):
+        return parent
+    return PROJECT_ROOT
+
+
+def workspace_material_root() -> Path:
+    return workspace_root() / "素材"
+
+
+def workspace_asset_roots() -> list[Path]:
+    workspace = workspace_root()
+    roots = [
+        workspace / "素材",
+        PROJECT_ROOT,
+        workspace,
+        workspace / "模型和素材",
+        workspace / "训练素材",
+    ]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            key = str(root.resolve())
+        except OSError:
+            key = str(root.absolute())
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def _read_mapping(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {path}")
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in {".json"}:
+        data = json.loads(text)
+    else:
+        if yaml is None:
+            raise RuntimeError("需要安装 PyYAML 才能读取 YAML 配置")
+        data = yaml.safe_load(text) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"配置文件根节点必须是对象: {path}")
+    return data
+
+
+def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``patch`` into ``base`` and return ``base``."""
+    for key, value in (patch or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+    return base
+
+
+def get_nested(data: dict[str, Any], dotted: str, default: Any = None) -> Any:
+    node: Any = data
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def set_nested(data: dict[str, Any], dotted: str, value: Any) -> None:
+    node = data
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[parts[-1]] = value
+
+
+def list_profiles(config_path: str | Path | None = None) -> list[str]:
+    path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+    raw = _read_mapping(path)
+    profiles = raw.get("profiles", {})
+    if not isinstance(profiles, dict):
+        return ["default"]
+    names = ["default"] + sorted(str(name) for name in profiles.keys())
+    return list(dict.fromkeys(names))
+
+
+def load_runtime_config(
+    *,
+    config_path: str | Path | None = None,
+    profile: str = "default",
+    feature_options: dict[str, Any] | None = None,
+    custom_model: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load Module A runtime config with profile and UI overrides applied.
+
+    The profile system is intentionally shallow for operators: base config lives
+    in ``configs/module_a_runtime.yaml``; each profile only overrides changed
+    keys. The Web adapter never mutates this object directly.
+    """
+    path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+    raw = _read_mapping(path)
+    profiles = raw.pop("profiles", {}) if isinstance(raw.get("profiles", {}), dict) else {}
+    cfg = copy.deepcopy(raw)
+    if profile and profile != "default":
+        if profile not in profiles:
+            raise KeyError(f"未知运行档位: {profile}; 可用档位: {', '.join(sorted(profiles))}")
+        deep_merge(cfg, profiles[profile])
+
+    # Environment override remains useful when the package is embedded in a
+    # larger project whose weights/configs live outside the delivery folder.
+    env_device = os.environ.get("MODULE_A_DEVICE")
+    if env_device:
+        set_nested(cfg, "module_a.device", env_device)
+        set_nested(cfg, "inference.device", env_device)
+
+    apply_feature_options(cfg, feature_options or {})
+    resolved_custom = apply_custom_model(cfg, normalize_custom_model_options(custom_model))
+    cfg.setdefault("runtime", {})["profile"] = profile or "default"
+    cfg.setdefault("runtime", {})["custom_model"] = resolved_custom
+    validate_runtime_config(cfg)
+    return cfg
+
+
+def apply_feature_options(config: dict[str, Any], options: dict[str, Any]) -> None:
+    module_a = config.setdefault("module_a", {})
+    if "static_image_enabled" in options:
+        module_a["static_image_enabled"] = bool(options["static_image_enabled"])
+
+
+def infer_backend_from_model_path(path: Path, fallback: str = "onnx") -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".engine":
+        return "tensorrt"
+    if suffix == ".onnx":
+        return "onnx"
+    if suffix in {".pt", ".pth"}:
+        return "pytorch"
+    return fallback
+
+
+def normalize_custom_model_options(custom_model: dict[str, Any] | None) -> dict[str, Any]:
+    custom_model = custom_model or {}
+    enabled = bool(custom_model.get("enabled", False))
+    path = str(custom_model.get("path", "") or "").strip()
+    backend = str(custom_model.get("backend", "auto") or "auto").strip().lower()
+    model_family = str(custom_model.get("model_family", "yolov5") or "yolov5").strip().lower()
+    if backend not in {"auto", "tensorrt", "onnx", "pytorch"}:
+        backend = "auto"
+    if model_family not in {"yolov5", "ultralytics", "yolov8"}:
+        model_family = "yolov5"
+    if model_family == "yolov8":
+        model_family = "ultralytics"
+    return {
+        "enabled": enabled and bool(path),
+        "path": path,
+        "backend": backend,
+        "model_family": model_family,
+    }
+
+
+def apply_custom_model(config: dict[str, Any], custom_model: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(custom_model)
+    if not resolved.get("enabled"):
+        return resolved
+    path = Path(str(resolved.get("path", ""))).expanduser()
+    backend = str(resolved.get("backend", "auto"))
+    if backend == "auto":
+        backend = infer_backend_from_model_path(path, str(get_nested(config, "inference.backend", "onnx")))
+    resolved["backend"] = backend
+    inference = config.setdefault("inference", {})
+    inference["backend"] = backend
+    inference["model_family"] = resolved.get("model_family", inference.get("model_family", "yolov5"))
+    artifacts = inference.setdefault("artifacts", {})
+    key = "engine" if backend == "tensorrt" else backend
+    artifacts[key] = [str(path)]
+    return resolved
+
+
+def public_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    """Return non-sensitive config fields for /api/status."""
+    inference = config.get("inference", {}) if isinstance(config.get("inference"), dict) else {}
+    module_a = config.get("module_a", {}) if isinstance(config.get("module_a"), dict) else {}
+    runtime = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
+    return {
+        "profile": runtime.get("profile", "default"),
+        "backend": inference.get("backend"),
+        "device": inference.get("device", module_a.get("device")),
+        "model_family": inference.get("model_family", inference.get("family")),
+        "frame_size": module_a.get("frame_size", 640),
+        "light_flow_interval": module_a.get("light_flow_interval"),
+        "static_image_interval": module_a.get("static_image_interval"),
+    }

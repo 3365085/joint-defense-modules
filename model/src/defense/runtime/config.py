@@ -184,6 +184,26 @@ def _canonical_model_family(value: str, fallback: str = "ultralytics") -> str:
     return fallback
 
 
+def _infer_model_family_from_path_hint(path: Path) -> str | None:
+    hint_text = " ".join(part.lower() for part in path.parts)
+    if "yolov5" in hint_text:
+        return "yolov5"
+    if any(token in hint_text for token in ("yolov8", "yolo8", "yolo11", "ultralytics")):
+        return "ultralytics"
+    return None
+
+
+def _infer_model_family_from_output_dims(dims: list[int]) -> str | None:
+    if len(dims) != 3:
+        return None
+    _, axis_a, axis_b = dims
+    if 0 < axis_a <= 128 and axis_b > axis_a:
+        return "ultralytics"
+    if axis_a > axis_b and 0 < axis_b <= 128:
+        return "yolov5"
+    return None
+
+
 def _ensure_yolov5_base_importable() -> None:
     yolov5_root = PROJECT_ROOT / "src" / "defense" / "model_bases" / "yolov5_official"
     if yolov5_root.exists() and str(yolov5_root) not in sys.path:
@@ -252,16 +272,50 @@ def _infer_onnx_model_family(path: Path) -> str | None:
         return "ultralytics"
 
     for output in model.graph.output:
-        dims: list[int] = []
-        for dim in output.type.tensor_type.shape.dim:
-            value = int(dim.dim_value or 0)
-            dims.append(value)
-        if len(dims) == 3:
-            _, axis_a, axis_b = dims
-            if 0 < axis_a <= 128 and axis_b > axis_a:
-                return "ultralytics"
-            if axis_a > axis_b and 0 < axis_b <= 128:
-                return "yolov5"
+        dims = [int(dim.dim_value or 0) for dim in output.type.tensor_type.shape.dim]
+        family = _infer_model_family_from_output_dims(dims)
+        if family:
+            return family
+    return None
+
+
+def _infer_tensorrt_model_family(path: Path) -> str | None:
+    path_hint = _infer_model_family_from_path_hint(path)
+    if path_hint:
+        return path_hint
+    if not path.exists():
+        return None
+    try:
+        import tensorrt as trt
+    except Exception:
+        return None
+    try:
+        logger = trt.Logger(trt.Logger.ERROR)
+        runtime = trt.Runtime(logger)
+        engine = runtime.deserialize_cuda_engine(path.read_bytes())
+    except Exception:
+        return None
+    if engine is None:
+        return None
+
+    output_shapes: list[tuple[int, ...]] = []
+    try:
+        if hasattr(engine, "num_io_tensors"):
+            for index in range(int(engine.num_io_tensors)):
+                name = engine.get_tensor_name(index)
+                if engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
+                    output_shapes.append(tuple(int(v) for v in engine.get_tensor_shape(name)))
+        else:
+            for index in range(int(engine.num_bindings)):
+                if not engine.binding_is_input(index):
+                    output_shapes.append(tuple(int(v) for v in engine.get_binding_shape(index)))
+    except Exception:
+        return None
+
+    for shape in output_shapes:
+        family = _infer_model_family_from_output_dims([int(v) for v in shape])
+        if family:
+            return family
     return None
 
 
@@ -274,6 +328,8 @@ def infer_model_family_from_model_path(path: Path, fallback: str = "ultralytics"
         return _infer_pt_model_family(path) or fallback
     if suffix == ".onnx":
         return _infer_onnx_model_family(path) or fallback
+    if suffix == ".engine":
+        return _infer_tensorrt_model_family(path) or fallback
     return fallback
 
 

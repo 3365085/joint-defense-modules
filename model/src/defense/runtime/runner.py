@@ -349,9 +349,15 @@ class MonitorEngine:
             "ppe_candidate": False,
             "ppe_confirmed": False,
             "ppe_person_count": 0,
+            "ppe_raw_person_count": 0,
+            "ppe_inferred_person_count": 0,
+            "ppe_person_context_count": 0,
             "ppe_helmet_count": 0,
             "ppe_head_count": 0,
             "ppe_missing_helmet_count": 0,
+            "ppe_has_person_class": False,
+            "ppe_evidence_mode": "",
+            "ppe_uncertain": False,
             "ppe_reason": "",
             "ppe_tracks": [],
             "feature_options": {"static_image_enabled": True},
@@ -381,6 +387,14 @@ class MonitorEngine:
             "preview_max_side": 960,
             "preview_width": 0,
             "preview_height": 0,
+            "capture_max_side": 1280,
+            "file_source_fps_cap": 0.0,
+            "source_frame_step": 1.0,
+            "source_frame_width": 0,
+            "source_frame_height": 0,
+            "capture_frame_width": 0,
+            "capture_frame_height": 0,
+            "capture_resized": False,
             "preview_never_wait_for_detection": True,
             "init_ms": 0.0,
             "video_time_s": 0.0,
@@ -518,6 +532,14 @@ class MonitorEngine:
         detector_process_fps_cap = float(
             runtime_config.get("detector_process_fps_cap", runtime_config.get("process_fps_cap", 15)) or 15
         )
+        capture_max_side = int(runtime_config.get("capture_max_side", 1280) or 1280)
+        file_source_fps_cap = float(
+            runtime_config.get(
+                "file_source_fps_cap",
+                max(float(preview_render_fps), float(detector_process_fps_cap)),
+            )
+            or 0.0
+        )
         preview_bus = PreviewBus()
         detection_bus = DetectionBus()
         with self.condition:
@@ -538,6 +560,8 @@ class MonitorEngine:
                         "detector_process_fps_cap": detector_process_fps_cap,
                         "preview_render_fps": preview_render_fps,
                         "preview_max_side": preview_max_side,
+                        "capture_max_side": capture_max_side,
+                        "file_source_fps_cap": file_source_fps_cap,
                         "preview_never_wait_for_detection": True,
                         "ready_for_preview": False,
                         "first_detection_ready": False,
@@ -552,7 +576,7 @@ class MonitorEngine:
                 )
                 self.condition.notify_all()
 
-        args = (
+        process_args = (
             run_id,
             preview_bus,
             detection_bus,
@@ -562,11 +586,16 @@ class MonitorEngine:
             bool(realtime),
             feature_options,
             custom_model_options,
+        )
+        capture_args = (
+            *process_args,
             float(preview_render_fps),
             float(detector_process_fps_cap),
+            int(capture_max_side),
+            float(file_source_fps_cap),
         )
-        self.capture_thread = threading.Thread(target=self._backend_capture_loop, args=args, name="module-a-source", daemon=True)
-        self.process_thread = threading.Thread(target=self._backend_process_loop, args=args[:-2], name="module-a-detector", daemon=True)
+        self.capture_thread = threading.Thread(target=self._backend_capture_loop, args=capture_args, name="module-a-source", daemon=True)
+        self.process_thread = threading.Thread(target=self._backend_process_loop, args=process_args, name="module-a-detector", daemon=True)
         self.preview_thread = threading.Thread(
             target=self._preview_render_loop,
             args=(run_id, preview_bus, float(preview_render_fps)),
@@ -744,6 +773,30 @@ class MonitorEngine:
         duration_s = (frame_count / fps) if frame_count > 0 and fps > 0 else 0.0
         return fps, duration_s, frame_count
 
+    @staticmethod
+    def _resize_capture_frame(frame: Any, max_side: int) -> tuple[Any, bool]:
+        if max_side <= 0:
+            return frame, False
+        height, width = frame.shape[:2]
+        longest = max(int(width), int(height))
+        if longest <= max_side:
+            return frame, False
+        scale = float(max_side) / float(longest)
+        resized = cv2.resize(
+            frame,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        return resized, True
+
+    @staticmethod
+    def _file_frame_step(source_fps: float, file_source_fps_cap: float, preview_render_fps: float, detector_fps: float) -> float:
+        fps = max(1.0, float(source_fps or 0.0))
+        cap = float(file_source_fps_cap or 0.0)
+        if cap <= 0.0:
+            cap = max(float(preview_render_fps or 0.0), float(detector_fps or 0.0), 1.0)
+        return max(1.0, fps / max(1.0, min(fps, cap)))
+
     def _backend_capture_loop(
         self,
         run_id: int,
@@ -757,19 +810,27 @@ class MonitorEngine:
         custom_model: dict[str, Any],
         preview_render_fps: float,
         detector_process_fps_cap: float,
+        capture_max_side: int,
+        file_source_fps_cap: float,
     ) -> None:
         cap = None
         packet_seq = 0
         last_detection_push = 0.0
         last_frame_seen = time.perf_counter()
         reconnects = 0
+        next_read_frame = 0.0
         try:
             cap = open_capture(source_type, source)
             fps, duration_s, frame_count = self._read_capture_meta(cap)
             self._source_fps = fps
             self._source_duration_s = duration_s
             self._source_frame_count = frame_count
-            frame_period = 1.0 / max(1.0, fps)
+            frame_step = (
+                self._file_frame_step(fps, file_source_fps_cap, preview_render_fps, detector_process_fps_cap)
+                if source_type == "file"
+                else 1.0
+            )
+            frame_period = frame_step / max(1.0, fps)
             detect_interval = 1.0 / max(1.0, min(detector_process_fps_cap, fps if source_type == "file" else detector_process_fps_cap))
             with self.condition:
                 if run_id == self.run_id:
@@ -783,6 +844,9 @@ class MonitorEngine:
                             "preview_seekable": source_type == "file",
                             "preview_mode": "backend_source_pipeline",
                             "detector_pipeline_mode": "backend_latest_only",
+                            "capture_max_side": int(capture_max_side),
+                            "file_source_fps_cap": float(file_source_fps_cap or 0.0),
+                            "source_frame_step": float(frame_step),
                         }
                     )
                     self.condition.notify_all()
@@ -800,6 +864,7 @@ class MonitorEngine:
                         current_epoch = int(self._source_epoch)
                 if seek_request is not None and source_type == "file":
                     cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(seek_request)) * 1000.0)
+                    next_read_frame = max(0.0, float(seek_request) * fps)
                     with self.condition:
                         if run_id == self.run_id:
                             self.status["source_epoch"] = current_epoch
@@ -831,6 +896,8 @@ class MonitorEngine:
                     continue
 
                 last_frame_seen = time.perf_counter()
+                original_h, original_w = frame.shape[:2]
+                frame, capture_resized = self._resize_capture_frame(frame, int(capture_max_side))
                 h, w = frame.shape[:2]
                 source_time_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
                 if source_time_s <= 0.0 and fps > 0:
@@ -847,7 +914,11 @@ class MonitorEngine:
                     width=int(w),
                     height=int(h),
                     fps=float(fps),
-                    flags={},
+                    flags={
+                        "original_width": int(original_w),
+                        "original_height": int(original_h),
+                        "capture_resized": bool(capture_resized),
+                    },
                 )
                 preview_bus.publish(packet)
                 now = time.perf_counter()
@@ -863,11 +934,26 @@ class MonitorEngine:
                                 "source_epoch": packet.epoch,
                                 "preview_started": True,
                                 "ready_for_preview": True,
+                                "source_frame_width": int(original_w),
+                                "source_frame_height": int(original_h),
+                                "capture_frame_width": int(w),
+                                "capture_frame_height": int(h),
+                                "capture_resized": bool(capture_resized),
                                 "dropped_detection_frames": int(detection_bus.dropped),
                                 "stream_last_frame_age_ms": 0.0,
                             }
                         )
                         self.condition.notify_all()
+                if source_type == "file" and frame_step > 1.01:
+                    if next_read_frame <= packet.frame_idx:
+                        next_read_frame = float(packet.frame_idx) + frame_step
+                    next_index = int(round(next_read_frame))
+                    current_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (packet.frame_idx + 1))
+                    skip_count = max(0, next_index - current_index)
+                    for _ in range(min(skip_count, 8)):
+                        if not cap.grab():
+                            break
+                    next_read_frame += frame_step
                 if source_type == "file" and realtime:
                     elapsed = time.perf_counter() - loop_started
                     wait_s = max(0.0, (frame_period / speed) - elapsed)
@@ -1141,9 +1227,13 @@ class MonitorEngine:
             "warning": bool(overlay.get("ppe_warning")),
             "confirmed": bool(overlay.get("ppe_warning")),
             "person_count": int(overlay.get("ppe_person_count") or 0),
+            "raw_person_count": int(overlay.get("ppe_raw_person_count", overlay.get("ppe_person_count")) or 0),
+            "inferred_person_count": int(overlay.get("ppe_inferred_person_count", overlay.get("ppe_person_count")) or 0),
+            "person_context_count": int(overlay.get("ppe_person_context_count", overlay.get("ppe_person_count")) or 0),
             "helmet_count": int(overlay.get("ppe_helmet_count") or 0),
             "head_count": int(overlay.get("ppe_head_count") or 0),
             "missing_helmet_count": int(overlay.get("ppe_missing_helmet_count") or 0),
+            "uncertain": bool(overlay.get("ppe_uncertain")),
             "reason": overlay.get("ppe_reason") or "",
         }
         return render_preview(

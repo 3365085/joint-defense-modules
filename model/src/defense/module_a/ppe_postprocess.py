@@ -22,6 +22,7 @@ class PPEPostprocessConfig:
     max_helmet_to_person_area_ratio: float = 0.30
     max_isolated_head_area_ratio: float = 0.012
     isolated_head_edge_margin: float = 0.10
+    min_isolated_head_confidence: float = 0.45
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,27 @@ def is_helmet_label(label: str) -> bool:
 
 def is_person_label(label: str) -> bool:
     return label_matches(label, PERSON_HINTS)
+
+
+def infer_ppe_model_capabilities(detections: Any, items: Iterable[PPEDetection] | None = None) -> dict[str, Any]:
+    names = getattr(detections, "names", {}) or {}
+    labels: list[str] = []
+    if isinstance(names, dict):
+        labels.extend(str(value) for value in names.values())
+    elif isinstance(names, (list, tuple)):
+        labels.extend(str(value) for value in names)
+    if items is not None:
+        labels.extend(str(item.label) for item in items)
+
+    has_person_class = any(is_person_label(label) for label in labels)
+    has_head_class = any(is_bare_head_label(label) for label in labels)
+    has_helmet_class = any(is_helmet_label(label) for label in labels)
+    return {
+        "has_person_class": has_person_class,
+        "has_head_class": has_head_class,
+        "has_helmet_class": has_helmet_class,
+        "evidence_mode": "person_context_available" if has_person_class else "head_helmet_only",
+    }
 
 
 def bbox_area(bbox: tuple[float, float, float, float] | None) -> float:
@@ -126,31 +148,66 @@ def suppress_helmet_false_positives(
     detections: Iterable[PPEDetection],
     config: PPEPostprocessConfig | None = None,
     frame_shape: tuple[int, int] | tuple[int, int, int] | None = None,
+    *,
+    has_person_class: bool | None = None,
 ) -> dict[str, Any]:
     cfg = config or PPEPostprocessConfig()
     items = [item for item in detections if item.confidence >= cfg.min_confidence]
     heads = [item for item in items if is_bare_head_label(item.label)]
     helmets = [item for item in items if is_helmet_label(item.label)]
     persons = [item for item in items if is_person_label(item.label)]
+    person_context_available = (
+        any(is_person_label(item.label) for item in items)
+        if has_person_class is None
+        else bool(has_person_class)
+    )
     frame_area = _frame_area(frame_shape)
     suppressed: list[dict[str, Any]] = []
+    suppressed_heads: list[dict[str, Any]] = []
     kept_helmet_indices: set[int] = set()
     suppressed_indices: set[int] = set()
-    isolated_head_indices: set[int] = set()
+    weak_head_indices: set[int] = set()
+    display_suppressed_head_indices: set[int] = set()
+    covered_head_indices: set[int] = set()
 
     for head in heads:
         head_area_ratio = bbox_area(head.bbox) / frame_area if frame_area > 0.0 else 0.0
         edge_margin = bbox_edge_proximity(head.bbox, frame_shape)
         person_context = any(bbox_iou(head.bbox, person.bbox) >= cfg.min_person_context_iou for person in persons)
         helmet_context = any(bbox_iou(head.bbox, helmet.bbox) >= cfg.overlap_iou for helmet in helmets)
-        if not person_context and not helmet_context and head_area_ratio < cfg.max_isolated_head_area_ratio and edge_margin <= cfg.isolated_head_edge_margin:
-            isolated_head_indices.add(head.index)
+        low_context = not person_context and not helmet_context
+        small_isolated = head_area_ratio < cfg.max_isolated_head_area_ratio
+        small_no_context = low_context and small_isolated
+        low_confidence_isolated = small_no_context and head.confidence < cfg.min_isolated_head_confidence
+        edge_isolated = small_no_context and edge_margin <= cfg.isolated_head_edge_margin
+        if small_no_context:
+            weak_head_indices.add(head.index)
+            if low_confidence_isolated:
+                reason = "small_low_conf_head"
+            elif edge_isolated:
+                reason = "edge_isolated_head"
+            else:
+                reason = "small_no_context_head"
+            if edge_isolated:
+                display_suppressed_head_indices.add(head.index)
+            suppressed_heads.append(
+                {
+                    "head_index": head.index,
+                    "head_confidence": head.confidence,
+                    "head_bbox": list(head.bbox) if head.bbox else None,
+                    "head_area_ratio": head_area_ratio,
+                    "edge_margin": edge_margin,
+                    "person_context": person_context,
+                    "helmet_context": helmet_context,
+                    "reason": reason,
+                }
+            )
 
     for helmet in helmets:
         matched_head: PPEDetection | None = None
         matched_iou = 0.0
         for head in heads:
-            if head.index in isolated_head_indices:
+            if head.index in weak_head_indices:
                 continue
             iou = bbox_iou(helmet.bbox, head.bbox)
             if iou > matched_iou:
@@ -167,7 +224,11 @@ def suppress_helmet_false_positives(
         small_target = frame_area > 0.0 and helmet.bbox is not None and bbox_area(helmet.bbox) / frame_area < cfg.small_target_area_ratio
         oversized_isolated = frame_area > 0.0 and helmet.bbox is not None and bbox_area(helmet.bbox) / frame_area > cfg.max_isolated_helmet_area_ratio
         oversized_for_person = max_person_iou >= cfg.min_person_context_iou and min_person_area_ratio > cfg.max_helmet_to_person_area_ratio
-        missing_context = matched_head is None and max_person_iou < cfg.min_person_context_iou
+        missing_context = (
+            person_context_available
+            and matched_head is None
+            and max_person_iou < cfg.min_person_context_iou
+        )
         overlap_weak = (
             matched_head is not None
             and matched_iou >= cfg.overlap_iou
@@ -207,15 +268,20 @@ def suppress_helmet_false_positives(
             )
         else:
             kept_helmet_indices.add(helmet.index)
+            if matched_head is not None and matched_iou >= cfg.overlap_iou:
+                covered_head_indices.add(matched_head.index)
 
     return {
         "kept_helmet_indices": sorted(kept_helmet_indices),
         "suppressed_helmet_indices": sorted(suppressed_indices),
         "suppressed_helmets": suppressed,
-        "suppressed_head_indices": sorted(isolated_head_indices),
+        "suppressed_head_indices": sorted(display_suppressed_head_indices),
+        "weak_head_indices": sorted(weak_head_indices),
+        "suppressed_heads": suppressed_heads,
+        "covered_head_indices": sorted(covered_head_indices),
         "helmet_count_raw": len(helmets),
         "helmet_count_effective": len(kept_helmet_indices),
-        "head_count": len(heads) - len(isolated_head_indices),
+        "head_count": max(0, len(heads) - len(weak_head_indices) - len(covered_head_indices)),
     }
 
 
@@ -226,13 +292,18 @@ def summarize_ppe_from_detections(
 ) -> dict[str, Any]:
     cfg = config or PPEPostprocessConfig()
     items = [item for item in extract_ppe_detections(detections) if item.confidence >= cfg.min_confidence]
-    suppression = suppress_helmet_false_positives(items, cfg, frame_shape=frame_shape)
+    capabilities = infer_ppe_model_capabilities(detections, items)
+    suppression = suppress_helmet_false_positives(
+        items,
+        cfg,
+        frame_shape=frame_shape,
+        has_person_class=bool(capabilities["has_person_class"]),
+    )
     kept_helmets = set(suppression["kept_helmet_indices"])
 
     person_count = 0
     helmet_count = 0
     raw_helmet_count = 0
-    head_count = 0
     raw_head_count = 0
     class_counts: dict[str, int] = {}
     for item in items:
@@ -246,34 +317,51 @@ def summarize_ppe_from_detections(
         elif is_person_label(item.label):
             person_count += 1
 
-    raw_helmet_evidence = raw_helmet_count > 0
     head_count = max(0, int(suppression.get("head_count", 0)))
-    missing_helmet_count = max(person_count - helmet_count, 0) if person_count > 0 else 0
-    if head_count > 0 and not raw_helmet_evidence:
-        missing_helmet_count = max(missing_helmet_count, head_count)
-    candidate = (person_count > 0 or head_count > 0) and missing_helmet_count > 0
+    missing_helmet_count = head_count
+    candidate = head_count > 0
+    suppressed_head_count = len(suppression.get("weak_head_indices", []) or [])
+    inferred_person_count = max(
+        person_count,
+        1 if (raw_head_count > 0 or raw_helmet_count > 0 or helmet_count > 0) else 0,
+    )
+    uncertain = (
+        (person_count > 0 and head_count == 0 and helmet_count == 0)
+        or (suppressed_head_count > 0 and head_count == 0 and helmet_count == 0)
+    )
     if candidate:
-        if suppression["suppressed_helmet_indices"]:
-            reason = "检测到头部/安全帽高重叠，低可信安全帽已降级为未戴帽候选"
-        elif head_count > 0 and not raw_helmet_evidence:
-            reason = "检测到裸头/头部目标，且安全帽证据不足"
-        elif helmet_count == 0:
-            reason = "检测到人员，但未检测到有效安全帽"
-        else:
-            reason = "人员数量多于有效安全帽数量"
-    elif person_count > 0:
-        reason = "检测到人员，安全帽数量满足当前检测结果"
+        reason = (
+            "bare_head_with_suppressed_helmet_evidence"
+            if suppression["suppressed_helmet_indices"]
+            else "bare_head_without_matched_helmet"
+        )
+    elif helmet_count > 0:
+        reason = "helmet_evidence_present"
+    elif uncertain:
+        reason = (
+            "isolated_head_evidence_uncertain"
+            if suppressed_head_count > 0
+            else "person_context_without_head_or_helmet_evidence"
+        )
+    elif capabilities["has_person_class"]:
+        reason = "no_ppe_evidence_detected"
     else:
-        reason = "未检测到人员"
+        reason = "no_head_or_helmet_evidence_detected"
+
     return {
         "person_count": person_count,
+        "person_context_count": person_count,
+        "raw_person_count": person_count,
+        "inferred_person_count": inferred_person_count,
         "helmet_count": helmet_count,
         "raw_helmet_count": raw_helmet_count,
         "raw_head_count": raw_head_count,
         "head_count": head_count,
         "missing_helmet_count": missing_helmet_count,
         "candidate": candidate,
+        "uncertain": uncertain,
         "reason": reason,
         "class_counts": class_counts,
+        **capabilities,
         "helmet_fp_suppression": suppression,
     }

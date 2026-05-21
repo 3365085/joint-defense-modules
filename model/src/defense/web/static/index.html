@@ -997,9 +997,14 @@
         timing_ms: Number(status.timing_ms || 0),
         p_adv: Number(status.p_adv || 0),
         ppe_person_count: Number(status.ppe_person_count || 0),
+        ppe_raw_person_count: Number(status.ppe_raw_person_count ?? status.ppe_person_count ?? 0),
+        ppe_inferred_person_count: Number(status.ppe_inferred_person_count ?? status.ppe_person_count ?? 0),
+        ppe_person_context_count: Number(status.ppe_person_context_count ?? status.ppe_person_count ?? 0),
         ppe_helmet_count: Number(status.ppe_helmet_count || 0),
         ppe_head_count: Number(status.ppe_head_count || 0),
         ppe_missing_helmet_count: Number(status.ppe_missing_helmet_count || 0),
+        ppe_uncertain: Boolean(status.ppe_uncertain),
+        ppe_evidence_mode: status.ppe_evidence_mode || "",
         display_options: status.display_options || {},
       });
       overlayTimeline.push(record);
@@ -1731,7 +1736,7 @@
         $("timing").textContent = Number(status.timing_ms || 0).toFixed(1);
         $("alerts").textContent = status.alert_event_count || 0;
         $("ppeAlerts").textContent = status.ppe_event_count || 0;
-        $("ppeCounts").textContent = `${status.ppe_person_count || 0}/${status.ppe_helmet_count || 0}`;
+        $("ppeCounts").textContent = `头${status.ppe_head_count || 0}/帽${status.ppe_helmet_count || 0}/人${status.ppe_inferred_person_count ?? status.ppe_person_count ?? 0}`;
         $("ppePill").textContent = status.ppe_warning ? "未戴帽" : "业务通道";
         $("ppePill").className = "pill " + (status.ppe_warning ? "alert" : "");
         const featureStatus = status.feature_options || {};
@@ -1783,14 +1788,15 @@
           const eventId = evt.event_id ?? "-";
           const startFrame = evt.trigger_frame ?? evt.started_frame ?? 0;
           const endFrame = evt.last_warning_frame ?? evt.last_alert_frame ?? evt.last_active_frame ?? startFrame;
-          const personCount = evt.person_count ?? evt.ppe_person_count ?? 0;
+          const personCount = evt.inferred_person_count ?? evt.ppe_inferred_person_count ?? evt.person_count ?? evt.ppe_person_count ?? 0;
+          const rawPersonCount = evt.raw_person_count ?? evt.ppe_raw_person_count ?? evt.person_count ?? evt.ppe_person_count ?? 0;
           const headCount = evt.head_count ?? evt.ppe_head_count ?? 0;
           const helmetCount = evt.helmet_count ?? evt.ppe_helmet_count ?? 0;
           return `
           <div class="event ppe">
             <strong>安全帽告警 #${eventId}</strong>
             <div class="main">检测到人员未佩戴安全帽，已按连续帧规则确认。</div>
-            <div class="sub">帧 ${startFrame} - ${endFrame} · 人员 ${personCount} · 裸头 ${headCount} · 安全帽 ${helmetCount}</div>
+            <div class="sub">帧 ${startFrame} - ${endFrame} · 推断人员 ${personCount} · 原始人员 ${rawPersonCount} · 裸头 ${headCount} · 安全帽 ${helmetCount}</div>
             <div class="chips">
               <span class="chip warn">业务安全</span>
               <span class="chip">未戴安全帽</span>
@@ -1852,6 +1858,5 @@
   </script>
 </body>
 </html>
-
 
 

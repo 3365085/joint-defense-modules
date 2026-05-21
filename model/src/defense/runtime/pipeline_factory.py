@@ -73,6 +73,7 @@ def allow_empty_backend_for_profile(profile: str) -> bool:
 class PipelineBundle:
     pipeline: VideoDefensePipeline
     backend: str
+    model_family: str
     artifact_path: str
     config: dict[str, Any]
     warmup_error: str = ""
@@ -155,6 +156,7 @@ class PipelineCache:
             bundle = PipelineBundle(
                 pipeline=pipeline,
                 backend=str(getattr(backend, "backend", "unknown")),
+                model_family=str(config.get("inference", {}).get("model_family", "unknown")),
                 artifact_path=str(getattr(backend, "artifact_path", "")),
                 config=config,
                 warmup_error=warmup_error,

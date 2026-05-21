@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -174,18 +175,119 @@ def infer_backend_from_model_path(path: Path, fallback: str = "onnx") -> str:
     return fallback
 
 
+def _canonical_model_family(value: str, fallback: str = "ultralytics") -> str:
+    family = str(value or fallback).strip().lower()
+    if family == "yolov8":
+        return "ultralytics"
+    if family in {"auto", "yolov5", "ultralytics"}:
+        return family
+    return fallback
+
+
+def _ensure_yolov5_base_importable() -> None:
+    yolov5_root = PROJECT_ROOT / "src" / "defense" / "model_bases" / "yolov5_official"
+    if yolov5_root.exists() and str(yolov5_root) not in sys.path:
+        sys.path.insert(0, str(yolov5_root))
+
+
+def _infer_pt_model_family(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        import torch
+    except Exception:
+        return None
+
+    _ensure_yolov5_base_importable()
+    load_kwargs: dict[str, Any] = {"map_location": "cpu"}
+    try:
+        checkpoint = torch.load(path, **load_kwargs, weights_only=False)
+    except TypeError:
+        try:
+            checkpoint = torch.load(path, **load_kwargs)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    model = checkpoint
+    if isinstance(checkpoint, dict):
+        model = checkpoint.get("ema") or checkpoint.get("model") or checkpoint
+    module_name = type(model).__module__.lower()
+    class_name = type(model).__name__.lower()
+    if module_name.startswith("ultralytics.") or "ultralytics" in module_name:
+        return "ultralytics"
+    if module_name.startswith("models.") or "yolov5" in module_name:
+        return "yolov5"
+    if "detectionmodel" in class_name and hasattr(model, "yaml"):
+        yaml_data = getattr(model, "yaml", {})
+        if isinstance(yaml_data, dict) and "anchors" in yaml_data:
+            return "yolov5"
+    return None
+
+
+def _infer_onnx_model_family(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        import onnx
+    except Exception:
+        return None
+    try:
+        model = onnx.load(str(path), load_external_data=False)
+    except Exception:
+        return None
+
+    producer = str(getattr(model, "producer_name", "") or "").lower()
+    if "ultralytics" in producer:
+        return "ultralytics"
+    metadata = {
+        str(item.key).lower(): str(item.value).lower()
+        for item in getattr(model, "metadata_props", [])
+    }
+    metadata_text = " ".join([producer, *metadata.keys(), *metadata.values()])
+    if "yolov5" in metadata_text:
+        return "yolov5"
+    if "yolov8" in metadata_text or "yolo11" in metadata_text or "ultralytics" in metadata_text:
+        return "ultralytics"
+
+    for output in model.graph.output:
+        dims: list[int] = []
+        for dim in output.type.tensor_type.shape.dim:
+            value = int(dim.dim_value or 0)
+            dims.append(value)
+        if len(dims) == 3:
+            _, axis_a, axis_b = dims
+            if 0 < axis_a <= 128 and axis_b > axis_a:
+                return "ultralytics"
+            if axis_a > axis_b and 0 < axis_b <= 128:
+                return "yolov5"
+    return None
+
+
+def infer_model_family_from_model_path(path: Path, fallback: str = "ultralytics") -> str:
+    fallback = _canonical_model_family(fallback, "ultralytics")
+    if fallback == "auto":
+        fallback = "ultralytics"
+    suffix = path.suffix.lower()
+    if suffix in {".pt", ".pth"}:
+        return _infer_pt_model_family(path) or fallback
+    if suffix == ".onnx":
+        return _infer_onnx_model_family(path) or fallback
+    return fallback
+
+
 def normalize_custom_model_options(custom_model: dict[str, Any] | None) -> dict[str, Any]:
     custom_model = custom_model or {}
     enabled = bool(custom_model.get("enabled", False))
     path = str(custom_model.get("path", "") or "").strip()
     backend = str(custom_model.get("backend", "auto") or "auto").strip().lower()
-    model_family = str(custom_model.get("model_family", "yolov5") or "yolov5").strip().lower()
+    model_family = _canonical_model_family(
+        str(custom_model.get("model_family", "auto") or "auto"),
+        "auto",
+    )
     if backend not in {"auto", "tensorrt", "onnx", "pytorch"}:
         backend = "auto"
-    if model_family not in {"yolov5", "ultralytics", "yolov8"}:
-        model_family = "yolov5"
-    if model_family == "yolov8":
-        model_family = "ultralytics"
     return {
         "enabled": enabled and bool(path),
         "path": path,
@@ -200,12 +302,25 @@ def apply_custom_model(config: dict[str, Any], custom_model: dict[str, Any]) -> 
         return resolved
     path = Path(str(resolved.get("path", ""))).expanduser()
     backend = str(resolved.get("backend", "auto"))
+    inferred_backend = infer_backend_from_model_path(path, "")
     if backend == "auto":
-        backend = infer_backend_from_model_path(path, str(get_nested(config, "inference.backend", "onnx")))
+        backend = inferred_backend or str(get_nested(config, "inference.backend", "onnx"))
+    elif inferred_backend and backend != inferred_backend:
+        raise ValueError(
+            f"Custom model backend does not match file suffix: {path.suffix or '<no suffix>'} "
+            f"should use {inferred_backend}, got {backend}"
+        )
     resolved["backend"] = backend
     inference = config.setdefault("inference", {})
+    model_family = _canonical_model_family(str(resolved.get("model_family", "auto")), "auto")
+    if model_family == "auto":
+        model_family = infer_model_family_from_model_path(path, "ultralytics")
+        resolved["model_family_auto_detected"] = True
+    else:
+        resolved["model_family_auto_detected"] = False
+    resolved["model_family"] = model_family
     inference["backend"] = backend
-    inference["model_family"] = resolved.get("model_family", inference.get("model_family", "yolov5"))
+    inference["model_family"] = model_family
     artifacts = inference.setdefault("artifacts", {})
     key = "engine" if backend == "tensorrt" else backend
     artifacts[key] = [str(path)]

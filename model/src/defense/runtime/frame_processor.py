@@ -279,6 +279,11 @@ class FrameProcessor:
         ppe_boxes_count = _int(ppe.get("person_count")) + _int(ppe.get("helmet_count")) + _int(ppe.get("head_count"))
         tracked_boxes_count = len([track for track in ppe_tracks if str(track.get("source", "detected")) in {"tracked", "held"}])
         render_boxes_count = len(ppe_tracks)
+        bundle_config = self.bundle.config if isinstance(self.bundle.config, dict) else {}
+        runtime_config = bundle_config.get("runtime", {}) if isinstance(bundle_config.get("runtime"), dict) else {}
+        resolved_custom_model = runtime_config.get("custom_model", custom_model)
+        if not isinstance(resolved_custom_model, dict):
+            resolved_custom_model = custom_model
         status = {
             "running": True,
             "source_type": source_type,
@@ -286,6 +291,7 @@ class FrameProcessor:
             "profile": profile,
             "realtime": bool(realtime),
             "backend": self.bundle.backend,
+            "model_family": self.bundle.model_family,
             "artifact": self.bundle.artifact_path,
             "frame_idx": int(frame_idx),
             "video_time_s": float(video_time_s),
@@ -344,7 +350,7 @@ class FrameProcessor:
             "ppe_roi_redetect_count": int(redetect_count),
             "ppe_roi_redetect_ms": float(redetect_ms),
             "feature_options": dict(feature_options),
-            "custom_model": dict(custom_model),
+            "custom_model": dict(resolved_custom_model),
             "display_options": dict(display_options),
             "preview_mode": "async_latest_frame" if realtime else "sync_detection_frame",
             "error": "",

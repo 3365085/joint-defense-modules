@@ -313,6 +313,7 @@ class MonitorEngine:
             "source": None,
             "profile": "default",
             "backend": None,
+            "model_family": None,
             "artifact": None,
             "frame_idx": 0,
             "fps": 0.0,
@@ -490,7 +491,13 @@ class MonitorEngine:
                     self.status.update(
                         {
                             "backend": preload_bundle.backend,
+                            "model_family": preload_bundle.model_family,
                             "artifact": preload_bundle.artifact_path,
+                            "custom_model": dict(
+                                preload_bundle.config.get("runtime", {}).get(
+                                    "custom_model", custom_model_options
+                                )
+                            ),
                             "initializing": False,
                             "detector_ready": True,
                             "init_ms": init_ms,
@@ -931,7 +938,11 @@ class MonitorEngine:
                     self.status.update(
                         {
                             "backend": bundle.backend,
+                            "model_family": bundle.model_family,
                             "artifact": bundle.artifact_path,
+                            "custom_model": dict(
+                                bundle.config.get("runtime", {}).get("custom_model", custom_model)
+                            ),
                             "evidence_session_dir": str(evidence.session_dir),
                             "evidence_manifest_path": str(evidence.manifest_path),
                             "detector_ready": True,

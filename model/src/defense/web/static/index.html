@@ -589,7 +589,7 @@
         </select>
         <label id="sourceValueLabel">MP4 文件</label>
         <div id="pathRow" class="fieldRow">
-          <input id="sourceValue" value="D:\security_project_d\素材\手机随意录制的视频\固定镜头室外视频.mp4" />
+          <input id="sourceValue" value="D:\联合防御模块\素材\手机随意录制的视频\固定镜头室外视频.mp4" />
           <button class="secondary" id="browseBtn" type="button">浏览</button>
           <button class="secondary" id="testSourceBtn" type="button" style="display:none;">连通检测</button>
         </div>
@@ -627,6 +627,7 @@
           </select>
           <label>模型类型</label>
           <select id="customModelFamily">
+            <option value="auto">自动识别模型类型</option>
             <option value="ultralytics">Ultralytics YOLOv8/YOLO11</option>
             <option value="yolov5">原版 YOLOv5</option>
           </select>
@@ -770,6 +771,20 @@
 
     function profileLabel(value) {
       return profileLabels[value] || value || "-";
+    }
+    function modelFamilyLabel(value) {
+      const labels = {
+        auto: "自动",
+        ultralytics: "Ultralytics",
+        yolov5: "YOLOv5",
+        yolov8: "Ultralytics",
+      };
+      return labels[value] || value || "-";
+    }
+    function backendLabel(status) {
+      const backend = status?.backend || "-";
+      const family = status?.model_family || status?.custom_model?.model_family || "";
+      return family ? `${backend} / ${modelFamilyLabel(family)}` : backend;
     }
     function setError(text) {
       $("error").textContent = text || "";
@@ -1244,7 +1259,7 @@
       $("enableCustomModel").checked = customStatus.enabled === true;
       if (customStatus.path) $("customModelPath").value = customStatus.path;
       $("customModelBackend").value = customStatus.backend || "auto";
-      $("customModelFamily").value = customStatus.model_family || "ultralytics";
+      $("customModelFamily").value = customStatus.model_family || "auto";
       inferCustomModelSelection();
       syncCustomModelPanelVisibility();
     }
@@ -1254,13 +1269,10 @@
       if (!path || $("customModelBackend").value !== "auto") return;
       if (path.endsWith(".engine")) {
         $("customModelBackend").value = "tensorrt";
-        $("customModelFamily").value = "yolov5";
       } else if (path.endsWith(".onnx")) {
         $("customModelBackend").value = "onnx";
-        $("customModelFamily").value = "yolov5";
       } else if (path.endsWith(".pt") || path.endsWith(".pth")) {
         $("customModelBackend").value = "pytorch";
-        $("customModelFamily").value = "yolov5";
       }
     }
 
@@ -1344,8 +1356,12 @@
         const source = localStorage.getItem("moduleA.lastSourcePath");
         const model = localStorage.getItem("moduleA.lastModelPath");
         const modelEnabled = localStorage.getItem("moduleA.lastCustomModelEnabled");
+        const modelBackend = localStorage.getItem("moduleA.lastCustomModelBackend");
+        const modelFamily = localStorage.getItem("moduleA.lastCustomModelFamily");
         if (source) $("sourceValue").value = source;
         if (model) $("customModelPath").value = model;
+        if (modelBackend) $("customModelBackend").value = modelBackend;
+        if (modelFamily) $("customModelFamily").value = modelFamily;
         inferCustomModelSelection();
         if (modelEnabled === "true") {
           $("enableCustomModel").checked = true;
@@ -1386,6 +1402,8 @@
         if ($("sourceValue").value) localStorage.setItem("moduleA.lastSourcePath", $("sourceValue").value);
         if ($("customModelPath").value) localStorage.setItem("moduleA.lastModelPath", $("customModelPath").value);
         localStorage.setItem("moduleA.lastCustomModelEnabled", $("enableCustomModel").checked ? "true" : "false");
+        localStorage.setItem("moduleA.lastCustomModelBackend", $("customModelBackend").value || "auto");
+        localStorage.setItem("moduleA.lastCustomModelFamily", $("customModelFamily").value || "auto");
       } catch (_) {}
     }
 
@@ -1442,6 +1460,7 @@
         if (data.path) {
           $("customModelPath").value = data.path;
           $("customModelBackend").value = "auto";
+          $("customModelFamily").value = "auto";
           inferCustomModelSelection();
           setCustomModelDraftDirty();
           setError("");
@@ -1557,6 +1576,7 @@
     };
     $("customModelPath").onchange = () => {
       $("customModelBackend").value = "auto";
+      $("customModelFamily").value = "auto";
       inferCustomModelSelection();
       setCustomModelDraftDirty();
     };
@@ -1647,6 +1667,7 @@
         };
         saveLastPaths();
         const data = await api("/api/start", body);
+        customModelDraftDirty = false;
         const status = data.status || {};
         lastOverlayStatus = status;
         updateRunControls(status);
@@ -1704,7 +1725,7 @@
         renderBranchCards(status.branch_cards || []);
         renderModelSecurity(status.model_security || {});
         $("profilePill").textContent = profileLabel(status.profile || $("profile").value);
-        $("backendPill").textContent = status.backend || "-";
+        $("backendPill").textContent = backendLabel(status);
         $("frame").textContent = status.frame_idx ?? 0;
         $("pAdv").textContent = Number(status.p_adv || 0).toFixed(3);
         $("timing").textContent = Number(status.timing_ms || 0).toFixed(1);
@@ -1831,8 +1852,6 @@
   </script>
 </body>
 </html>
-
-
 
 
 

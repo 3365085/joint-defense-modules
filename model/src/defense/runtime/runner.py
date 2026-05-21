@@ -532,8 +532,14 @@ class MonitorEngine:
         detector_process_fps_cap = float(
             runtime_config.get("detector_process_fps_cap", runtime_config.get("process_fps_cap", 15)) or 15
         )
-        capture_max_side = int(runtime_config.get("capture_max_side", 1280) or 1280)
-        file_source_fps_cap = float(runtime_config.get("file_source_fps_cap", 0.0) or 0.0)
+        capture_max_side = int(runtime_config.get("capture_max_side", preview_max_side) or preview_max_side)
+        file_source_fps_cap = float(
+            runtime_config.get(
+                "file_source_fps_cap",
+                preview_render_fps if source_type == "file" else 0.0,
+            )
+            or 0.0
+        )
         preview_bus = PreviewBus()
         detection_bus = DetectionBus()
         with self.condition:
@@ -813,6 +819,10 @@ class MonitorEngine:
         last_frame_seen = time.perf_counter()
         reconnects = 0
         next_read_frame = 0.0
+        playback_anchor_wall = time.perf_counter()
+        playback_anchor_frame = 0.0
+        playback_clock_speed = 1.0
+        playback_was_paused = False
         try:
             cap = open_capture(source_type, source)
             fps, duration_s, frame_count = self._read_capture_meta(cap)
@@ -859,13 +869,25 @@ class MonitorEngine:
                 if seek_request is not None and source_type == "file":
                     cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(seek_request)) * 1000.0)
                     next_read_frame = max(0.0, float(seek_request) * fps)
+                    playback_anchor_wall = time.perf_counter()
+                    playback_anchor_frame = next_read_frame
+                    playback_clock_speed = speed
+                    playback_was_paused = False
                     with self.condition:
                         if run_id == self.run_id:
                             self.status["source_epoch"] = current_epoch
                     continue
                 if paused and source_type == "file":
+                    playback_was_paused = True
                     time.sleep(0.03)
                     continue
+                if source_type == "file" and realtime:
+                    current_index_for_anchor = float(cap.get(cv2.CAP_PROP_POS_FRAMES) or next_read_frame)
+                    if playback_was_paused or abs(float(speed) - float(playback_clock_speed)) > 1e-3:
+                        playback_anchor_wall = time.perf_counter()
+                        playback_anchor_frame = current_index_for_anchor
+                        playback_clock_speed = float(speed)
+                        playback_was_paused = False
 
                 ok, frame = cap.read()
                 if not ok or frame is None:
@@ -938,16 +960,15 @@ class MonitorEngine:
                             }
                         )
                         self.condition.notify_all()
-                if source_type == "file" and frame_step > 1.01:
-                    if next_read_frame <= packet.frame_idx:
-                        next_read_frame = float(packet.frame_idx) + frame_step
+                if source_type == "file" and realtime:
+                    clock_target = playback_anchor_frame + max(0.0, time.perf_counter() - playback_anchor_wall) * float(speed) * max(1.0, fps)
+                    next_read_frame = max(float(packet.frame_idx) + frame_step, clock_target)
                     next_index = int(round(next_read_frame))
                     current_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (packet.frame_idx + 1))
                     skip_count = max(0, next_index - current_index)
-                    for _ in range(min(skip_count, 8)):
+                    for _ in range(min(skip_count, 120)):
                         if not cap.grab():
                             break
-                    next_read_frame += frame_step
                 if source_type == "file" and realtime:
                     elapsed = time.perf_counter() - loop_started
                     wait_s = max(0.0, (frame_period / speed) - elapsed)
@@ -1103,15 +1124,14 @@ class MonitorEngine:
         last_seq = 0
         while run_id == self.run_id and not self.stop_event.is_set():
             started = time.perf_counter()
-            packet = preview_bus.wait_for_frame(last_seq, timeout=interval)
-            if packet is not None:
-                last_seq = packet.seq
-            else:
-                packet = preview_bus.latest_packet_if_open()
+            packet = preview_bus.latest_packet_if_open()
+            if packet is None:
+                packet = preview_bus.wait_for_frame(last_seq, timeout=interval)
             if packet is None:
                 if preview_bus.closed:
                     break
                 continue
+            last_seq = packet.seq
             try:
                 overlay = self._select_preview_overlay(packet.source_time_s, packet.epoch)
                 rendered = self._render_backend_preview(packet, overlay)

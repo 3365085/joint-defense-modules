@@ -327,6 +327,9 @@ class MonitorEngine:
             "processing_ms": 0.0,
             "detector_inference_ms": 0.0,
             "module_a_timing_ms": 0.0,
+            "a3b_static_media_ms": 0.0,
+            "target_frame_budget_ms": 0.0,
+            "processing_budget_ok": True,
             "p_adv": None,
             "p_adv_display": 0.0,
             "p_adv_missing_reason": "not_started",
@@ -397,6 +400,20 @@ class MonitorEngine:
             "capture_resized": False,
             "preview_never_wait_for_detection": True,
             "init_ms": 0.0,
+            "pipeline_cache_hit": False,
+            "pipeline_cache_get_ms": 0.0,
+            "pipeline_config_load_ms": 0.0,
+            "pipeline_backend_create_ms": 0.0,
+            "pipeline_construct_ms": 0.0,
+            "pipeline_warmup_ms": 0.0,
+            "pipeline_warmup_frames": 0,
+            "pipeline_reset_ms": 0.0,
+            "first_detection_processing_ms": 0.0,
+            "first_detection_timing_ms": 0.0,
+            "first_detection_detector_inference_ms": 0.0,
+            "first_detection_module_a_timing_ms": 0.0,
+            "first_detection_frame_idx": 0,
+            "first_detection_source_time_s": 0.0,
             "video_time_s": 0.0,
             "source_time_s": 0.0,
             "source_epoch": 0,
@@ -420,6 +437,10 @@ class MonitorEngine:
             "ppe_boxes_count": 0,
             "tracked_boxes_count": 0,
             "render_boxes_count": 0,
+            "ppe_roi_redetect_budget_ok": True,
+            "ppe_roi_redetect_triggered": False,
+            "ppe_roi_redetect_count": 0,
+            "ppe_roi_redetect_ms": 0.0,
         }
         status["branch_cards"] = build_branch_cards(status)
         return status
@@ -515,6 +536,14 @@ class MonitorEngine:
                             "initializing": False,
                             "detector_ready": True,
                             "init_ms": init_ms,
+                            "pipeline_cache_hit": bool(preload_bundle.cache_hit),
+                            "pipeline_cache_get_ms": float(preload_bundle.cache_get_ms),
+                            "pipeline_config_load_ms": float(preload_bundle.config_load_ms),
+                            "pipeline_backend_create_ms": float(preload_bundle.backend_create_ms),
+                            "pipeline_construct_ms": float(preload_bundle.pipeline_construct_ms),
+                            "pipeline_warmup_ms": float(preload_bundle.warmup_ms),
+                            "pipeline_warmup_frames": int(preload_bundle.warmup_frames),
+                            "pipeline_reset_ms": float(preload_bundle.pipeline_reset_ms),
                             "warmup_error": preload_bundle.warmup_error,
                             "preview_mode": "mp4_clock_prepare" if source_type == "file" else "detector_ready_wait_first_frame",
                         }
@@ -1311,6 +1340,22 @@ class MonitorEngine:
             processed.status["display_options"] = dict(display_options)
             if extra_status:
                 processed.status.update(extra_status)
+            first_detection_pending = not bool(self.status.get("first_detection_ready"))
+            if first_detection_pending:
+                processed.status["first_detection_processing_ms"] = float(
+                    processed.status.get("processing_ms") or 0.0
+                )
+                processed.status["first_detection_timing_ms"] = float(processed.status.get("timing_ms") or 0.0)
+                processed.status["first_detection_detector_inference_ms"] = float(
+                    processed.status.get("detector_inference_ms") or 0.0
+                )
+                processed.status["first_detection_module_a_timing_ms"] = float(
+                    processed.status.get("module_a_timing_ms") or 0.0
+                )
+                processed.status["first_detection_frame_idx"] = int(processed.status.get("frame_idx") or 0)
+                processed.status["first_detection_source_time_s"] = float(
+                    processed.status.get("source_time_s", processed.status.get("video_time_s", 0.0)) or 0.0
+                )
             was_running = bool(self.status.get("running"))
             source_ended = bool(self.status.get("source_ended"))
             ended_status = {

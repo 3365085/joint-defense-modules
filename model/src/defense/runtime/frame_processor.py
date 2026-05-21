@@ -213,6 +213,7 @@ class FrameProcessor:
             redetect_count=redetect_count,
             redetect_ms=redetect_ms,
             processing_ms=process_total_s * 1000.0,
+            target_frame_budget_ms=target_frame_budget_ms,
             raw_boxes_count=len(getattr(detections, "boxes", []) or []),
         )
         return ProcessedFrame(
@@ -247,11 +248,13 @@ class FrameProcessor:
         redetect_count: int,
         redetect_ms: float,
         processing_ms: float,
+        target_frame_budget_ms: float,
         raw_boxes_count: int,
     ) -> dict[str, Any]:
         static_media = dict(_static_media_details(info))
         static_media["source_path"] = source
         latency = info.get("latency_breakdown", {}) if isinstance(info.get("latency_breakdown"), dict) else {}
+        module_breakdown = latency.get("module_a_breakdown", {}) if isinstance(latency.get("module_a_breakdown"), dict) else {}
         p_adv = info.get("p_adv")
         a3b_soft = self.a3b_soft.update(static_media)
         a3b_triggered = bool(a3b_soft["triggered"])
@@ -291,6 +294,9 @@ class FrameProcessor:
             "processing_ms": float(processing_ms),
             "detector_inference_ms": _float(info.get("detector_inference_ms")),
             "module_a_timing_ms": _float(info.get("module_a_timing_ms")),
+            "a3b_static_media_ms": _float(module_breakdown.get("a3b_static_media_ms")),
+            "target_frame_budget_ms": float(target_frame_budget_ms),
+            "processing_budget_ok": bool(processing_ms <= target_frame_budget_ms),
             "latency_breakdown": latency,
             "detector_reuse_hit": bool(latency.get("detector_reuse_hit", False)),
             "detector_change_score": _float(latency.get("detector_change_score")),
@@ -342,6 +348,7 @@ class FrameProcessor:
             "tracked_boxes_count": int(tracked_boxes_count),
             "render_boxes_count": int(render_boxes_count),
             "ppe_roi_redetect_budget_ok": bool(redetect_budget_ok),
+            "ppe_roi_redetect_triggered": bool(redetect_count > 0),
             "ppe_roi_redetect_count": int(redetect_count),
             "ppe_roi_redetect_ms": float(redetect_ms),
             "feature_options": dict(feature_options),

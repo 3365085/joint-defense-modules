@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,14 @@ class PipelineBundle:
     artifact_path: str
     config: dict[str, Any]
     warmup_error: str = ""
+    cache_hit: bool = False
+    cache_get_ms: float = 0.0
+    config_load_ms: float = 0.0
+    backend_create_ms: float = 0.0
+    pipeline_construct_ms: float = 0.0
+    warmup_ms: float = 0.0
+    warmup_frames: int = 0
+    pipeline_reset_ms: float = 0.0
 
 
 class PipelineCache:
@@ -106,6 +115,7 @@ class PipelineCache:
         feature_options: dict[str, Any] | None = None,
         custom_model: dict[str, Any] | None = None,
     ) -> PipelineBundle:
+        get_started = time.perf_counter()
         configure_runtime_threads()
         normalized_custom = normalize_custom_model_options(custom_model)
         key = (
@@ -119,21 +129,33 @@ class PipelineCache:
         )
         with self._lock:
             if self._bundle is not None and self._key == key:
+                reset_started = time.perf_counter()
                 self._bundle.pipeline.reset()
+                self._bundle.cache_hit = True
+                self._bundle.cache_get_ms = (time.perf_counter() - get_started) * 1000.0
+                self._bundle.config_load_ms = 0.0
+                self._bundle.backend_create_ms = 0.0
+                self._bundle.pipeline_construct_ms = 0.0
+                self._bundle.warmup_ms = 0.0
+                self._bundle.warmup_frames = 0
+                self._bundle.pipeline_reset_ms = (time.perf_counter() - reset_started) * 1000.0
                 return self._bundle
 
+            config_started = time.perf_counter()
             config = load_runtime_config(
                 config_path=self.config_path,
                 profile=str(profile or "default"),
                 feature_options=feature_options,
                 custom_model=normalized_custom,
             )
+            config_load_ms = (time.perf_counter() - config_started) * 1000.0
             runtime_config = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
             allow_empty_backend = bool(runtime_config.get("allow_empty_backend", False))
             if allow_empty_backend and not allow_empty_backend_for_profile(str(profile or "default")):
                 raise RuntimeError(
                     f"runtime.allow_empty_backend is only allowed for profiles: {', '.join(sorted(EMPTY_BACKEND_PROFILES))}"
                 )
+            backend_started = time.perf_counter()
             if allow_empty_backend:
                 backend = EmptyDetectorBackend()
             else:
@@ -141,18 +163,27 @@ class PipelineCache:
                     backend = create_detector_backend(config, self.root)
                 except Exception as exc:
                     raise RuntimeError(f"{exc}\n{missing_artifact_message(config, self.root)}") from exc
+            backend_create_ms = (time.perf_counter() - backend_started) * 1000.0
+            construct_started = time.perf_counter()
             pipeline = VideoDefensePipeline(backend, config=config)
+            pipeline_construct_ms = (time.perf_counter() - construct_started) * 1000.0
             warmup_frames = int(getattr(pipeline, "warmup_frames", 0) or 0)
             warmup_error = ""
+            warmup_started = time.perf_counter()
+            warmup_ms = 0.0
+            reset_ms = 0.0
             try:
                 pipeline.warmup(warmup_frames)
-                pipeline.reset()
             except Exception as exc:
                 # Warmup is an optimization, not a correctness requirement. The
                 # actual inference error will still surface during processing.
                 warmup_error = f"{type(exc).__name__}: {exc}"
                 traceback.print_exc()
+            finally:
+                warmup_ms = (time.perf_counter() - warmup_started) * 1000.0
+                reset_started = time.perf_counter()
                 pipeline.reset()
+                reset_ms = (time.perf_counter() - reset_started) * 1000.0
             bundle = PipelineBundle(
                 pipeline=pipeline,
                 backend=str(getattr(backend, "backend", "unknown")),
@@ -160,6 +191,14 @@ class PipelineCache:
                 artifact_path=str(getattr(backend, "artifact_path", "")),
                 config=config,
                 warmup_error=warmup_error,
+                cache_hit=False,
+                cache_get_ms=(time.perf_counter() - get_started) * 1000.0,
+                config_load_ms=config_load_ms,
+                backend_create_ms=backend_create_ms,
+                pipeline_construct_ms=pipeline_construct_ms,
+                warmup_ms=warmup_ms,
+                warmup_frames=warmup_frames,
+                pipeline_reset_ms=reset_ms,
             )
             self._bundle = bundle
             self._key = key

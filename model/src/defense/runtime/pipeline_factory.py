@@ -103,6 +103,10 @@ class PipelineCache:
             bundle = self._bundle
             self._bundle = None
             self._key = None
+        self._close_bundle(bundle)
+
+    @staticmethod
+    def _close_bundle(bundle: PipelineBundle | None) -> None:
         if bundle is not None:
             close_pipeline = getattr(bundle.pipeline, "close", None)
             if callable(close_pipeline):
@@ -141,6 +145,10 @@ class PipelineCache:
                 self._bundle.pipeline_reset_ms = (time.perf_counter() - reset_started) * 1000.0
                 return self._bundle
 
+            stale_bundle = self._bundle
+            self._bundle = None
+            self._key = None
+            self._close_bundle(stale_bundle)
             config_started = time.perf_counter()
             config = load_runtime_config(
                 config_path=self.config_path,

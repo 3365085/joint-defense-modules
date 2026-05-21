@@ -9,8 +9,6 @@ import cv2
 import numpy as np
 
 from defense.module_a.postprocess import PPEDisplayTracker, merge_roi_detections
-from defense.visualization import render_preview
-
 from .a3b_soft_trigger import A3BSoftTriggerState
 from .pipeline_factory import PipelineBundle
 from .ppe_business import evaluate_ppe_business
@@ -192,15 +190,6 @@ class FrameProcessor:
         )
         ppe = ppe_result.ppe
         ppe_tracks = ppe_result.tracks
-        rendered = render_preview(
-            frame_640,
-            info=info,
-            ppe=ppe,
-            ppe_tracks=ppe_tracks,
-            display_options=display_options,
-            frame_idx=frame_idx,
-        )
-
         process_total_s = time.perf_counter() - started
         self.processing_history.append(process_total_s)
         fps = 1.0 / (sum(self.processing_history) / len(self.processing_history)) if self.processing_history else 0.0
@@ -229,7 +218,7 @@ class FrameProcessor:
         return ProcessedFrame(
             frame_idx=frame_idx,
             frame_640=frame_640,
-            rendered_frame=rendered,
+            rendered_frame=frame_640,
             info=info,
             ppe=ppe,
             ppe_tracks=ppe_tracks,

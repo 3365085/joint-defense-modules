@@ -25,6 +25,9 @@ from .scheduler import ModuleAScheduler
 def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> None:
     config = config or {}
     module_config = config.get("module_a", config)
+    runtime_config = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
+    realtime_profile = str(runtime_config.get("profile") or "").lower()
+    default_multiscale_fallback = realtime_profile not in {"desktop_rtx", "edge_fast", "low_power"}
     detector.require_gpu = bool(module_config.get("require_gpu", True))
     detector.profile_cuda_sync = bool(module_config.get("profile_cuda_sync", False))
     strict_gpu = os.environ.get("MODULE_A_STRICT_GPU", "0") == "1"
@@ -386,7 +389,7 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
         max_tracks=module_config.get("static_image_max_tracks", 64),
         emit_roi_details=detector.emit_roi_motion_details,
         multiscale_fallback_enabled=module_config.get(
-            "static_image_multiscale_fallback_enabled", True
+            "static_image_multiscale_fallback_enabled", default_multiscale_fallback
         ),
         multiscale_trigger_count=module_config.get(
             "static_image_multiscale_trigger_count", 1

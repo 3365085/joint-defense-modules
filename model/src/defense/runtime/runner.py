@@ -533,13 +533,7 @@ class MonitorEngine:
             runtime_config.get("detector_process_fps_cap", runtime_config.get("process_fps_cap", 15)) or 15
         )
         capture_max_side = int(runtime_config.get("capture_max_side", 1280) or 1280)
-        file_source_fps_cap = float(
-            runtime_config.get(
-                "file_source_fps_cap",
-                max(float(preview_render_fps), float(detector_process_fps_cap)),
-            )
-            or 0.0
-        )
+        file_source_fps_cap = float(runtime_config.get("file_source_fps_cap", 0.0) or 0.0)
         preview_bus = PreviewBus()
         detection_bus = DetectionBus()
         with self.condition:
@@ -794,7 +788,7 @@ class MonitorEngine:
         fps = max(1.0, float(source_fps or 0.0))
         cap = float(file_source_fps_cap or 0.0)
         if cap <= 0.0:
-            cap = max(float(preview_render_fps or 0.0), float(detector_fps or 0.0), 1.0)
+            return 1.0
         return max(1.0, fps / max(1.0, min(fps, cap)))
 
     def _backend_capture_loop(

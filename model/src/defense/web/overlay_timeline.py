@@ -17,11 +17,21 @@ def _clone_track(track: dict[str, Any]) -> dict[str, Any]:
     return clone
 
 
+def _can_hold_track(track: dict[str, Any]) -> bool:
+    return bool(track.get("hold_eligible", True))
+
+
 def _lerp(a: Any, b: Any, ratio: float) -> float:
     return _num(a) + (_num(b) - _num(a)) * ratio
 
 
-def interpolate_overlay(prev: dict[str, Any], next_item: dict[str, Any], video_time_s: float) -> dict[str, Any] | None:
+def interpolate_overlay(
+    prev: dict[str, Any],
+    next_item: dict[str, Any],
+    video_time_s: float,
+    *,
+    keep_unmatched_tracks: bool = True,
+) -> dict[str, Any] | None:
     left = _num(prev.get("video_time_s"), float("nan"))
     right = _num(next_item.get("video_time_s"), float("nan"))
     if right <= left:
@@ -32,6 +42,9 @@ def interpolate_overlay(prev: dict[str, Any], next_item: dict[str, Any], video_t
     for track in prev.get("ppe_tracks", []):
         key = str(track.get("track_id", track.get("id", "")))
         later = next_by_id.get(key)
+        if later is None:
+            if not keep_unmatched_tracks or not _can_hold_track(track):
+                continue
         clone = _clone_track(track)
         if later and len(track.get("box") or []) >= 4 and len(later.get("box") or []) >= 4:
             clone["box"] = [_lerp(track["box"][idx], later["box"][idx], ratio) for idx in range(4)]
@@ -97,7 +110,11 @@ class OverlayTimeline:
         out = dict(self.last_held)
         out["video_time_s"] = float(video_time_s)
         out["held"] = True
-        out["ppe_tracks"] = [_clone_track(track) | {"source": "held"} for track in self.last_held.get("ppe_tracks", [])]
+        out["ppe_tracks"] = [
+            _clone_track(track) | {"source": "held"}
+            for track in self.last_held.get("ppe_tracks", [])
+            if _can_hold_track(track)
+        ]
         return out
 
     def select(
@@ -108,13 +125,19 @@ class OverlayTimeline:
         interpolate_s: float = 0.4,
         hold_s: float = 0.55,
         max_age_s: float = 0.95,
+        keep_unmatched_tracks: bool = True,
     ) -> dict[str, Any] | None:
         # Prefer interpolation while the display clock is between two detector
         # records.  Nearest-first selection makes boxes jump/drag at detector FPS
         # because the same older record is held until a newer one becomes closer.
         bracket = self.find_bracket(video_time_s, interpolate_s)
         if bracket is not None:
-            mixed = interpolate_overlay(bracket[0], bracket[1], video_time_s)
+            mixed = interpolate_overlay(
+                bracket[0],
+                bracket[1],
+                video_time_s,
+                keep_unmatched_tracks=keep_unmatched_tracks,
+            )
             if mixed is not None:
                 self.last_held = mixed
                 return mixed

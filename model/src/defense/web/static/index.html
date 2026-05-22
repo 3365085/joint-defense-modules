@@ -1056,11 +1056,14 @@
 
     function selectOverlayRecord(videoTime) {
       if (!Number.isFinite(videoTime)) return null;
+      const isFileRealtimePreview = (lastOverlayStatus?.source_type || "") === "file"
+        && lastOverlayStatus?.realtime !== false;
       return overlayTimeline.select(videoTime, {
         matchWindowSec: Math.max(0.02, Number(overlayMatchWindowMs || 180) / 1000.0),
         interpolateSec: Math.max(0, Number(overlayInterpolateMs || 400) / 1000.0),
         holdSec: Math.max(0, Number(overlayHoldMs || 550) / 1000.0),
         maxAgeSec: Math.max(0.12, Number(overlayMaxAgeMs || 950) / 1000.0),
+        keepUnmatchedTracks: !isFileRealtimePreview,
       });
     }
 
@@ -1859,4 +1862,3 @@
   </script>
 </body>
 </html>
-

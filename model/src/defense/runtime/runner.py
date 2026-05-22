@@ -1183,6 +1183,19 @@ class MonitorEngine:
             hold_s = float(self.status.get("overlay_hold_ms") or 550.0) / 1000.0
             interp_s = float(self.status.get("overlay_interpolate_ms") or 400.0) / 1000.0
             max_age_s = float(self.status.get("overlay_max_age_ms") or 950.0) / 1000.0
+            file_realtime_preview = str(self.status.get("source_type") or "").lower() == "file" and bool(
+                self.status.get("realtime", True)
+            )
+            if file_realtime_preview:
+                # File preview follows the video clock. A long held overlay makes
+                # stale boxes visibly trail moving content, so cap display-only
+                # smoothing to a short bridge between detector frames.
+                detector_fps = max(1.0, float(self.status.get("detector_process_fps_cap") or 15.0))
+                bridge_s = min(0.14, max(0.08, 1.5 / detector_fps))
+                match_s = min(match_s, bridge_s)
+                hold_s = min(hold_s, bridge_s)
+                max_age_s = min(max_age_s, bridge_s)
+                interp_s = min(interp_s, max(bridge_s * 2.0, 0.16))
         if not records:
             return None
         records.sort(key=lambda item: float(item.get("video_time_s") or 0.0))
@@ -1197,7 +1210,12 @@ class MonitorEngine:
                 break
         if prev is not None and next_item is not None:
             if float(next_item.get("video_time_s") or 0.0) - float(prev.get("video_time_s") or 0.0) <= interp_s:
-                mixed = interpolate_overlay(prev, next_item, source_time_s)
+                mixed = interpolate_overlay(
+                    prev,
+                    next_item,
+                    source_time_s,
+                    keep_unmatched_tracks=not file_realtime_preview,
+                )
                 if mixed is not None:
                     mixed["overlay_display_source"] = "interpolated"
                     self._preview_last_overlay = mixed
@@ -1216,11 +1234,14 @@ class MonitorEngine:
                 out["held"] = True
                 out["overlay_display_source"] = "held"
                 tracks = []
-                for track in out.get("ppe_tracks", []) or []:
-                    clone = dict(track)
-                    clone["box"] = list(track.get("box") or [])
-                    clone["source"] = "held"
-                    tracks.append(clone)
+                if not file_realtime_preview:
+                    for track in out.get("ppe_tracks", []) or []:
+                        if not bool(track.get("hold_eligible", True)):
+                            continue
+                        clone = dict(track)
+                        clone["box"] = list(track.get("box") or [])
+                        clone["source"] = "held"
+                        tracks.append(clone)
                 out["ppe_tracks"] = tracks
                 return out
         return None

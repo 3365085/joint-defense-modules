@@ -187,6 +187,7 @@ class FrameProcessor:
             ppe_state=self.ppe_state,
             ppe_tracker=self.ppe_tracker,
             tracking_enabled=self.ppe_tracking_enabled,
+            max_render_misses=_ppe_max_render_misses(source_type=source_type, realtime=realtime),
         )
         ppe = ppe_result.ppe
         ppe_tracks = ppe_result.tracks
@@ -359,6 +360,12 @@ class FrameProcessor:
         }
         status["branch_cards"] = build_branch_cards(status)
         return status
+
+
+def _ppe_max_render_misses(*, source_type: str, realtime: bool) -> int | None:
+    if str(source_type or "").lower() == "file" and bool(realtime):
+        return 0
+    return None
 
 
 def _score_display(value: Any) -> str:

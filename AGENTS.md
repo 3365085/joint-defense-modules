@@ -35,6 +35,13 @@ Scope: entire repository.
 - Keep compatibility for public Web API paths and existing detection/status field names.
 - When fixing runtime bugs, address the root cause and add a focused regression test when practical.
 
+## 提交前视觉验收
+
+- 凡涉及检测效果、检测框显示、预览/页面状态、状态刷新、overlay、拖框/断框/流畅度的修改，提交前必须用当前项目实际跑一遍目标视频，生成检测结果视频。
+- 跑完后必须从结果视频中随机抽取连续 3 秒，导出该 3 秒内的完整帧画面，并逐帧亲自查看。
+- 若发现拖框、断框、旧框滞留、画面明显不流畅、页面状态与画面不同步、检测信息遮挡异常、误导性显示等问题，禁止提交。
+- 只有在完整记录检测视频路径、抽帧区间、抽帧图片路径和肉眼检查结论后，才允许提交此类修改。
+
 ## 技术/算法问题记录
 
 - 当用户主动提及技术问题、算法问题、检测效果疑问、性能权衡或架构取舍时，必须用中文记录到 `docs/技术.算法/`。

@@ -38,6 +38,7 @@ class StableTrack:
     age: int
     is_small: bool
     source: str
+    hold_eligible: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class StableTrack:
             "age": int(self.age),
             "is_small": bool(self.is_small),
             "source": self.source,
+            "hold_eligible": bool(self.hold_eligible),
         }
 
 
@@ -200,6 +202,8 @@ class PPEDisplayTracker:
         for track in self.tracks:
             if int(track.get("misses", 0)) <= 0:
                 continue
+            if not bool(track.get("hold_eligible", True)):
+                continue
             if not bool(track.get("is_small", False)):
                 continue
             priority = 2.0 + int(track.get("misses", 0)) * 0.2
@@ -224,6 +228,8 @@ class PPEDisplayTracker:
         detections: DetectionFrameResult,
         ppe: dict[str, Any],
         frame_shape: tuple[int, int] | tuple[int, int, int],
+        *,
+        max_render_misses: int | None = None,
     ) -> list[dict[str, Any]]:
         incoming = self._incoming_items(detections, ppe, frame_shape)
         incoming = self._merge_same_target_items(incoming, frame_shape)
@@ -232,7 +238,7 @@ class PPEDisplayTracker:
         self._prune_tracks()
         self.tracks = self._remove_shadow_tracks(self.tracks, frame_shape)
         self.tracks = self._filter_low_context_display_tracks(self.tracks, frame_shape)
-        return [track.as_dict() for track in self._render_tracks()]
+        return [track.as_dict() for track in self._render_tracks(max_misses=max_render_misses)]
 
     def _incoming_items(
         self,
@@ -243,6 +249,7 @@ class PPEDisplayTracker:
         suppression = ppe.get("helmet_fp_suppression", {})
         suppressed_helmets = self._suppressed_helmet_indices_for_display(suppression)
         suppressed_heads = {int(v) for v in suppression.get("suppressed_head_indices", []) or []}
+        weak_heads = {int(v) for v in suppression.get("weak_head_indices", []) or []}
         frame_area = _frame_area(frame_shape)
         incoming: list[dict[str, Any]] = []
         for index, (box, cls_id, confidence) in enumerate(
@@ -269,6 +276,7 @@ class PPEDisplayTracker:
                     "confidence": float(confidence),
                     "is_small": bool(area_ratio <= self.small_area_ratio),
                     "area_ratio": float(area_ratio),
+                    "hold_eligible": not (label == "head" and index in weak_heads),
                 }
             )
         return incoming
@@ -345,6 +353,7 @@ class PPEDisplayTracker:
                 "age": 1,
                 "misses": 0,
                 "is_small": bool(item["is_small"]),
+                "hold_eligible": bool(item.get("hold_eligible", True)),
                 "source": "detected",
                 "_matched": True,
             }
@@ -365,6 +374,7 @@ class PPEDisplayTracker:
         track["age"] = int(track.get("age", 0)) + 1
         track["misses"] = 0
         track["is_small"] = bool(item["is_small"])
+        track["hold_eligible"] = bool(item.get("hold_eligible", True))
         track["source"] = "detected"
         track["_matched"] = True
         self._update_stable_label(track, str(item["label"]), float(item["confidence"]))
@@ -394,12 +404,18 @@ class PPEDisplayTracker:
                 kept.append(track)
         self.tracks = kept
 
-    def _render_tracks(self) -> list[StableTrack]:
+    def _render_tracks(self, *, max_misses: int | None = None) -> list[StableTrack]:
         rendered: list[StableTrack] = []
         for track in self.tracks:
             confidence = float(track.get("confidence", 0.0))
-            if int(track.get("misses", 0)) > 0 and not self.show_held_boxes:
+            misses = int(track.get("misses", 0))
+            if not bool(track.get("hold_eligible", True)):
                 continue
+            if misses > 0:
+                if not self.show_held_boxes:
+                    continue
+                if max_misses is not None and misses > max(0, int(max_misses)):
+                    continue
             if confidence < (0.14 if track.get("is_small") else 0.18):
                 continue
             rendered.append(
@@ -408,10 +424,11 @@ class PPEDisplayTracker:
                     box=list(track["box"]),
                     label=str(track["stable_label"]),
                     confidence=confidence,
-                    misses=int(track.get("misses", 0)),
+                    misses=misses,
                     age=int(track.get("age", 0)),
                     is_small=bool(track.get("is_small", False)),
                     source=str(track.get("source", "detected")),
+                    hold_eligible=bool(track.get("hold_eligible", True)),
                 )
             )
         return rendered

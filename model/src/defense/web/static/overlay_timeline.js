@@ -16,6 +16,10 @@
     return Object.assign({}, track || {}, { box: Array.from((track && track.box) || []) });
   }
 
+  function canHoldTrack(track) {
+    return !track || track.hold_eligible !== false;
+  }
+
   function lerp(a, b, t) {
     return number(a, 0) + (number(b, 0) - number(a, 0)) * t;
   }
@@ -26,7 +30,9 @@
     return out;
   }
 
-  function interpolateOverlay(prev, next, t) {
+  function interpolateOverlay(prev, next, t, options) {
+    const opts = options || {};
+    const keepUnmatchedTracks = opts.keepUnmatchedTracks !== false;
     const leftTime = number(prev && prev.video_time_s, NaN);
     const rightTime = number(next && next.video_time_s, NaN);
     if (!Number.isFinite(leftTime) || !Number.isFinite(rightTime) || rightTime <= leftTime) {
@@ -34,16 +40,25 @@
     }
     const ratio = Math.max(0, Math.min(1, (number(t, leftTime) - leftTime) / (rightTime - leftTime)));
     const nextById = new Map(((next && next.ppe_tracks) || []).map((track) => [String(track.track_id ?? track.id ?? ""), track]));
-    const tracks = ((prev && prev.ppe_tracks) || []).map((track) => {
+    const tracks = [];
+    ((prev && prev.ppe_tracks) || []).forEach((track) => {
       const key = String(track.track_id ?? track.id ?? "");
       const later = nextById.get(key);
-      if (!later || !Array.isArray(track.box) || !Array.isArray(later.box)) return cloneTrack(track);
+      if (!later) {
+        if (!keepUnmatchedTracks || !canHoldTrack(track)) return;
+        tracks.push(cloneTrack(track));
+        return;
+      }
+      if (!Array.isArray(track.box) || !Array.isArray(later.box)) {
+        tracks.push(cloneTrack(track));
+        return;
+      }
       const mixed = cloneTrack(track);
       mixed.box = boxLerp(track.box, later.box, ratio);
       mixed.confidence = lerp(track.confidence, later.confidence, ratio);
       mixed.misses = Math.round(lerp(track.misses, later.misses, ratio));
       mixed.source = mixed.source || "tracked";
-      return mixed;
+      tracks.push(mixed);
     });
     return Object.assign({}, prev, {
       video_time_s: number(t, leftTime),
@@ -125,7 +140,7 @@
       return Object.assign({}, this.lastHeld, {
         video_time_s: time,
         held: true,
-        ppe_tracks: ((this.lastHeld.ppe_tracks) || []).map((track) => {
+        ppe_tracks: ((this.lastHeld.ppe_tracks) || []).filter(canHoldTrack).map((track) => {
           const copy = cloneTrack(track);
           if (!copy.source || copy.source === "detected") copy.source = "held";
           return copy;
@@ -139,11 +154,12 @@
       const interpolateSec = number(opts.interpolateSec, 0.4);
       const holdSec = number(opts.holdSec, 0.55);
       const maxAgeSec = number(opts.maxAgeSec, 0.95);
+      const keepUnmatchedTracks = opts.keepUnmatchedTracks !== false;
       // Prefer interpolation while the display clock is between two detector
       // records. Nearest-first selection produces visible step/drag at 10~15 FPS.
       const bracket = this.findBracket(t, interpolateSec);
       if (bracket) {
-        const mixed = interpolateOverlay(bracket.prev, bracket.next, t);
+        const mixed = interpolateOverlay(bracket.prev, bracket.next, t, { keepUnmatchedTracks });
         if (mixed) {
           this.lastHeld = mixed;
           return mixed;

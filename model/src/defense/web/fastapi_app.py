@@ -94,23 +94,9 @@ def create_app(
     async def start(request: Request) -> JSONResponse:
         require_http_access(request)
         payload = await _body(request)
-        # Module B startup path: hash/fingerprint check only, then optional
-        # background scan for unknown models. This never enters the per-frame
-        # preview/detection hot path.
-        try:
-            ms = _model_security(request.app)
-            ms_status = ms.status(
-                profile=normalize_profile(payload.get("profile", "default")),
-                custom_model=payload.get("custom_model") or {},
-            )
-            if ms_status.get("status") == "unknown":
-                ms.start_background_scan(
-                    scan_type="quick",
-                    profile=normalize_profile(payload.get("profile", "default")),
-                    custom_model=payload.get("custom_model") or {},
-                )
-        except Exception:
-            pass
+        # Module B can hash and scan model artifacts, so keep it out of the
+        # startup hot path. Operators can refresh status or run a scan from the
+        # B-module controls without blocking Module A preview/detection.
         engine = _engine(request.app)
         run_id = engine.start(
             source_type=str(payload.get("source_type", "file")),
@@ -131,7 +117,7 @@ def create_app(
         engine = _engine(request.app)
         if run_id is not None and int(run_id) != int(engine.run_id):
             raise HTTPException(status_code=409, detail="run_id does not match current run")
-        engine.stop()
+        engine.stop(release_pipeline_cache=False)
         return _json({"ok": True, "status": enrich_status(engine.get_status())})
 
     @app.post("/api/runs/{run_id}/control")
@@ -238,6 +224,22 @@ def create_app(
     async def model_security_status(request: Request, profile: str = "default") -> JSONResponse:
         require_http_access(request)
         return _json({"ok": True, "model_security": _model_security(request.app).status(profile=normalize_profile(profile))})
+
+    @app.post("/api/model-security/status")
+    async def model_security_status_post(request: Request) -> JSONResponse:
+        require_http_access(request)
+        payload = await _body(request)
+        profile = normalize_profile(payload.get("profile", "default"))
+        custom_model = payload.get("custom_model") or {}
+        return _json(
+            {
+                "ok": True,
+                "model_security": _model_security(request.app).status(
+                    profile=profile,
+                    custom_model=custom_model,
+                ),
+            }
+        )
 
     @app.post("/api/model-security/scan")
     async def model_security_scan(request: Request) -> JSONResponse:

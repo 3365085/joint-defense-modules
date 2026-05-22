@@ -466,7 +466,7 @@ class MonitorEngine:
         elif source_type == "camera":
             camera_text = normalize_source_text(source)
             source = camera_text.split(":", 1)[1].strip() if camera_text.lower().startswith("camera:") else camera_text
-        self.stop()
+        self.stop(release_pipeline_cache=False)
         feature_options = {
             "static_image_enabled": bool((feature_options or {}).get("static_image_enabled", True)),
         }
@@ -672,7 +672,7 @@ class MonitorEngine:
             self.condition.notify_all()
             return dict(self.display_options)
 
-    def stop(self) -> None:
+    def stop(self, *, release_pipeline_cache: bool = True) -> None:
         threads = [thread for thread in (self.capture_thread, self.process_thread, self.preview_thread) if thread is not None]
         self.stop_event.set()
         if self.preview_bus is not None:
@@ -692,7 +692,8 @@ class MonitorEngine:
         self.preview_thread = None
         self.preview_bus = None
         self.detection_bus = None
-        self._release_pipeline_cache()
+        if release_pipeline_cache:
+            self._release_pipeline_cache()
         with self.condition:
             if self.status.get("running"):
                 self.status["running"] = False
@@ -867,15 +868,16 @@ class MonitorEngine:
             detect_interval = 1.0 / max(1.0, min(detector_process_fps_cap, fps if source_type == "file" else detector_process_fps_cap))
             with self.condition:
                 if run_id == self.run_id:
+                    preview_can_start = source_type != "file"
                     self.status.update(
                         {
                             "source_fps": fps,
                             "source_duration_s": duration_s,
                             "source_frame_count": frame_count,
-                            "ready_for_preview": True,
-                            "preview_started": True,
+                            "ready_for_preview": preview_can_start,
+                            "preview_started": preview_can_start,
                             "preview_seekable": source_type == "file",
-                            "preview_mode": "backend_source_pipeline",
+                            "preview_mode": "backend_source_pipeline" if preview_can_start else "waiting_first_detection",
                             "detector_pipeline_mode": "backend_latest_only",
                             "capture_max_side": int(capture_max_side),
                             "file_source_fps_cap": float(file_source_fps_cap or 0.0),
@@ -972,13 +974,14 @@ class MonitorEngine:
                     detection_bus.push(packet)
                 with self.condition:
                     if run_id == self.run_id:
+                        preview_can_start = source_type != "file" or bool(self.status.get("first_detection_ready"))
                         self.status.update(
                             {
                                 "source_time_s": packet.source_time_s,
                                 "video_time_s": packet.source_time_s,
                                 "source_epoch": packet.epoch,
-                                "preview_started": True,
-                                "ready_for_preview": True,
+                                "preview_started": preview_can_start,
+                                "ready_for_preview": preview_can_start,
                                 "source_frame_width": int(original_w),
                                 "source_frame_height": int(original_h),
                                 "capture_frame_width": int(w),
@@ -1161,6 +1164,15 @@ class MonitorEngine:
                     break
                 continue
             last_seq = packet.seq
+            with self.condition:
+                waiting_for_first_file_detection = (
+                    str(self.status.get("source_type") or "").lower() == "file"
+                    and bool(self.status.get("realtime", True))
+                    and not bool(self.status.get("first_detection_ready"))
+                )
+            if waiting_for_first_file_detection:
+                time.sleep(min(interval, 0.03))
+                continue
             try:
                 overlay = self._select_preview_overlay(packet.source_time_s, packet.epoch)
                 rendered = self._render_backend_preview(packet, overlay)

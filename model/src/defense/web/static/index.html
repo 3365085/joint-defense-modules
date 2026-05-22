@@ -1398,7 +1398,10 @@
 
     async function refreshModelSecurity() {
       try {
-        const data = await api(`/api/model-security/status?profile=${encodeURIComponent($("profile").value || "default")}`);
+        const data = await api("/api/model-security/status", {
+          profile: $("profile").value || "default",
+          custom_model: customModelOptions(),
+        });
         renderModelSecurity(data.model_security || {});
       } catch (err) {
         renderModelSecurity({status:"error", error: err.message});
@@ -1681,7 +1684,7 @@
         updateRunControls(status);
         updateStartButtonState(status);
         startMjpegPreview(status);
-        refreshModelSecurity();
+        setTimeout(refreshModelSecurity, 2000);
         scheduleRefresh(0);
       } catch (err) {
         setError(err.message);
@@ -1857,7 +1860,7 @@
     loadLastPaths();
     updateSourceControls();
         showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
-    refreshModelSecurity();
+    setTimeout(refreshModelSecurity, 1200);
     refresh();
   </script>
 </body>

@@ -84,12 +84,10 @@ def create_app(
     @app.get("/api/status")
     @app.get("/api/runs/current")
     async def status(request: Request) -> JSONResponse:
-        status_payload = enrich_status(_engine(request.app).get_status())
-        try:
-            status_payload["model_security"] = _model_security(request.app).status(profile=str(status_payload.get("profile") or "default"), custom_model=status_payload.get("custom_model") or {})
-        except Exception as exc:
-            status_payload["model_security"] = {"status": "error", "error": str(exc)}
-        return _json({"ok": True, "status": status_payload})
+        # Keep the high-frequency runtime status endpoint on the preview hot
+        # path lightweight. Model-security fingerprinting can touch large model
+        # artifacts, so the UI fetches it through /api/model-security/status.
+        return _json({"ok": True, "status": enrich_status(_engine(request.app).get_status())})
 
     @app.post("/api/runs/start")
     @app.post("/api/start")

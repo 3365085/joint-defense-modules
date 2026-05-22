@@ -1678,6 +1678,7 @@
         updateRunControls(status);
         updateStartButtonState(status);
         startMjpegPreview(status);
+        refreshModelSecurity();
         scheduleRefresh(0);
       } catch (err) {
         setError(err.message);
@@ -1728,7 +1729,7 @@
         pill.textContent = title;
         pill.className = "pill " + stateClass;
         renderBranchCards(status.branch_cards || []);
-        renderModelSecurity(status.model_security || {});
+        if (status.model_security) renderModelSecurity(status.model_security);
         $("profilePill").textContent = profileLabel(status.profile || $("profile").value);
         $("backendPill").textContent = backendLabel(status);
         $("frame").textContent = status.frame_idx ?? 0;
@@ -1858,5 +1859,4 @@
   </script>
 </body>
 </html>
-
 

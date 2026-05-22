@@ -101,7 +101,8 @@ def draw_ppe_boxes(frame: np.ndarray, tracks: list[dict[str, Any]] | None) -> np
         confidence = float(track.get("confidence", 0.0) or 0.0)
         suffix = " held" if int(track.get("misses", 0) or 0) > 0 else ""
         small = " far" if track.get("is_small") else ""
-        text = f"{PPE_LABEL_TEXT.get(label, label)}#{int(track.get('track_id', 0))} {confidence:.2f}{small}{suffix}"
+        display_label = "weakHead" if label == "head" and not bool(track.get("hold_eligible", True)) else PPE_LABEL_TEXT.get(label, label)
+        text = f"{display_label}#{int(track.get('track_id', 0))} {confidence:.2f}{small}{suffix}"
         _draw_label(rendered, [int(v) for v in box], text, color, 1)
     return rendered
 

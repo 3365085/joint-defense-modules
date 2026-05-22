@@ -270,6 +270,12 @@ class FrameProcessor:
         a3b_event_score = a3b_confidence if a3b_confidence > 0 else a3b_observed_score
         a3b_state = str(a3b_soft.get("state") or ("confirmed" if a3b_soft.get("triggered") else "normal"))
         ppe_boxes_count = _int(ppe.get("person_count")) + _int(ppe.get("helmet_count")) + _int(ppe.get("head_count"))
+        ppe_suppression = ppe.get("helmet_fp_suppression", {})
+        ppe_weak_head_count = (
+            len(ppe_suppression.get("weak_head_indices", []) or [])
+            if isinstance(ppe_suppression, dict)
+            else 0
+        )
         tracked_boxes_count = len([track for track in ppe_tracks if str(track.get("source", "detected")) in {"tracked", "held"}])
         render_boxes_count = len(ppe_tracks)
         bundle_config = self.bundle.config if isinstance(self.bundle.config, dict) else {}
@@ -333,7 +339,10 @@ class FrameProcessor:
             "ppe_inferred_person_count": _int(ppe.get("inferred_person_count", ppe.get("person_count"))),
             "ppe_person_context_count": _int(ppe.get("person_context_count", ppe.get("person_count"))),
             "ppe_helmet_count": _int(ppe.get("helmet_count")),
+            "ppe_raw_helmet_count": _int(ppe.get("raw_helmet_count", ppe.get("helmet_count"))),
             "ppe_head_count": _int(ppe.get("head_count")),
+            "ppe_raw_head_count": _int(ppe.get("raw_head_count", ppe.get("head_count"))),
+            "ppe_weak_head_count": int(ppe_weak_head_count),
             "ppe_missing_helmet_count": _int(ppe.get("missing_helmet_count")),
             "ppe_has_person_class": bool(ppe.get("has_person_class", False)),
             "ppe_evidence_mode": str(ppe.get("evidence_mode", "")),

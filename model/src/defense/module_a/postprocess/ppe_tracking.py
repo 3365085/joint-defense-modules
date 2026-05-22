@@ -248,7 +248,6 @@ class PPEDisplayTracker:
     ) -> list[dict[str, Any]]:
         suppression = ppe.get("helmet_fp_suppression", {})
         suppressed_helmets = self._suppressed_helmet_indices_for_display(suppression)
-        suppressed_heads = {int(v) for v in suppression.get("suppressed_head_indices", []) or []}
         weak_heads = {int(v) for v in suppression.get("weak_head_indices", []) or []}
         frame_area = _frame_area(frame_shape)
         incoming: list[dict[str, Any]] = []
@@ -260,8 +259,6 @@ class PPEDisplayTracker:
             if label is None:
                 continue
             if label == "helmet" and index in suppressed_helmets:
-                continue
-            if label == "head" and index in suppressed_heads:
                 continue
             clipped = _clip_box(box, frame_shape)
             if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
@@ -409,10 +406,10 @@ class PPEDisplayTracker:
         for track in self.tracks:
             confidence = float(track.get("confidence", 0.0))
             misses = int(track.get("misses", 0))
-            if not bool(track.get("hold_eligible", True)):
-                continue
             if misses > 0:
                 if not self.show_held_boxes:
+                    continue
+                if not bool(track.get("hold_eligible", True)):
                     continue
                 if max_misses is not None and misses > max(0, int(max_misses)):
                     continue

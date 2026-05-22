@@ -29,6 +29,7 @@ Scope: entire repository.
 
 - Prefer small, categorized commits that can be reverted independently.
 - Write every commit message in Chinese, with a concise description of the change category and purpose.
+- Never commit before the user has personally finished testing and explicitly confirmed that committing is allowed. Local tests, visual acceptance, or agent judgment do not replace the user's test confirmation.
 - After every successful `git commit`, immediately run `codegraph init -i` from the corresponding project root to incrementally refresh the CodeGraph/codep index; if indexing fails, report the failure reason and current index state in the final handoff.
 - Do not move files or functions unless the ownership boundary is clearly wrong.
 - Do not introduce a new framework, package root, web stack, or build system without explicit architecture work.

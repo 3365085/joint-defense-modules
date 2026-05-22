@@ -50,7 +50,11 @@ def _filter_tracks_for_ppe_counts(tracks: list[dict[str, Any]], ppe: dict[str, A
         allowed_labels.add("person")
     if int(ppe.get("helmet_count") or 0) > 0:
         allowed_labels.add("helmet")
-    if int(ppe.get("head_count") or 0) > 0:
+    suppression = ppe.get("helmet_fp_suppression", {})
+    weak_head_count = 0
+    if isinstance(suppression, dict):
+        weak_head_count = len(suppression.get("weak_head_indices", []) or [])
+    if int(ppe.get("head_count") or 0) > 0 or weak_head_count > 0:
         allowed_labels.add("head")
     if not allowed_labels:
         return []

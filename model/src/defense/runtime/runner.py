@@ -393,8 +393,6 @@ class MonitorEngine:
             "capture_max_side": 1280,
             "file_source_fps_cap": 0.0,
             "source_frame_step": 1.0,
-            "source_skip_frames_last": 0,
-            "source_skipped_frames_total": 0,
             "source_frame_width": 0,
             "source_frame_height": 0,
             "capture_frame_width": 0,
@@ -468,7 +466,7 @@ class MonitorEngine:
         elif source_type == "camera":
             camera_text = normalize_source_text(source)
             source = camera_text.split(":", 1)[1].strip() if camera_text.lower().startswith("camera:") else camera_text
-        self.stop(release_pipeline_cache=False)
+        self.stop()
         feature_options = {
             "static_image_enabled": bool((feature_options or {}).get("static_image_enabled", True)),
         }
@@ -559,8 +557,6 @@ class MonitorEngine:
         preview_render_fps = float(
             runtime_config.get("preview_render_fps", runtime_config.get("preview_fps", 25)) or 25
         )
-        if source_type == "file":
-            preview_render_fps = max(preview_render_fps, float(runtime_config.get("file_preview_min_fps", 30.0) or 0.0))
         preview_max_side = int(runtime_config.get("preview_max_side", 960) or 960)
         detector_process_fps_cap = float(
             runtime_config.get("detector_process_fps_cap", runtime_config.get("process_fps_cap", 15)) or 15
@@ -676,7 +672,7 @@ class MonitorEngine:
             self.condition.notify_all()
             return dict(self.display_options)
 
-    def stop(self, *, release_pipeline_cache: bool = True) -> None:
+    def stop(self) -> None:
         threads = [thread for thread in (self.capture_thread, self.process_thread, self.preview_thread) if thread is not None]
         self.stop_event.set()
         if self.preview_bus is not None:
@@ -696,8 +692,7 @@ class MonitorEngine:
         self.preview_thread = None
         self.preview_bus = None
         self.detection_bus = None
-        if release_pipeline_cache:
-            self._release_pipeline_cache()
+        self._release_pipeline_cache()
         with self.condition:
             if self.status.get("running"):
                 self.status["running"] = False
@@ -857,7 +852,6 @@ class MonitorEngine:
         playback_anchor_frame = 0.0
         playback_clock_speed = 1.0
         playback_was_paused = False
-        skipped_frames_total = 0
         try:
             cap = open_capture(source_type, source)
             fps, duration_s, frame_count = self._read_capture_meta(cap)
@@ -886,8 +880,6 @@ class MonitorEngine:
                             "capture_max_side": int(capture_max_side),
                             "file_source_fps_cap": float(file_source_fps_cap or 0.0),
                             "source_frame_step": float(frame_step),
-                            "source_skip_frames_last": 0,
-                            "source_skipped_frames_total": 0,
                         }
                     )
                     self.condition.notify_all()
@@ -1003,16 +995,9 @@ class MonitorEngine:
                     next_index = int(round(next_read_frame))
                     current_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (packet.frame_idx + 1))
                     skip_count = max(0, next_index - current_index)
-                    skipped_now = 0
                     for _ in range(min(skip_count, 120)):
                         if not cap.grab():
                             break
-                        skipped_now += 1
-                    skipped_frames_total += skipped_now
-                    with self.condition:
-                        if run_id == self.run_id:
-                            self.status["source_skip_frames_last"] = int(skipped_now)
-                            self.status["source_skipped_frames_total"] = int(skipped_frames_total)
                 if source_type == "file" and realtime:
                     elapsed = time.perf_counter() - loop_started
                     wait_s = max(0.0, (frame_period / speed) - elapsed)
@@ -1153,8 +1138,15 @@ class MonitorEngine:
                     self._merge_completed_events(evidence.close())
                 except Exception as exc:
                     self._set_error(f"evidence close failed: {exc}", run_id)
-            # Keep the model pipeline hot after normal file completion so
-            # repeated local test runs do not pay backend creation/warmup again.
+            with self.condition:
+                release_finished_file_pipeline = (
+                    run_id == self.run_id
+                    and source_type == "file"
+                    and bool(self.status.get("source_ended"))
+                    and not self.stop_event.is_set()
+                )
+            if release_finished_file_pipeline:
+                self._release_pipeline_cache()
 
     def _preview_render_loop(self, run_id: int, preview_bus: PreviewBus, preview_render_fps: float) -> None:
         interval = 1.0 / max(1.0, float(preview_render_fps or 25.0))

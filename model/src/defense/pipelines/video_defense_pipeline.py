@@ -111,6 +111,9 @@ class VideoDefensePipeline:
         warmup_frame = np.zeros((640, 640, 3), dtype=np.uint8)
         for _ in range(frames):
             self.process_frame(warmup_frame)
+        warmup_postprocess = getattr(self.detector_backend, "warmup_postprocess", None)
+        if callable(warmup_postprocess):
+            warmup_postprocess()
         self.reset()
 
     # ------------------------------------------------------------------ core

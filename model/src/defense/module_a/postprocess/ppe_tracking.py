@@ -39,6 +39,11 @@ class StableTrack:
     is_small: bool
     source: str
     hold_eligible: bool = True
+    evidence_label: str = ""
+    weak_head_streak: int = 0
+    weak_helmet_streak: int = 0
+    temporal_promoted: bool = False
+    promoted_label: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -51,6 +56,11 @@ class StableTrack:
             "is_small": bool(self.is_small),
             "source": self.source,
             "hold_eligible": bool(self.hold_eligible),
+            "evidence_label": self.evidence_label,
+            "weak_head_streak": int(self.weak_head_streak),
+            "weak_helmet_streak": int(self.weak_helmet_streak),
+            "temporal_promoted": bool(self.temporal_promoted),
+            "promoted_label": self.promoted_label,
         }
 
 
@@ -154,6 +164,12 @@ class PPEDisplayTracker:
         hold_last_box: bool = True,
         smooth_alpha: float = 0.35,
         show_held_boxes: bool = True,
+        weak_promotion_hits: int = 3,
+        weak_head_min_avg_confidence: float = 0.30,
+        weak_helmet_min_avg_confidence: float = 0.30,
+        weak_helmet_isolated_min_avg_confidence: float = 0.50,
+        weak_edge_promotion_hits: int = 4,
+        weak_edge_min_avg_confidence: float = 0.45,
     ):
         self.history = max(1, int(history))
         self.hold_frames = max(0, int(hold_frames))
@@ -167,6 +183,12 @@ class PPEDisplayTracker:
         self.hold_last_box = bool(hold_last_box)
         self.smooth_alpha = max(0.0, min(1.0, float(smooth_alpha)))
         self.show_held_boxes = bool(show_held_boxes)
+        self.weak_promotion_hits = max(1, int(weak_promotion_hits))
+        self.weak_head_min_avg_confidence = float(weak_head_min_avg_confidence)
+        self.weak_helmet_min_avg_confidence = float(weak_helmet_min_avg_confidence)
+        self.weak_helmet_isolated_min_avg_confidence = float(weak_helmet_isolated_min_avg_confidence)
+        self.weak_edge_promotion_hits = max(self.weak_promotion_hits, int(weak_edge_promotion_hits))
+        self.weak_edge_min_avg_confidence = float(weak_edge_min_avg_confidence)
         self.tracks: list[dict[str, Any]] = []
         self.next_track_id = 1
         self._last_redetect_frame = -10_000
@@ -238,7 +260,71 @@ class PPEDisplayTracker:
         self._prune_tracks()
         self.tracks = self._remove_shadow_tracks(self.tracks, frame_shape)
         self.tracks = self._filter_low_context_display_tracks(self.tracks, frame_shape)
+        self._refresh_temporal_promotions(frame_shape)
         return [track.as_dict() for track in self._render_tracks(max_misses=max_render_misses)]
+
+    def apply_temporal_evidence(
+        self,
+        ppe: dict[str, Any],
+        frame_shape: tuple[int, int] | tuple[int, int, int],
+    ) -> dict[str, Any]:
+        """Promote stable current-frame weak PPE evidence without extra inference."""
+        promotions = self._current_temporal_promotions(frame_shape)
+        promoted_heads = [item for item in promotions if item["label"] == "head"]
+        promoted_helmets = [item for item in promotions if item["label"] == "helmet"]
+        out = dict(ppe)
+        suppression = (
+            dict(out.get("helmet_fp_suppression") or {})
+            if isinstance(out.get("helmet_fp_suppression"), dict)
+            else {}
+        )
+        base_head_count = int(out.get("head_count") or 0)
+        base_helmet_count = int(out.get("helmet_count") or 0)
+        promoted_head_count = len(promoted_heads)
+        promoted_helmet_count = len(promoted_helmets)
+        effective_head_count = base_head_count + promoted_head_count
+        effective_helmet_count = base_helmet_count + promoted_helmet_count
+
+        out["promoted_head_count"] = promoted_head_count
+        out["promoted_helmet_count"] = promoted_helmet_count
+        out["effective_head_count"] = effective_head_count
+        out["effective_helmet_count"] = effective_helmet_count
+        out["head_count"] = effective_head_count
+        out["helmet_count"] = effective_helmet_count
+        out["missing_helmet_count"] = effective_head_count
+        out["candidate"] = effective_head_count > 0
+        if promoted_head_count or promoted_helmet_count:
+            out["inferred_person_count"] = max(
+                int(out.get("inferred_person_count") or 0),
+                1,
+            )
+        out["uncertain"] = bool(
+            out.get("uncertain", False)
+            and effective_head_count == 0
+            and effective_helmet_count == 0
+        )
+        if effective_head_count > 0:
+            out["reason"] = (
+                "bare_head_without_matched_helmet"
+                if base_head_count > 0
+                else "temporal_weak_head_promoted"
+            )
+        elif promoted_helmet_count > 0 and effective_helmet_count > 0:
+            out["reason"] = (
+                "helmet_evidence_present"
+                if base_helmet_count > 0
+                else "temporal_weak_helmet_promoted"
+            )
+
+        suppression["temporal_promoted_head_tracks"] = [
+            dict(item) for item in promoted_heads
+        ]
+        suppression["temporal_promoted_helmet_tracks"] = [
+            dict(item) for item in promoted_helmets
+        ]
+        out["helmet_fp_suppression"] = suppression
+        out["temporal_promotions"] = [dict(item) for item in promotions]
+        return out
 
     def _incoming_items(
         self,
@@ -249,6 +335,9 @@ class PPEDisplayTracker:
         suppression = ppe.get("helmet_fp_suppression", {})
         suppressed_helmets = self._suppressed_helmet_indices_for_display(suppression)
         weak_heads = {int(v) for v in suppression.get("weak_head_indices", []) or []}
+        weak_helmets = {int(v) for v in suppression.get("weak_helmet_indices", []) or []}
+        weak_head_reasons = self._weak_head_reasons_by_index(suppression)
+        weak_helmet_reasons = self._weak_helmet_reasons_by_index(suppression)
         frame_area = _frame_area(frame_shape)
         incoming: list[dict[str, Any]] = []
         for index, (box, cls_id, confidence) in enumerate(
@@ -264,6 +353,14 @@ class PPEDisplayTracker:
             if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
                 continue
             area_ratio = bbox_area(clipped) / frame_area
+            weak_label = ""
+            weak_reason = ""
+            if label == "head" and index in weak_heads:
+                weak_label = "head"
+                weak_reason = weak_head_reasons.get(index, "")
+            elif label == "helmet" and index in weak_helmets:
+                weak_label = "helmet"
+                weak_reason = weak_helmet_reasons.get(index, "")
             incoming.append(
                 {
                     "index": index,
@@ -273,7 +370,9 @@ class PPEDisplayTracker:
                     "confidence": float(confidence),
                     "is_small": bool(area_ratio <= self.small_area_ratio),
                     "area_ratio": float(area_ratio),
-                    "hold_eligible": not (label == "head" and index in weak_heads),
+                    "hold_eligible": not bool(weak_label),
+                    "weak_evidence_label": weak_label,
+                    "weak_reason": weak_reason,
                 }
             )
         return incoming
@@ -350,7 +449,15 @@ class PPEDisplayTracker:
                 "age": 1,
                 "misses": 0,
                 "is_small": bool(item["is_small"]),
+                "area_ratio": float(item.get("area_ratio", 0.0)),
                 "hold_eligible": bool(item.get("hold_eligible", True)),
+                "current_weak_label": str(item.get("weak_evidence_label") or ""),
+                "weak_reason": str(item.get("weak_reason") or ""),
+                "weak_head_streak": 1 if item.get("weak_evidence_label") == "head" else 0,
+                "weak_helmet_streak": 1 if item.get("weak_evidence_label") == "helmet" else 0,
+                "weak_head_conf_sum": float(item["confidence"]) if item.get("weak_evidence_label") == "head" else 0.0,
+                "weak_helmet_conf_sum": float(item["confidence"]) if item.get("weak_evidence_label") == "helmet" else 0.0,
+                "temporal_promoted_label": None,
                 "source": "detected",
                 "_matched": True,
             }
@@ -371,9 +478,13 @@ class PPEDisplayTracker:
         track["age"] = int(track.get("age", 0)) + 1
         track["misses"] = 0
         track["is_small"] = bool(item["is_small"])
+        track["area_ratio"] = float(item.get("area_ratio", track.get("area_ratio", 0.0)))
         track["hold_eligible"] = bool(item.get("hold_eligible", True))
+        track["current_weak_label"] = str(item.get("weak_evidence_label") or "")
+        track["weak_reason"] = str(item.get("weak_reason") or "")
         track["source"] = "detected"
         track["_matched"] = True
+        self._update_weak_streak(track, item)
         self._update_stable_label(track, str(item["label"]), float(item["confidence"]))
 
     def _age_unmatched(self) -> None:
@@ -384,6 +495,13 @@ class PPEDisplayTracker:
             track["misses"] = misses
             track["confidence"] = float(track.get("confidence", 0.0)) * (0.90 if track.get("is_small") else 0.84)
             track["source"] = "held"
+            track["current_weak_label"] = ""
+            track["weak_reason"] = ""
+            track["weak_head_streak"] = 0
+            track["weak_helmet_streak"] = 0
+            track["weak_head_conf_sum"] = 0.0
+            track["weak_helmet_conf_sum"] = 0.0
+            track["temporal_promoted_label"] = None
             # Phase 1.2: extrapolate position using velocity during misses
             # instead of holding the box static (reduces lag on reappearance)
             velocity = track.get("velocity", [0.0, 0.0, 0.0, 0.0])
@@ -426,6 +544,11 @@ class PPEDisplayTracker:
                     is_small=bool(track.get("is_small", False)),
                     source=str(track.get("source", "detected")),
                     hold_eligible=bool(track.get("hold_eligible", True)),
+                    evidence_label=str(track.get("current_weak_label") or ""),
+                    weak_head_streak=int(track.get("weak_head_streak", 0) or 0),
+                    weak_helmet_streak=int(track.get("weak_helmet_streak", 0) or 0),
+                    temporal_promoted=bool(track.get("temporal_promoted_label")),
+                    promoted_label=str(track.get("temporal_promoted_label") or ""),
                 )
             )
         return rendered
@@ -467,6 +590,9 @@ class PPEDisplayTracker:
             label = str(track.get("stable_label", ""))
             confidence = float(track.get("confidence", 0.0))
             if label == "helmet" and confidence < (0.30 if track.get("is_small") else 0.38):
+                if str(track.get("current_weak_label") or "") == "helmet":
+                    filtered.append(track)
+                    continue
                 has_context = any(
                     bbox_iou(track["box"], context["box"]) >= 0.01
                     or center_distance_ratio(track["box"], context["box"], frame_shape) <= 0.065
@@ -538,7 +664,7 @@ class PPEDisplayTracker:
         return max(cluster_items, key=lambda item: (priority.get(str(item["label"]), 0), float(item["confidence"]))).copy()
 
     def _suppressed_helmet_indices_for_display(self, suppression: dict[str, Any]) -> set[int]:
-        hidden_reasons = {"head_helmet_overlap", "small_low_conf_helmet"}
+        hidden_reasons = {"head_helmet_overlap"}
         suppressed: set[int] = set()
         for item in suppression.get("suppressed_helmets", []) or []:
             try:
@@ -548,8 +674,177 @@ class PPEDisplayTracker:
             if str(item.get("reason", "")) in hidden_reasons:
                 suppressed.add(index)
         if not suppression.get("suppressed_helmets"):
-            suppressed.update(int(v) for v in suppression.get("suppressed_helmet_indices", []) or [])
+            weak_helmets = {int(v) for v in suppression.get("weak_helmet_indices", []) or []}
+            suppressed.update(
+                int(v)
+                for v in suppression.get("suppressed_helmet_indices", []) or []
+                if int(v) not in weak_helmets
+            )
         return suppressed
+
+    def _weak_head_reasons_by_index(self, suppression: dict[str, Any]) -> dict[int, str]:
+        reasons: dict[int, str] = {}
+        for item in suppression.get("suppressed_heads", []) or []:
+            try:
+                index = int(item.get("head_index"))
+            except (TypeError, ValueError):
+                continue
+            reasons[index] = str(item.get("reason") or "")
+        return reasons
+
+    def _weak_helmet_reasons_by_index(self, suppression: dict[str, Any]) -> dict[int, str]:
+        reasons: dict[int, str] = {}
+        for item in suppression.get("suppressed_helmets", []) or []:
+            try:
+                index = int(item.get("helmet_index"))
+            except (TypeError, ValueError):
+                continue
+            reasons[index] = str(item.get("reason") or "")
+        return reasons
+
+    def _update_weak_streak(self, track: dict[str, Any], item: dict[str, Any]) -> None:
+        weak_label = str(item.get("weak_evidence_label") or "")
+        confidence = float(item.get("confidence", 0.0))
+        if weak_label == "head":
+            track["weak_head_streak"] = int(track.get("weak_head_streak", 0) or 0) + 1
+            track["weak_head_conf_sum"] = float(track.get("weak_head_conf_sum", 0.0) or 0.0) + confidence
+            track["weak_helmet_streak"] = 0
+            track["weak_helmet_conf_sum"] = 0.0
+        elif weak_label == "helmet":
+            track["weak_helmet_streak"] = int(track.get("weak_helmet_streak", 0) or 0) + 1
+            track["weak_helmet_conf_sum"] = float(track.get("weak_helmet_conf_sum", 0.0) or 0.0) + confidence
+            track["weak_head_streak"] = 0
+            track["weak_head_conf_sum"] = 0.0
+        else:
+            track["weak_head_streak"] = 0
+            track["weak_helmet_streak"] = 0
+            track["weak_head_conf_sum"] = 0.0
+            track["weak_helmet_conf_sum"] = 0.0
+        track["temporal_promoted_label"] = None
+
+    def _refresh_temporal_promotions(self, frame_shape: tuple[int, int] | tuple[int, int, int]) -> None:
+        for track in self.tracks:
+            track["temporal_promoted_label"] = None
+        helmets = [
+            track
+            for track in self.tracks
+            if str(track.get("stable_label") or "") == "helmet" and int(track.get("misses", 0) or 0) == 0
+        ]
+        promoted_helmets = [
+            track for track in helmets if self._track_promotes_weak_label(track, "helmet", frame_shape)
+        ]
+        for track in promoted_helmets:
+            track["temporal_promoted_label"] = "helmet"
+        helmet_blockers = [
+            track
+            for track in helmets
+            if str(track.get("current_weak_label") or "") != "helmet"
+            or str(track.get("temporal_promoted_label") or "") == "helmet"
+        ]
+
+        for track in self.tracks:
+            if not self._track_promotes_weak_label(track, "head", frame_shape):
+                continue
+            if any(self._same_head_zone(track, helmet, frame_shape) for helmet in helmet_blockers):
+                continue
+            track["temporal_promoted_label"] = "head"
+
+    def _current_temporal_promotions(
+        self,
+        frame_shape: tuple[int, int] | tuple[int, int, int],
+    ) -> list[dict[str, Any]]:
+        self._refresh_temporal_promotions(frame_shape)
+        promotions: list[dict[str, Any]] = []
+        for track in self.tracks:
+            label = str(track.get("temporal_promoted_label") or "")
+            if label not in {"head", "helmet"}:
+                continue
+            promotions.append(
+                {
+                    "track_id": int(track.get("id", 0) or 0),
+                    "label": label,
+                    "box": list(track.get("box") or []),
+                    "confidence": float(track.get("confidence", 0.0) or 0.0),
+                    "streak": int(track.get(f"weak_{label}_streak", 0) or 0),
+                    "avg_confidence": self._weak_avg_confidence(track, label),
+                    "reason": str(track.get("weak_reason") or ""),
+                    "area_ratio": float(track.get("area_ratio", 0.0) or 0.0),
+                }
+            )
+        return promotions
+
+    def _track_promotes_weak_label(
+        self,
+        track: dict[str, Any],
+        label: str,
+        frame_shape: tuple[int, int] | tuple[int, int, int],
+    ) -> bool:
+        if int(track.get("misses", 0) or 0) != 0:
+            return False
+        if str(track.get("stable_label") or "") != label:
+            return False
+        if str(track.get("current_weak_label") or "") != label:
+            return False
+        streak = int(track.get(f"weak_{label}_streak", 0) or 0)
+        required_hits = self._required_weak_hits(track, label)
+        if streak < required_hits:
+            return False
+        avg_conf = self._weak_avg_confidence(track, label)
+        min_conf = self._required_weak_confidence(track, label)
+        if label == "helmet" and not self._helmet_has_context(track, frame_shape):
+            min_conf = max(min_conf, self.weak_helmet_isolated_min_avg_confidence)
+        return avg_conf >= min_conf
+
+    def _required_weak_hits(self, track: dict[str, Any], label: str) -> int:
+        required = self.weak_promotion_hits
+        reason = str(track.get("weak_reason") or "")
+        if label == "head" and reason == "edge_isolated_head":
+            required = max(required, self.weak_edge_promotion_hits)
+        return required
+
+    def _required_weak_confidence(self, track: dict[str, Any], label: str) -> float:
+        if label == "helmet":
+            return self.weak_helmet_min_avg_confidence
+        reason = str(track.get("weak_reason") or "")
+        if reason == "edge_isolated_head":
+            return max(self.weak_head_min_avg_confidence, self.weak_edge_min_avg_confidence)
+        return self.weak_head_min_avg_confidence
+
+    def _weak_avg_confidence(self, track: dict[str, Any], label: str) -> float:
+        streak = max(1, int(track.get(f"weak_{label}_streak", 0) or 0))
+        total = float(track.get(f"weak_{label}_conf_sum", 0.0) or 0.0)
+        return total / float(streak)
+
+    def _same_head_zone(
+        self,
+        left: dict[str, Any],
+        right: dict[str, Any],
+        frame_shape: tuple[int, int] | tuple[int, int, int],
+    ) -> bool:
+        return (
+            bbox_iou(left["box"], right["box"]) >= 0.20
+            or center_distance_ratio(left["box"], right["box"], frame_shape) <= 0.040
+        )
+
+    def _helmet_has_context(
+        self,
+        helmet_track: dict[str, Any],
+        frame_shape: tuple[int, int] | tuple[int, int, int],
+    ) -> bool:
+        for track in self.tracks:
+            if track is helmet_track:
+                continue
+            if int(track.get("misses", 0) or 0) != 0:
+                continue
+            label = str(track.get("stable_label") or "")
+            if label not in {"head", "person"}:
+                continue
+            if bbox_iou(helmet_track["box"], track["box"]) >= 0.01:
+                return True
+            limit = 0.075 if label == "person" else 0.045
+            if center_distance_ratio(helmet_track["box"], track["box"], frame_shape) <= limit:
+                return True
+        return False
 
     def _update_stable_label(self, track: dict[str, Any], observed_label: str, observed_confidence: float) -> None:
         stable_label = str(track.get("stable_label", ""))

@@ -167,6 +167,7 @@ def suppress_helmet_false_positives(
     kept_helmet_indices: set[int] = set()
     suppressed_indices: set[int] = set()
     weak_head_indices: set[int] = set()
+    weak_helmet_indices: set[int] = set()
     display_suppressed_head_indices: set[int] = set()
     covered_head_indices: set[int] = set()
 
@@ -229,6 +230,7 @@ def suppress_helmet_false_positives(
             and matched_head is None
             and max_person_iou < cfg.min_person_context_iou
         )
+        high_confidence_isolated = missing_context and helmet.confidence >= cfg.min_direct_helmet_conf
         overlap_weak = (
             matched_head is not None
             and matched_iou >= cfg.overlap_iou
@@ -236,10 +238,11 @@ def suppress_helmet_false_positives(
         )
         overlap_low_direct = matched_head is not None and matched_iou >= cfg.overlap_iou and helmet.confidence < cfg.min_direct_helmet_conf
         weak_small = small_target and helmet.confidence < cfg.small_target_min_conf
-        if overlap_weak or overlap_low_direct or weak_small or missing_context or oversized_isolated or oversized_for_person:
+        suppress_missing_context = missing_context and not high_confidence_isolated
+        if overlap_weak or overlap_low_direct or weak_small or suppress_missing_context or oversized_isolated or oversized_for_person:
             if overlap_weak or overlap_low_direct:
                 reason = "head_helmet_overlap"
-            elif missing_context:
+            elif suppress_missing_context:
                 reason = "helmet_without_person_context"
             elif oversized_isolated:
                 reason = "oversized_isolated_helmet"
@@ -247,6 +250,8 @@ def suppress_helmet_false_positives(
                 reason = "oversized_helmet_vs_person"
             else:
                 reason = "small_low_conf_helmet"
+            if weak_small or suppress_missing_context:
+                weak_helmet_indices.add(helmet.index)
             suppressed_indices.add(helmet.index)
             suppressed.append(
                 {
@@ -274,6 +279,7 @@ def suppress_helmet_false_positives(
     return {
         "kept_helmet_indices": sorted(kept_helmet_indices),
         "suppressed_helmet_indices": sorted(suppressed_indices),
+        "weak_helmet_indices": sorted(weak_helmet_indices),
         "suppressed_helmets": suppressed,
         "suppressed_head_indices": sorted(display_suppressed_head_indices),
         "weak_head_indices": sorted(weak_head_indices),
@@ -321,6 +327,7 @@ def summarize_ppe_from_detections(
     missing_helmet_count = head_count
     candidate = head_count > 0
     suppressed_head_count = len(suppression.get("weak_head_indices", []) or [])
+    weak_helmet_count = len(suppression.get("weak_helmet_indices", []) or [])
     inferred_person_count = max(
         person_count,
         1 if (raw_head_count > 0 or raw_helmet_count > 0 or helmet_count > 0) else 0,
@@ -355,7 +362,13 @@ def summarize_ppe_from_detections(
         "inferred_person_count": inferred_person_count,
         "helmet_count": helmet_count,
         "raw_helmet_count": raw_helmet_count,
+        "weak_helmet_count": weak_helmet_count,
+        "promoted_helmet_count": 0,
+        "effective_helmet_count": helmet_count,
         "raw_head_count": raw_head_count,
+        "weak_head_count": suppressed_head_count,
+        "promoted_head_count": 0,
+        "effective_head_count": head_count,
         "head_count": head_count,
         "missing_helmet_count": missing_helmet_count,
         "candidate": candidate,

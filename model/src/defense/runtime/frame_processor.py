@@ -117,6 +117,14 @@ class FrameProcessor:
             hold_last_box=bool(ppe_config.get("hold_last_box", True)),
             smooth_alpha=float(ppe_config.get("smooth_alpha", 0.82 if ppe_config else 0.82)),
             show_held_boxes=bool(ppe_config.get("show_held_boxes", True)),
+            weak_promotion_hits=int(ppe_config.get("weak_promotion_hits", 3)),
+            weak_head_min_avg_confidence=float(ppe_config.get("weak_head_min_avg_confidence", 0.30)),
+            weak_helmet_min_avg_confidence=float(ppe_config.get("weak_helmet_min_avg_confidence", 0.30)),
+            weak_helmet_isolated_min_avg_confidence=float(
+                ppe_config.get("weak_helmet_isolated_min_avg_confidence", 0.50)
+            ),
+            weak_edge_promotion_hits=int(ppe_config.get("weak_edge_promotion_hits", 4)),
+            weak_edge_min_avg_confidence=float(ppe_config.get("weak_edge_min_avg_confidence", 0.45)),
         )
         self.ppe_tracking_enabled = bool(ppe_config.get("enabled", True))
         a3b_config = config.get("a3b", {}) if isinstance(config.get("a3b"), dict) else {}
@@ -276,6 +284,11 @@ class FrameProcessor:
             if isinstance(ppe_suppression, dict)
             else 0
         )
+        ppe_weak_helmet_count = (
+            len(ppe_suppression.get("weak_helmet_indices", []) or [])
+            if isinstance(ppe_suppression, dict)
+            else 0
+        )
         tracked_boxes_count = len([track for track in ppe_tracks if str(track.get("source", "detected")) in {"tracked", "held"}])
         render_boxes_count = len(ppe_tracks)
         bundle_config = self.bundle.config if isinstance(self.bundle.config, dict) else {}
@@ -340,9 +353,14 @@ class FrameProcessor:
             "ppe_person_context_count": _int(ppe.get("person_context_count", ppe.get("person_count"))),
             "ppe_helmet_count": _int(ppe.get("helmet_count")),
             "ppe_raw_helmet_count": _int(ppe.get("raw_helmet_count", ppe.get("helmet_count"))),
+            "ppe_weak_helmet_count": int(ppe_weak_helmet_count),
+            "ppe_promoted_helmet_count": _int(ppe.get("promoted_helmet_count")),
+            "ppe_effective_helmet_count": _int(ppe.get("effective_helmet_count", ppe.get("helmet_count"))),
             "ppe_head_count": _int(ppe.get("head_count")),
             "ppe_raw_head_count": _int(ppe.get("raw_head_count", ppe.get("head_count"))),
             "ppe_weak_head_count": int(ppe_weak_head_count),
+            "ppe_promoted_head_count": _int(ppe.get("promoted_head_count")),
+            "ppe_effective_head_count": _int(ppe.get("effective_head_count", ppe.get("head_count"))),
             "ppe_missing_helmet_count": _int(ppe.get("missing_helmet_count")),
             "ppe_has_person_class": bool(ppe.get("has_person_class", False)),
             "ppe_evidence_mode": str(ppe.get("evidence_mode", "")),

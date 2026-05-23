@@ -29,17 +29,22 @@ def evaluate_ppe_business(
     """Convert detector boxes into stable safety-helmet business state."""
 
     ppe_raw = summarize_ppe_from_detections(detections, frame_shape=frame_shape)
-    ppe = ppe_state.update(ppe_raw)
     tracks = (
         ppe_tracker.update(
             detections,
-            ppe,
+            ppe_raw,
             frame_shape=frame_shape,
             max_render_misses=max_render_misses,
         )
         if tracking_enabled
         else []
     )
+    ppe_input = (
+        ppe_tracker.apply_temporal_evidence(ppe_raw, frame_shape)
+        if tracking_enabled
+        else ppe_raw
+    )
+    ppe = ppe_state.update(ppe_input)
     tracks = _filter_tracks_for_ppe_counts(tracks, ppe)
     return PPEBusinessResult(ppe=ppe, tracks=tracks)
 

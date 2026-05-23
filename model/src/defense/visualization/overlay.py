@@ -101,7 +101,18 @@ def draw_ppe_boxes(frame: np.ndarray, tracks: list[dict[str, Any]] | None) -> np
         confidence = float(track.get("confidence", 0.0) or 0.0)
         suffix = " held" if int(track.get("misses", 0) or 0) > 0 else ""
         small = " far" if track.get("is_small") else ""
-        display_label = "weakHead" if label == "head" and not bool(track.get("hold_eligible", True)) else PPE_LABEL_TEXT.get(label, label)
+        evidence_label = str(track.get("evidence_label") or "")
+        promoted_label = str(track.get("promoted_label") or "")
+        if promoted_label == "head":
+            display_label = "head+"
+        elif promoted_label == "helmet":
+            display_label = "helmet+"
+        elif label == "head" and (evidence_label == "head" or not bool(track.get("hold_eligible", True))):
+            display_label = "weakHead"
+        elif label == "helmet" and evidence_label == "helmet":
+            display_label = "weakHelmet"
+        else:
+            display_label = PPE_LABEL_TEXT.get(label, label)
         text = f"{display_label}#{int(track.get('track_id', 0))} {confidence:.2f}{small}{suffix}"
         _draw_label(rendered, [int(v) for v in box], text, color, 1)
     return rendered
@@ -120,13 +131,17 @@ def draw_ppe_hud(frame: np.ndarray, ppe: dict[str, Any] | None) -> np.ndarray:
     color = (0, 0, 255) if warning else (0, 220, 100)
     suppression = ppe.get("helmet_fp_suppression", {}) if isinstance(ppe.get("helmet_fp_suppression"), dict) else {}
     weak_head_count = len(suppression.get("weak_head_indices", suppression.get("suppressed_head_indices", [])) or [])
+    weak_helmet_count = len(suppression.get("weak_helmet_indices", []) or [])
+    promoted_head_count = int(ppe.get("promoted_head_count", 0) or 0)
+    promoted_helmet_count = int(ppe.get("promoted_helmet_count", 0) or 0)
     raw_person_count = int(ppe.get("raw_person_count", ppe.get("person_count", 0)) or 0)
     inferred_person_count = int(ppe.get("inferred_person_count", raw_person_count) or 0)
     text = (
         f"PPE rawP={raw_person_count} inferP={inferred_person_count} "
         f"helmet={int(ppe.get('helmet_count', 0) or 0)} "
         f"head={int(ppe.get('head_count', 0) or 0)} "
-        f"weakHead={weak_head_count} "
+        f"weakH={weak_head_count}/{weak_helmet_count} "
+        f"prom={promoted_head_count}/{promoted_helmet_count} "
         f"missing={int(ppe.get('missing_helmet_count', 0) or 0)}"
     )
     cv2.putText(frame, text, (10, h - 52), font, 0.45, color, 1, cv2.LINE_AA)

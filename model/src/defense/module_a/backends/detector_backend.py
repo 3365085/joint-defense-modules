@@ -239,6 +239,32 @@ class YoloV5DetectorBackend:
         self.model = None
         _release_torch_cuda_cache()
 
+    def warmup_postprocess(self) -> None:
+        """Force lazy NMS imports/kernels before the first real detection frame."""
+        device = self.device if self.device.startswith("cuda") else "cpu"
+        dummy = self.torch.tensor(
+            [
+                [
+                    [10.0, 10.0, 40.0, 40.0, 0.90, 0.0],
+                    [12.0, 12.0, 42.0, 42.0, 0.80, 0.0],
+                    [80.0, 80.0, 110.0, 115.0, 0.70, 1.0],
+                    [120.0, 120.0, 160.0, 170.0, 0.60, 2.0],
+                    [0.0, 0.0, 1.0, 1.0, 0.01, 0.0],
+                    [1.0, 1.0, 2.0, 2.0, 0.01, 1.0],
+                ]
+            ],
+            device=device,
+            dtype=self.torch.float32,
+        )
+        self._non_max_suppression(
+            dummy,
+            conf_thres=min(self.confidence, 0.25),
+            iou_thres=0.7,
+            max_det=10,
+        )
+        if self.device.startswith("cuda") and self.torch.cuda.is_available():
+            self.torch.cuda.synchronize(self.torch.device(self.device))
+
     @staticmethod
     def _configure_yolov5_base_runtime(yolov5_root: Path) -> None:
         """Constrain bundled YOLOv5 code to local artifact loading only."""

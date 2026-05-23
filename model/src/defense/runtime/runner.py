@@ -356,7 +356,15 @@ class MonitorEngine:
             "ppe_inferred_person_count": 0,
             "ppe_person_context_count": 0,
             "ppe_helmet_count": 0,
+            "ppe_raw_helmet_count": 0,
+            "ppe_weak_helmet_count": 0,
+            "ppe_promoted_helmet_count": 0,
+            "ppe_effective_helmet_count": 0,
             "ppe_head_count": 0,
+            "ppe_raw_head_count": 0,
+            "ppe_weak_head_count": 0,
+            "ppe_promoted_head_count": 0,
+            "ppe_effective_head_count": 0,
             "ppe_missing_helmet_count": 0,
             "ppe_has_person_class": False,
             "ppe_evidence_mode": "",
@@ -377,6 +385,7 @@ class MonitorEngine:
             "error": "",
             "preview_mode": "idle",
             "initializing": False,
+            "prewarming": False,
             "detector_ready": False,
             "first_detection_ready": False,
             "ready_for_preview": False,
@@ -408,6 +417,8 @@ class MonitorEngine:
             "pipeline_warmup_ms": 0.0,
             "pipeline_warmup_frames": 0,
             "pipeline_reset_ms": 0.0,
+            "detector_thread_warmup_ms": 0.0,
+            "detector_thread_warmup_frames": 0,
             "first_detection_processing_ms": 0.0,
             "first_detection_timing_ms": 0.0,
             "first_detection_detector_inference_ms": 0.0,
@@ -501,6 +512,7 @@ class MonitorEngine:
                     "started_at": datetime.now().isoformat(timespec="seconds"),
                     "preview_mode": "initializing_detector",
                     "initializing": True,
+                    "prewarming": True,
                     "detector_ready": False,
                     "first_detection_ready": False,
                     "ready_for_preview": False,
@@ -534,7 +546,8 @@ class MonitorEngine:
                                 )
                             ),
                             "initializing": False,
-                            "detector_ready": True,
+                            "prewarming": True,
+                            "detector_ready": False,
                             "init_ms": init_ms,
                             "pipeline_cache_hit": bool(preload_bundle.cache_hit),
                             "pipeline_cache_get_ms": float(preload_bundle.cache_get_ms),
@@ -545,7 +558,7 @@ class MonitorEngine:
                             "pipeline_warmup_frames": int(preload_bundle.warmup_frames),
                             "pipeline_reset_ms": float(preload_bundle.pipeline_reset_ms),
                             "warmup_error": preload_bundle.warmup_error,
-                            "preview_mode": "mp4_clock_prepare" if source_type == "file" else "detector_ready_wait_first_frame",
+                            "preview_mode": "detector_thread_prewarming",
                         }
                     )
                     self.condition.notify_all()
@@ -623,7 +636,6 @@ class MonitorEngine:
             int(capture_max_side),
             float(file_source_fps_cap),
         )
-        self.capture_thread = threading.Thread(target=self._backend_capture_loop, args=capture_args, name="module-a-source", daemon=True)
         self.process_thread = threading.Thread(target=self._backend_process_loop, args=process_args, name="module-a-detector", daemon=True)
         self.preview_thread = threading.Thread(
             target=self._preview_render_loop,
@@ -631,8 +643,32 @@ class MonitorEngine:
             name="module-a-preview",
             daemon=True,
         )
-        self.capture_thread.start()
         self.process_thread.start()
+        detector_ready_deadline = time.perf_counter() + float(runtime_config.get("detector_thread_warmup_timeout_s", 30.0) or 30.0)
+        with self.condition:
+            while (
+                run_id == self.run_id
+                and not self.stop_event.is_set()
+                and bool(self.status.get("running"))
+                and bool(self.status.get("prewarming", False))
+                and time.perf_counter() < detector_ready_deadline
+            ):
+                self.condition.wait(timeout=0.05)
+            if run_id != self.run_id or self.stop_event.is_set():
+                raise RuntimeError("monitor start was interrupted")
+            if self.status.get("error"):
+                raise RuntimeError(str(self.status.get("error")))
+            if bool(self.status.get("prewarming", False)):
+                self.status["error"] = "detector thread warmup timed out"
+                self.status["running"] = False
+                self.status["initializing"] = False
+                self.status["prewarming"] = False
+                self.status["stopped_at"] = datetime.now().isoformat(timespec="seconds")
+                self.condition.notify_all()
+                raise RuntimeError("detector thread warmup timed out")
+
+        self.capture_thread = threading.Thread(target=self._backend_capture_loop, args=capture_args, name="module-a-source", daemon=True)
+        self.capture_thread.start()
         self.preview_thread.start()
         return run_id
 
@@ -1054,6 +1090,25 @@ class MonitorEngine:
         try:
             bundle = self.cache.get(profile=profile, feature_options=feature_options, custom_model=custom_model)
             runtime_config = bundle.config.get("runtime", {}) if isinstance(bundle.config.get("runtime"), dict) else {}
+            thread_warmup_frames = int(
+                runtime_config.get(
+                    "detector_thread_warmup_frames",
+                    getattr(bundle.pipeline, "warmup_frames", 0) or 0,
+                )
+                or 0
+            )
+            thread_warmup_started = time.perf_counter()
+            thread_warmup_error = ""
+            try:
+                bundle.pipeline.warmup(thread_warmup_frames)
+            except Exception as exc:
+                thread_warmup_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                try:
+                    bundle.pipeline.reset()
+                except Exception as exc:
+                    thread_warmup_error = thread_warmup_error or f"{type(exc).__name__}: {exc}"
+                thread_warmup_ms = (time.perf_counter() - thread_warmup_started) * 1000.0
             processor = FrameProcessor(bundle, jpeg_quality=int(runtime_config.get("jpeg_quality", 82)))
             evidence = EvidenceSession(
                 source_type=source_type,
@@ -1080,8 +1135,13 @@ class MonitorEngine:
                             "evidence_manifest_path": str(evidence.manifest_path),
                             "detector_ready": True,
                             "initializing": False,
+                            "prewarming": False,
+                            "detector_thread_warmup_ms": float(thread_warmup_ms),
+                            "detector_thread_warmup_frames": int(thread_warmup_frames),
+                            "warmup_error": thread_warmup_error or str(bundle.warmup_error or ""),
                             "detector_process_fps_cap": process_fps_cap,
                             "detector_queue_policy": "latest_only",
+                            "preview_mode": "mp4_clock_prepare" if source_type == "file" else "detector_ready_wait_first_frame",
                         }
                     )
                     self.condition.notify_all()
@@ -1203,7 +1263,7 @@ class MonitorEngine:
                 # stale boxes visibly trail moving content, so cap display-only
                 # smoothing to a short bridge between detector frames.
                 detector_fps = max(1.0, float(self.status.get("detector_process_fps_cap") or 15.0))
-                bridge_s = min(0.14, max(0.08, 1.5 / detector_fps))
+                bridge_s = min(0.18, max(0.12, 2.4 / detector_fps))
                 match_s = min(match_s, bridge_s)
                 hold_s = min(hold_s, bridge_s)
                 max_age_s = min(max_age_s, bridge_s)
@@ -1425,6 +1485,7 @@ class MonitorEngine:
                     ended_status.get("module_a_timing_ms", self.status.get("module_a_timing_ms") or 0.0)
                 )
             self.status["initializing"] = False
+            self.status["prewarming"] = False
             self.status["detector_ready"] = True
             self.status["first_detection_ready"] = True
             if was_running:
@@ -1486,5 +1547,7 @@ class MonitorEngine:
         with self.condition:
             self.status["error"] = message
             self.status["running"] = False
+            self.status["initializing"] = False
+            self.status["prewarming"] = False
             self.status["stopped_at"] = datetime.now().isoformat(timespec="seconds")
             self.condition.notify_all()

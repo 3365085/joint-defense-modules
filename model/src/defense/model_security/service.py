@@ -11,7 +11,7 @@ from defense.runtime.config import DEFAULT_CONFIG_PATH, load_runtime_config, pro
 
 from .fingerprint import ModelFingerprint, SCANNER_VERSION, build_model_fingerprint, sha256_file
 from .integrity import TrustStoreIntegrity, verify_trust_store, write_trust_store_seal
-from .purifier import run_new_purification
+from .purifier import known_poisoned_attack_metrics, run_new_purification
 from .registry import ModelTrustRegistry
 from .reports import ModelPurificationReport, ModelSecurityReport, ScanBudget, now_iso
 from .scanner import full_scan, quick_scan
@@ -243,6 +243,7 @@ class ModelSecurityService:
             image_size=fp.image_size,
             class_names_hash=fp.class_names_hash,
             ppe_mapping_hash=fp.ppe_mapping_hash,
+            security_metrics=self._security_metrics(purified_report=report),
             approval_source="full_scan",
         )
         self._log_event(
@@ -266,6 +267,156 @@ class ModelSecurityService:
         if not report.report_path:
             return False
         return True
+
+    @staticmethod
+    def _strict_observed_asr(strict: dict[str, Any]) -> float | None:
+        try:
+            k = float(strict.get("k"))
+            n = float(strict.get("N"))
+        except Exception:
+            return None
+        if n <= 0:
+            return None
+        return k / n
+
+    @staticmethod
+    def _scan_metrics(report: ModelSecurityReport | None, *, role: str) -> dict[str, Any]:
+        if report is None:
+            return {}
+        metrics: dict[str, Any] = {
+            f"{role}_status": report.status,
+            f"{role}_risk_score": report.risk_score,
+            f"{role}_report_path": report.report_path,
+        }
+        diagnostics = report.diagnostics if isinstance(report.diagnostics, dict) else {}
+        external = diagnostics.get("external_validation")
+        summary = external.get("summary") if isinstance(external, dict) and isinstance(external.get("summary"), dict) else {}
+        if summary:
+            if summary.get("max_asr") is not None:
+                metrics[f"{role}_asr"] = float(summary.get("max_asr") or 0.0)
+                metrics[f"{role}_asr_kind"] = "external_max_asr"
+            if summary.get("mean_asr") is not None:
+                metrics[f"{role}_mean_asr"] = float(summary.get("mean_asr") or 0.0)
+            if summary.get("n_rows") is not None:
+                metrics[f"{role}_n_rows"] = int(summary.get("n_rows") or 0)
+
+        poisoned = diagnostics.get("new_algorithm_poisoned_evidence")
+        if isinstance(poisoned, dict):
+            original = poisoned.get("original_attack_metrics")
+            if not isinstance(original, dict) and poisoned.get("family_tag"):
+                original = known_poisoned_attack_metrics(str(poisoned.get("family_tag") or ""))
+            if isinstance(original, dict) and original.get("max_asr") is not None:
+                metrics[f"{role}_asr"] = float(original.get("max_asr") or 0.0)
+                metrics[f"{role}_asr_kind"] = "packaged_original_max_asr"
+                metrics[f"{role}_attack"] = original.get("attack")
+                metrics[f"{role}_metric_source"] = original.get("source")
+                if original.get("successes") is not None:
+                    metrics[f"{role}_successes"] = original.get("successes")
+                if original.get("n") is not None:
+                    metrics[f"{role}_n"] = original.get("n")
+            if poisoned.get("family_tag"):
+                metrics.setdefault("family_tag", poisoned.get("family_tag"))
+
+        strict = diagnostics.get("new_algorithm_strict_audit")
+        if isinstance(strict, dict):
+            observed = ModelSecurityService._strict_observed_asr(strict)
+            if observed is not None:
+                metrics[f"{role}_asr"] = observed
+                metrics[f"{role}_asr_kind"] = "strict_observed_asr"
+            metrics[f"{role}_wilson_upper"] = strict.get("wilson_upper")
+            metrics[f"{role}_map_drop_pp"] = strict.get("mAP_drop_pp")
+            metrics[f"{role}_k"] = strict.get("k")
+            metrics[f"{role}_n"] = strict.get("N")
+            metrics[f"{role}_defense"] = strict.get("defense")
+            metrics[f"{role}_tier"] = strict.get("tier")
+            if strict.get("family_tag"):
+                metrics.setdefault("family_tag", strict.get("family_tag"))
+        return metrics
+
+    @staticmethod
+    def _read_report(path: str | None) -> ModelSecurityReport | None:
+        if not path:
+            return None
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return None
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            return ModelSecurityReport(**raw)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _read_purification_report(path: str | None) -> ModelPurificationReport | None:
+        if not path:
+            return None
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return None
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            return ModelPurificationReport(**raw)
+        except Exception:
+            return None
+
+    def _security_metrics(
+        self,
+        *,
+        original_report: ModelSecurityReport | None = None,
+        purified_report: ModelSecurityReport | None = None,
+        purification_report: ModelPurificationReport | None = None,
+    ) -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
+        metrics.update(self._scan_metrics(original_report, role="original"))
+        metrics.update(self._scan_metrics(purified_report, role="purified"))
+        if purification_report is not None:
+            metrics["purification_status"] = purification_report.status
+            metrics["purification_strategy"] = purification_report.strategy
+            metrics["purification_report_path"] = purification_report.report_path
+            metrics["purified_model_path"] = purification_report.purified_model_path
+            metrics["purified_model_hash"] = purification_report.purified_model_hash
+            if purified_report is None and purification_report.scan_report_path:
+                metrics.update(
+                    self._scan_metrics(
+                        self._read_report(purification_report.scan_report_path),
+                        role="purified",
+                    )
+                )
+        return metrics
+
+    def _trusted_record_context(self, rec: Any) -> dict[str, Any]:
+        purification_report = self._read_purification_report(getattr(rec, "purification_report_path", None))
+        purified_report = self._read_report(getattr(rec, "report_path", None))
+        original_report = None
+        if purification_report is not None:
+            original_fp = str(purification_report.fingerprint.get("fingerprint") or "")
+            original_report = self._load_report(
+                original_fp,
+                "full",
+                purification_report.source_model_hash,
+            )
+        metrics = dict(getattr(rec, "security_metrics", None) or {})
+        if not metrics:
+            metrics = self._security_metrics(
+                original_report=original_report,
+                purified_report=purified_report,
+                purification_report=purification_report,
+            )
+        original_source_model_path = getattr(rec, "original_source_model_path", None) or (
+            purification_report.source_model_path if purification_report else None
+        )
+        original_source_model_hash = getattr(rec, "original_source_model_hash", None) or (
+            purification_report.source_model_hash if purification_report else None
+        )
+        if original_source_model_path:
+            metrics.setdefault("original_source_model_path", original_source_model_path)
+        if original_source_model_hash:
+            metrics.setdefault("original_source_model_hash", original_source_model_hash)
+        return {
+            "security_metrics": metrics,
+            "original_source_model_path": original_source_model_path,
+            "original_source_model_hash": original_source_model_hash,
+        }
 
     def _is_scanning(self, fingerprint: str | None = None) -> bool:
         running = bool(self._scan_thread and self._scan_thread.is_alive())
@@ -346,6 +497,17 @@ class ModelSecurityService:
                 status = "unverifiable"
                 reason = "source_pt_required_for_accelerated_artifact"
 
+            trusted_record_match = bool(rec and self._trusted_record_matches(rec, fp, source_hash))
+            trusted_context = self._trusted_record_context(rec) if trusted_record_match else {}
+            security_metrics = (
+                dict(trusted_context.get("security_metrics") or {})
+                if trusted_record_match
+                else self._security_metrics(
+                    original_report=last_report,
+                    purification_report=last_purification,
+                )
+            )
+
             payload = {
                 "enabled": True,
                 "allowed": allowed,
@@ -361,6 +523,16 @@ class ModelSecurityService:
                 "runtime_artifact_path": fp.model_path,
                 "source_pt_path": str(source_pt) if source_pt else None,
                 "source_pt_hash": source_hash,
+                "original_source_model_path": (
+                    trusted_context.get("original_source_model_path")
+                    if trusted_record_match
+                    else (last_purification.source_model_path if last_purification else None)
+                ),
+                "original_source_model_hash": (
+                    trusted_context.get("original_source_model_hash")
+                    if trusted_record_match
+                    else (last_purification.source_model_hash if last_purification else None)
+                ),
                 "backend": fp.backend,
                 "model_family": fp.model_family,
                 "image_size": fp.image_size,
@@ -371,6 +543,7 @@ class ModelSecurityService:
                 "whitelist_user_actions": ["delete", "clear"],
                 "full_scan_model_policy": "source_pt_only",
                 "risk_score": risk,
+                "security_metrics": security_metrics,
                 "last_scan_time": last_scan,
                 "report_path": report_path,
                 "purification_status": last_purification.status if last_purification else ("running" if purifying else "idle"),
@@ -811,6 +984,7 @@ class ModelSecurityService:
                     report.purified_model_hash = "sha256:" + sha256_file(accepted_path)
                     report.scan_report_path = accepted_scan_report.report_path
                     report.scan_status = accepted_scan_report.status
+                    report.status = "scan_clean_trusted"
                     self.registry.mark_trusted(
                         accepted_fp.fingerprint,
                         risk_score=accepted_scan_report.risk_score,
@@ -821,15 +995,21 @@ class ModelSecurityService:
                         runtime_model_path=accepted_fp.model_path,
                         source_model_hash=accepted_scan_report.source_model_hash,
                         source_model_path=accepted_scan_report.source_model_path,
+                        original_source_model_hash=latest_report.source_model_hash or source_hash,
+                        original_source_model_path=latest_report.source_model_path or (str(source_pt) if source_pt else None),
                         backend=accepted_fp.backend,
                         model_family=accepted_fp.model_family,
                         image_size=accepted_fp.image_size,
                         class_names_hash=accepted_fp.class_names_hash,
                         ppe_mapping_hash=accepted_fp.ppe_mapping_hash,
                         purification_report_path=report.report_path,
+                        security_metrics=self._security_metrics(
+                            original_report=latest_report,
+                            purified_report=accepted_scan_report,
+                            purification_report=report,
+                        ),
                         approval_source="purified_full_scan",
                     )
-                    report.status = "scan_clean_trusted"
                     self._log_event(
                         "whitelist_written",
                         status="trusted",
@@ -891,7 +1071,18 @@ class ModelSecurityService:
 
     def trust_records(self) -> dict[str, Any]:
         integrity = self._trust_store_integrity()
-        records = [rec.to_dict() for rec in self.registry.list_records()] if integrity.ok else []
+        records: list[dict[str, Any]] = []
+        if integrity.ok:
+            for rec in self.registry.list_records():
+                item = rec.to_dict()
+                context = self._trusted_record_context(rec)
+                if context.get("security_metrics"):
+                    item["security_metrics"] = context["security_metrics"]
+                if context.get("original_source_model_path"):
+                    item["original_source_model_path"] = context["original_source_model_path"]
+                if context.get("original_source_model_hash"):
+                    item["original_source_model_hash"] = context["original_source_model_hash"]
+                records.append(item)
         payload = {"registry_path": str(self.registry.path), "count": len(records), "records": records}
         payload.update(self._trust_store_fields(integrity))
         return payload

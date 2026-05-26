@@ -617,6 +617,11 @@
             <button class="secondary" id="openModelSecurityCenterBtn" type="button">打开安全中心</button>
             <button class="secondary" id="refreshModelSecurityBtn" type="button">刷新状态</button>
           </div>
+          <label class="toggleLine" style="margin-top:10px;">
+            <input id="testBypassModelSecurity" type="checkbox" />
+            测试入口：绕过B模块安全准入直接运行当前模型
+          </label>
+          <div class="sourceHint">仅用于当前阶段对比毒模型/净化模型效果；不会写入白名单，禁止生产使用。</div>
         </section>
         <label>画面叠加</label>
         <div class="toggleGrid">
@@ -769,6 +774,34 @@
         model_family: modelFamily,
         source_pt_path: sourcePtPath,
       };
+    }
+
+    function modelSecurityBypassEnabled() {
+      try {
+        const node = $("testBypassModelSecurity");
+        if (node) return !!node.checked;
+        return localStorage.getItem("moduleA.testBypassModelSecurity") === "true";
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function loadModelSecurityBypassOption() {
+      const node = $("testBypassModelSecurity");
+      if (!node) return;
+      try {
+        node.checked = localStorage.getItem("moduleA.testBypassModelSecurity") === "true";
+      } catch (_) {
+        node.checked = false;
+      }
+    }
+
+    function saveModelSecurityBypassOption() {
+      const node = $("testBypassModelSecurity");
+      if (!node) return;
+      try {
+        localStorage.setItem("moduleA.testBypassModelSecurity", node.checked ? "true" : "false");
+      } catch (_) {}
     }
     function modelFamilyLabel(value) {
       const labels = {
@@ -1279,7 +1312,19 @@
         body: body ? JSON.stringify(body) : undefined,
         signal: options.signal,
       });
-      const data = await res.json();
+      const text = await res.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (_) {
+        const snippet = (text || res.statusText || "请求失败").slice(0, 180);
+        data = {
+          ok: false,
+          error: "non_json_response",
+          message: snippet,
+          status_code: res.status,
+        };
+      }
       if (!res.ok || data.ok === false) {
         const err = new Error(data.message || data.error || res.statusText);
         err.data = data;
@@ -1403,6 +1448,7 @@
         review: "需要复核",
         purifying: "净化中",
         clean_export_required: "净化通过，待切换",
+        bypassed_for_test: "测试绕过",
         error: "异常",
         planned: "已生成净化计划",
         purified: "已生成净化模型",
@@ -1443,6 +1489,9 @@
       }
       if (status === "trusted") {
         return `当前运行模型已通过B模块准入，可以启动A模块检测。${suffix}`;
+      }
+      if (status === "bypassed_for_test") {
+        return `测试模式已绕过B模块准入；当前模型不会写入白名单，结果只用于临时对比。`;
       }
       if (status === "clean_export_required") {
         return `净化模型已通过，请在安全中心切换到净化PT；需要加速格式时再导出绑定。`;
@@ -1713,6 +1762,12 @@
         $("refreshModelSecurityBtn").disabled = false;
       }
     };
+    if ($("testBypassModelSecurity")) {
+      $("testBypassModelSecurity").onchange = () => {
+        saveModelSecurityBypassOption();
+        setError($("testBypassModelSecurity").checked ? "测试绕过已启用：下一次开始检测会跳过B模块准入。" : "");
+      };
+    }
     $("startBtn").onclick = async () => {
       if (startInFlight) return;
       setError("");
@@ -1731,7 +1786,11 @@
         }
         modelSecurityBlockState = null;
         hideAllPreview();
-        showEmpty("正在检查模型安全准入", "B模块正在核对白名单、源PT和扫描报告；如果需要净化，会自动净化并使用净化PT启动A模块。");
+        if (modelSecurityBypassEnabled()) {
+          showEmpty("测试绕过安全准入", "本次启动会直接运行当前模型，不做B模块阻断，也不会写入白名单。");
+        } else {
+          showEmpty("正在检查模型安全准入", "B模块正在核对白名单、源PT和扫描报告；如果需要净化，会自动净化并使用净化PT启动A模块。");
+        }
         await syncDrawingOptions();
         const sourceType = $("sourceType").value;
         const body = {
@@ -1741,6 +1800,7 @@
           realtime: true,
           feature_options: featureOptions(),
           custom_model: customModelOptions(),
+          test_bypass_model_security: modelSecurityBypassEnabled(),
           ready_timeout_s: 45,
         };
         saveLastPaths();
@@ -1947,6 +2007,7 @@
     }
 
     loadLastPaths();
+    loadModelSecurityBypassOption();
     updateSourceControls();
     showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
     refreshModelSecurity();

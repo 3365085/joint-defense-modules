@@ -149,15 +149,26 @@ def _external_target_class_ids(config: Mapping[str, Any] | None) -> list[int]:
 def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, Any]:
     model_security = _model_security_config(config)
     class_names = _class_name_map(config)
+    ignored_targets: list[str] = []
+
+    def keep_ppe_target(idx: int) -> bool:
+        name = str(class_names.get(idx, idx)).strip().lower()
+        if name == "person":
+            ignored_targets.append(name)
+            return False
+        return True
+
     explicit_ids = _as_sequence(
         model_security.get("external_eval_target_class_ids", model_security.get("target_class_ids"))
     )
     ids: list[int] = []
     for item in explicit_ids:
         try:
-            ids.append(int(item))
+            idx = int(item)
         except (TypeError, ValueError):
             continue
+        if keep_ppe_target(idx):
+            ids.append(idx)
     if ids:
         ids = list(dict.fromkeys(ids))
         return {
@@ -165,20 +176,27 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
             "target_classes": [class_names.get(idx, str(idx)) for idx in ids],
             "requested_target_classes": [],
             "missing_target_classes": [],
+            "ignored_target_classes": sorted(set(ignored_targets)),
             "available_class_names": class_names,
             "source": "explicit_ids",
         }
 
-    target_names = [
+    requested_target_names = [
         str(item).strip().lower()
         for item in _as_sequence(
             model_security.get(
                 "external_eval_target_classes",
-                model_security.get("target_classes", ["person"]),
+                model_security.get("target_classes", ["helmet", "head"]),
             )
         )
         if str(item).strip()
     ]
+    target_names = []
+    for name in requested_target_names:
+        if name == "person":
+            ignored_targets.append(name)
+            continue
+        target_names.append(name)
     reverse = {name.lower(): idx for idx, name in class_names.items()}
     ids = [int(reverse[name]) for name in target_names if name in reverse]
     missing = [name for name in target_names if name not in reverse]
@@ -187,16 +205,18 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
         return {
             "target_class_ids": ids,
             "target_classes": [class_names.get(idx, str(idx)) for idx in ids],
-            "requested_target_classes": target_names,
+            "requested_target_classes": requested_target_names,
             "missing_target_classes": missing,
+            "ignored_target_classes": sorted(set(ignored_targets)),
             "available_class_names": class_names,
             "source": "class_names",
         }
     return {
         "target_class_ids": [],
         "target_classes": [],
-        "requested_target_classes": target_names,
+        "requested_target_classes": requested_target_names,
         "missing_target_classes": missing or target_names,
+        "ignored_target_classes": sorted(set(ignored_targets)),
         "available_class_names": class_names,
         "source": "unresolved",
     }
@@ -210,7 +230,9 @@ def _external_target_policy_error(config: Mapping[str, Any] | None, resolution: 
     if not target_ids:
         requested = ", ".join(str(x) for x in resolution.get("requested_target_classes", []) or [])
         missing = ", ".join(str(x) for x in resolution.get("missing_target_classes", []) or [])
-        return f"no scannable B-module target class resolved; requested=[{requested}], missing=[{missing}]"
+        ignored = ", ".join(str(x) for x in resolution.get("ignored_target_classes", []) or [])
+        suffix = f", ignored=[{ignored}]" if ignored else ""
+        return f"no scannable B-module target class resolved; requested=[{requested}], missing=[{missing}]{suffix}"
 
     target_names = {str(name).strip().lower() for name in resolution.get("target_classes", []) if str(name).strip()}
     available_names = {

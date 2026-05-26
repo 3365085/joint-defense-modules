@@ -243,6 +243,8 @@
             </label>
           </div>
           <div class="notice">TensorRT 表示使用已导出的 .engine 加速运行；B模块准入仍以同源原始 PT 为依据。未知模型必须先完成安全扫描，不能只靠路径或手工选择放行。</div>
+          <label class="checkLine"><input id="testBypassModelSecurity" type="checkbox" />测试入口：绕过B模块安全准入直接运行当前模型</label>
+          <div class="notice warn">仅用于当前阶段对比毒模型、原模型和净化模型检测效果；不会写入白名单，禁止生产使用。</div>
           <div class="grid2">
             <button id="saveModelConfigBtn" class="primary" type="button">保存并应用</button>
             <button id="resetModelConfigBtn" type="button">恢复默认模型</button>
@@ -263,6 +265,11 @@
             <div class="metric"><b id="lastScan">--</b><span>最近扫描</span></div>
             <div class="metric"><b id="whitelistHit">--</b><span>白名单命中</span></div>
           </div>
+          <div class="grid3">
+            <div class="metric"><b id="originalAsr">--</b><span>原始ASR</span></div>
+            <div class="metric"><b id="purifiedAsr">--</b><span>净化后ASR</span></div>
+            <div class="metric"><b id="purifiedWilson">--</b><span>净化后Wilson上界</span></div>
+          </div>
           <div class="grid2">
             <div class="field"><strong>运行档位：</strong><span id="profileText">全速GPU（默认加速模型）</span></div>
             <label>自动刷新
@@ -277,6 +284,7 @@
           <div class="stack">
             <div class="field"><strong>运行模型：</strong><code id="runtimePath">--</code></div>
             <div class="field"><strong>源PT：</strong><code id="sourcePtStatusPath">--</code></div>
+            <div class="field"><strong>原始源模型：</strong><code id="originalSourcePath">--</code></div>
             <div class="field"><strong>净化模型：</strong><code id="purifiedPath">--</code></div>
             <div class="field"><strong>模型指纹：</strong><code id="fingerprint">--</code></div>
             <div class="field"><strong>扫描报告：</strong><code id="reportPath">--</code></div>
@@ -413,6 +421,10 @@
       return {enabled: enabled && !!path, path, backend, model_family: family, source_pt_path: sourcePtPath};
     }
 
+    function modelSecurityBypassEnabled() {
+      return getStored("moduleA.testBypassModelSecurity", "false") === "true";
+    }
+
     function loadModelConfig() {
       $("profileSelect").value = getStored("moduleA.lastProfile", DEFAULT_RUNTIME_PROFILE);
       $("enableCustomModel").checked = getStored("moduleA.lastCustomModelEnabled", "false") === "true";
@@ -420,6 +432,7 @@
       $("sourcePtPath").value = getStored("moduleA.lastSourcePtPath", "");
       $("customModelBackend").value = getStored("moduleA.lastCustomModelBackend", "auto");
       $("customModelFamily").value = getStored("moduleA.lastCustomModelFamily", "auto");
+      $("testBypassModelSecurity").checked = modelSecurityBypassEnabled();
       syncModelConfigControls();
     }
 
@@ -430,6 +443,7 @@
       setStored("moduleA.lastSourcePtPath", $("sourcePtPath").value.trim());
       setStored("moduleA.lastCustomModelBackend", $("customModelBackend").value || "auto");
       setStored("moduleA.lastCustomModelFamily", $("customModelFamily").value || "auto");
+      setStored("moduleA.testBypassModelSecurity", $("testBypassModelSecurity").checked ? "true" : "false");
       syncModelConfigControls();
       if (!options.silent) showConfigMessage("模型运行配置已保存。");
     }
@@ -441,6 +455,7 @@
       $("sourcePtPath").value = "";
       $("customModelBackend").value = "auto";
       $("customModelFamily").value = "auto";
+      $("testBypassModelSecurity").checked = false;
       saveModelConfig({silent: true});
       showConfigMessage("已恢复默认模型配置。");
     }
@@ -473,6 +488,7 @@
         review: "需要复核",
         purifying: "净化中",
         purified_alternative_available: "净化模型可用",
+        bypassed_for_test: "测试绕过",
         trust_store_compromised: "白名单失效",
         error: "异常",
         deleted: "已删除",
@@ -536,6 +552,17 @@
       return String(value).replace("T", " ").replace("+00:00", " UTC").slice(0, 23);
     }
 
+    function percentText(value) {
+      if (value === null || value === undefined || value === "") return "--";
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "--";
+      return (num * 100).toFixed(2) + "%";
+    }
+
+    function metricsOf(obj) {
+      return (obj && typeof obj.security_metrics === "object" && obj.security_metrics) ? obj.security_metrics : {};
+    }
+
     function escapeHtml(value) {
       return String(value ?? "").replace(/[&<>"]/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch]));
     }
@@ -549,11 +576,16 @@
       const status = lastModelSecurity.admission_status || lastModelSecurity.status || "unknown";
       $("statusPill").textContent = statusLabel(status);
       $("statusPill").className = "pill " + tone(status);
+      const metrics = metricsOf(lastModelSecurity);
       $("riskScore").textContent = lastModelSecurity.risk_score == null ? "--" : Number(lastModelSecurity.risk_score).toFixed(3);
+      $("originalAsr").textContent = percentText(metrics.original_asr);
+      $("purifiedAsr").textContent = percentText(metrics.purified_asr);
+      $("purifiedWilson").textContent = percentText(metrics.purified_wilson_upper);
       $("lastScan").textContent = timeText(lastModelSecurity.last_scan_time);
       $("whitelistHit").textContent = lastModelSecurity.whitelist_hit ? "是" : "否";
       $("runtimePath").textContent = lastModelSecurity.runtime_artifact_path || lastModelSecurity.model_path || "--";
       $("sourcePtStatusPath").textContent = lastModelSecurity.source_pt_path || "--";
+      $("originalSourcePath").textContent = lastModelSecurity.original_source_model_path || metrics.original_source_model_path || "--";
       $("purifiedPath").textContent = lastModelSecurity.purified_model_path || "--";
       $("fingerprint").textContent = lastModelSecurity.fingerprint || "--";
       $("reportPath").textContent = lastModelSecurity.report_path || "--";
@@ -622,6 +654,8 @@
           <div class="field"><strong>指纹：</strong><code>${escapeHtml(rec.fingerprint || "--")}</code></div>
           <div class="field"><strong>运行模型：</strong><code>${escapeHtml(rec.runtime_model_path || "--")}</code></div>
           <div class="field"><strong>源模型：</strong><code>${escapeHtml(rec.source_model_path || "--")}</code></div>
+          <div class="field"><strong>原始源模型：</strong><code>${escapeHtml(rec.original_source_model_path || "--")}</code></div>
+          <div class="field"><strong>ASR对比：</strong>原始 ${escapeHtml(percentText(metricsOf(rec).original_asr))} · 净化后 ${escapeHtml(percentText(metricsOf(rec).purified_asr))} · Wilson上界 ${escapeHtml(percentText(metricsOf(rec).purified_wilson_upper))}</div>
           <div class="field"><strong>来源：</strong>${escapeHtml(rec.approval_source || "--")} · <strong>风险：</strong>${rec.risk_score == null ? "--" : Number(rec.risk_score).toFixed(3)}</div>
         </article>
       `).join("");
@@ -693,7 +727,7 @@
       syncModelConfigControls();
       showConfigMessage("配置已修改，保存后监控台会使用新模型。");
     };
-    ["profileSelect", "customModelPath", "sourcePtPath", "customModelBackend", "customModelFamily"].forEach((id) => {
+    ["profileSelect", "customModelPath", "sourcePtPath", "customModelBackend", "customModelFamily", "testBypassModelSecurity"].forEach((id) => {
       $(id).onchange = () => {
         syncModelConfigControls();
         showConfigMessage("配置已修改，保存后监控台会使用新模型。");

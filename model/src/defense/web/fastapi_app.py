@@ -225,11 +225,52 @@ def create_app(
         profile = normalize_profile(payload.get("profile", "default"))
         custom_model = payload.get("custom_model") or {}
         model_security_service = _model_security(request.app)
-        runtime_custom_model, admission, runtime_replacement = _resolve_model_security_start(
-            model_security_service,
-            profile=profile,
-            custom_model=custom_model,
+        bypass_security_for_test = bool(
+            payload.get("test_bypass_model_security")
+            or payload.get("bypass_model_security_for_test")
+            or payload.get("bypass_model_security")
         )
+        if bypass_security_for_test:
+            try:
+                admission = model_security_service.status(profile=profile, custom_model=custom_model)
+            except Exception as exc:
+                admission = {"enabled": True, "status": "error", "error": str(exc)}
+            admission = dict(admission or {})
+            admission.update(
+                {
+                    "allowed": True,
+                    "status": "bypassed_for_test",
+                    "admission_status": "bypassed_for_test",
+                    "whitelist_hit": False,
+                    "blocking_reason": "",
+                    "test_bypass_model_security": True,
+                    "warning": "测试模式已绕过B模块模型安全准入；不会写入白名单，请勿用于生产。",
+                }
+            )
+            runtime_custom_model = custom_model
+            runtime_replacement = {
+                "scan": None,
+                "purification": None,
+                "runtime_replacement": {
+                    "mode": "test_bypass_model_security",
+                    "requested_custom_model": custom_model,
+                },
+            }
+            logger = getattr(model_security_service, "_log_event", None)
+            if callable(logger):
+                logger(
+                    "model_security_bypass_start",
+                    status="warn",
+                    message="测试模式绕过B模块模型安全准入并启动A模块",
+                    profile=profile,
+                    custom_model_path=custom_model.get("path") if isinstance(custom_model, dict) else None,
+                )
+        else:
+            runtime_custom_model, admission, runtime_replacement = _resolve_model_security_start(
+                model_security_service,
+                profile=profile,
+                custom_model=custom_model,
+            )
         scan_result = runtime_replacement.get("scan") if isinstance(runtime_replacement, dict) else None
         purification_result = runtime_replacement.get("purification") if isinstance(runtime_replacement, dict) else None
         start_runtime_replacement = runtime_replacement.get("runtime_replacement") if isinstance(runtime_replacement, dict) else runtime_replacement
@@ -252,14 +293,51 @@ def create_app(
                 admission = model_security_service.status(profile=profile, custom_model=custom_model)
             return _json(_start_blocked_payload(admission, scan_result=scan_result, purification_result=purification_result), status_code=409)
         engine = _engine(request.app)
-        run_id = engine.start(
-            source_type=str(payload.get("source_type", "file")),
-            source=str(payload.get("source", "")),
-            profile=profile,
-            realtime=bool(payload.get("realtime", True)),
-            feature_options=payload.get("feature_options") or {},
-            custom_model=runtime_custom_model,
-        )
+        try:
+            run_id = engine.start(
+                source_type=str(payload.get("source_type", "file")),
+                source=str(payload.get("source", "")),
+                profile=profile,
+                realtime=bool(payload.get("realtime", True)),
+                feature_options=payload.get("feature_options") or {},
+                custom_model=runtime_custom_model,
+            )
+        except FileNotFoundError as exc:
+            return _json(
+                {
+                    "ok": False,
+                    "error": "source_unavailable",
+                    "message": str(exc),
+                    "status": enrich_status(engine.get_status()),
+                    "model_security": admission,
+                    "model_security_runtime_replacement": start_runtime_replacement,
+                },
+                status_code=400,
+            )
+        except ValueError as exc:
+            return _json(
+                {
+                    "ok": False,
+                    "error": "invalid_start_request",
+                    "message": str(exc),
+                    "status": enrich_status(engine.get_status()),
+                    "model_security": admission,
+                    "model_security_runtime_replacement": start_runtime_replacement,
+                },
+                status_code=400,
+            )
+        except RuntimeError as exc:
+            return _json(
+                {
+                    "ok": False,
+                    "error": "runtime_start_failed",
+                    "message": str(exc),
+                    "status": enrich_status(engine.get_status()),
+                    "model_security": admission,
+                    "model_security_runtime_replacement": start_runtime_replacement,
+                },
+                status_code=500,
+            )
         timeout = float(payload.get("ready_timeout_s", 45.0) or 45.0)
         status_payload = engine.wait_ready_for_preview(run_id, timeout=timeout)
         return _json(

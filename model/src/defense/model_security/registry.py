@@ -24,12 +24,15 @@ class TrustRecord:
     runtime_model_path: str | None = None
     source_model_hash: str | None = None
     source_model_path: str | None = None
+    original_source_model_hash: str | None = None
+    original_source_model_path: str | None = None
     backend: str | None = None
     model_family: str | None = None
     image_size: Any = None
     class_names_hash: str | None = None
     ppe_mapping_hash: str | None = None
     purification_report_path: str | None = None
+    security_metrics: dict[str, Any] | None = None
     approval_source: str = "manual"
     notes: str = ""
 
@@ -110,12 +113,15 @@ class ModelTrustRegistry:
         runtime_model_path: str | None = None,
         source_model_hash: str | None = None,
         source_model_path: str | None = None,
+        original_source_model_hash: str | None = None,
+        original_source_model_path: str | None = None,
         backend: str | None = None,
         model_family: str | None = None,
         image_size: Any = None,
         class_names_hash: str | None = None,
         ppe_mapping_hash: str | None = None,
         purification_report_path: str | None = None,
+        security_metrics: dict[str, Any] | None = None,
         approval_source: str = "manual",
     ) -> TrustRecord:
         rec = TrustRecord(
@@ -130,12 +136,15 @@ class ModelTrustRegistry:
             runtime_model_path=runtime_model_path,
             source_model_hash=source_model_hash,
             source_model_path=source_model_path,
+            original_source_model_hash=original_source_model_hash,
+            original_source_model_path=original_source_model_path,
             backend=backend,
             model_family=model_family,
             image_size=image_size,
             class_names_hash=class_names_hash,
             ppe_mapping_hash=ppe_mapping_hash,
             purification_report_path=purification_report_path,
+            security_metrics=security_metrics,
             approval_source=approval_source,
             notes=notes,
         )

@@ -14,9 +14,62 @@ from .reports import ModelPurificationReport, ModelSecurityReport
 NEW_DETOX_STRATEGY = "autodetox_backbone_soup"
 STRICT_AUDIT_NAME = "FINAL_STRICT_AUDIT_2026-05-23.json"
 
+_PACKAGED_POISONED_ATTACK_METRICS: dict[str, dict[str, Any]] = {
+    "v2": {
+        "max_asr": 0.97619,
+        "successes": 41,
+        "n": 42,
+        "source": "audit/BACKDOOR_MODELS_SUMMARY.md",
+        "attack": "visible_patch_oga",
+    },
+    "v3": {
+        "max_asr": 0.69048,
+        "successes": 29,
+        "n": 42,
+        "source": "audit/BACKDOOR_MODELS_SUMMARY.md",
+        "attack": "sig_invisible_oga",
+    },
+    "v4": {
+        "max_asr": 0.905,
+        "source": "audit/BACKDOOR_MODELS_SUMMARY.md",
+        "attack": "orange_vest_semantic_oga",
+    },
+    "b1": {
+        "max_asr": 1.0,
+        "source": "latest_poison_models/evidence/evaluation/b_invisible_noise_hi_oda/external_hard_suite_asr.json",
+        "attack": "invisible_noise_oda",
+    },
+    "b2": {
+        "max_asr": 1.0,
+        "source": "latest_poison_models/evidence/evaluation/b_sig_multiperiod_oda/external_hard_suite_asr.json",
+        "attack": "sig_multiperiod_oda",
+    },
+    "b3": {
+        "max_asr": 1.0,
+        "source": "latest_poison_models/evidence/evaluation/b_warp_lowfreq_strong_combo_oda/external_hard_suite_asr.json",
+        "attack": "warp_lowfreq_combo_oda",
+    },
+    "b4": {
+        "max_asr": 1.0,
+        "source": "latest_poison_models/evidence/evaluation/b_sig_lowfreq_hi_oda/external_hard_suite_asr.json",
+        "attack": "sig_lowfreq_hi_oda",
+    },
+}
+
 
 def _safe_slug(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value).strip("_") or "model"
+
+
+def _known_poisoned_attack_metrics(family_tag: str) -> dict[str, Any] | None:
+    metrics = _PACKAGED_POISONED_ATTACK_METRICS.get(str(family_tag or "").strip().lower())
+    return dict(metrics) if metrics else None
+
+
+def known_poisoned_attack_metrics(family_tag: str) -> dict[str, Any] | None:
+    """Return packaged original attack metrics for a known poisoned family."""
+
+    return _known_poisoned_attack_metrics(family_tag)
 
 
 def _model_security_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -85,6 +138,13 @@ def new_algorithm_package_root(project_root: str | Path) -> Path | None:
 
 def _family_tag(path: str | Path) -> str:
     return Path(path).stem.lower().split("_", 1)[0]
+
+
+def _family_tag_for_model(path: str | Path, *, root: str | Path) -> str:
+    evidence = packaged_poisoned_evidence_for_model(path, root=root)
+    if isinstance(evidence, Mapping) and evidence.get("family_tag"):
+        return str(evidence.get("family_tag") or "").strip().lower()
+    return _family_tag(path)
 
 
 def _strict_audit_path(package_root: Path) -> Path:
@@ -227,6 +287,7 @@ def packaged_poisoned_evidence_for_model(model_path: str | Path, *, root: str | 
         return None
     tag = _family_tag(matched_poisoned)
     strict_entry = strict_audit_entry_for_family(package_root, tag)
+    original_attack_metrics = _known_poisoned_attack_metrics(tag)
     purified_candidates = []
     for candidate in _packaged_purified_models_for_tag(package_root, tag):
         cert = packaged_strict_certification_for_model(candidate, root=root)
@@ -252,6 +313,7 @@ def packaged_poisoned_evidence_for_model(model_path: str | Path, *, root: str | 
         "strict_audit_path": str(_strict_audit_path(package_root)),
         "strict_audit_available": strict_entry is not None,
         "best_strict_audit": strict_entry,
+        "original_attack_metrics": original_attack_metrics,
         "purified_candidates": purified_candidates,
         "acceptance_rule": "known poisoned package hash match => block runtime and require packaged strict purification",
     }
@@ -274,7 +336,7 @@ def find_clean_anchor(source_pt: str | Path, *, config: Mapping[str, Any], root:
     package_root = new_algorithm_package_root(root_path)
     if package_root is not None:
         clean_dir = package_root / "models" / "clean_baseline"
-        prefix = _family_tag(source)
+        prefix = _family_tag_for_model(source, root=root_path)
         if prefix in {"v2", "v3", "v4"}:
             candidates.extend(sorted(clean_dir.glob(f"{prefix}_*clean_baseline*.pt")))
         elif bool(_detox_config(config).get("allow_generic_clean_anchor_fallback", False)):
@@ -300,7 +362,7 @@ def _packaged_purified_candidates(source_pt: str | Path, *, root: str | Path) ->
         return []
     source = Path(source_pt)
     stem = source.stem.lower()
-    tag = _family_tag(source)
+    tag = _family_tag_for_model(source, root=root)
     preferred_names = [
         stem.replace("_poisoned", "_purified_strict") + source.suffix.lower(),
         stem.replace("_poisoned", "_purified_backbone_soup") + source.suffix.lower(),
@@ -324,6 +386,7 @@ def _packaged_purified_candidates(source_pt: str | Path, *, root: str | Path) ->
 def _stage_packaged_candidates(source_pt: Path, *, root: str | Path, out_dir: Path) -> list[dict[str, Any]]:
     staged: list[dict[str, Any]] = []
     staged_dir = out_dir / "packaged_strict"
+    family_tag = _family_tag_for_model(source_pt, root=root)
     for source_candidate in _packaged_purified_candidates(source_pt, root=root):
         staged_dir.mkdir(parents=True, exist_ok=True)
         target = staged_dir / f"{_safe_slug(source_candidate.stem)}{source_candidate.suffix.lower()}"
@@ -336,7 +399,7 @@ def _stage_packaged_candidates(source_pt: Path, *, root: str | Path, out_dir: Pa
             "source_candidate_hash": "sha256:" + sha256_file(source_candidate),
             "output_model": str(target),
             "output_model_hash": "sha256:" + sha256_file(target),
-            "family_tag": _family_tag(source_pt),
+            "family_tag": family_tag,
             "requires_full_scan": True,
             "validation_scope": "new_algorithm_family_strict_audit",
         }
@@ -353,6 +416,22 @@ def _alpha_grid(config: Mapping[str, Any]) -> list[float]:
 
     values = parse_alpha_grid(raw)
     return values or [0.2]
+
+
+def _autodetox_target_classes(model_security: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = model_security.get("external_eval_target_classes", ("helmet", "head"))
+    if isinstance(raw, (str, bytes)):
+        values = [raw]
+    elif isinstance(raw, Sequence):
+        values = list(raw)
+    else:
+        values = []
+    targets = tuple(
+        str(value).strip()
+        for value in values
+        if str(value).strip() and str(value).strip().lower() != "person"
+    )
+    return targets or ("helmet", "head")
 
 
 def _write_autodetox_plan(
@@ -382,7 +461,7 @@ def _write_autodetox_plan(
                 external_report=str(latest_scan_report.report_path),
                 model_path=str(source_pt),
                 clean_anchor_model=str(clean_anchor) if clean_anchor else None,
-                target_classes=tuple(str(x) for x in model_security.get("external_eval_target_classes", ("helmet",))),
+                target_classes=_autodetox_target_classes(model_security),
                 smoke=True,
             ),
             spec,

@@ -25,6 +25,21 @@ Scope: entire repository.
 - Shared diagnostics that are reusable by production code belong in `src/defense/diagnostics`; `tools/` should only parse CLI arguments and call into package code.
 - Tests may define local fakes and fixtures, but production code must not import from `tests/`.
 
+## 多任务执行
+
+- 当用户提出 3-4 条或更多、且每条都较长或耗时的任务时，默认启用 subagent 模式；主线程负责拆分互不重叠的写入/探索范围、持续推进关键路径，并最终整合与验证结果。
+
+## Subagent lifecycle
+
+- Only create subagents when the user explicitly asks for subagent/parallel-agent work, or when a clearly independent side task can run in parallel without blocking the main critical path.
+- Before spawning subagents, split tasks into non-overlapping scopes and decide which immediate blocking work stays in the main thread.
+- Record every spawned subagent id, nickname, task scope, and expected output in the working notes or progress update.
+- After a subagent completes, is interrupted, is no longer needed, or the user asks to stop/close agents, call `close_agent` for that subagent id immediately.
+- Do not assume completed subagents are automatically released. Treat any unclosed subagent as still occupying the thread quota.
+- If `agent thread limit reached` appears, stop spawning, close known stale subagents first, then retry only if parallel work is still necessary.
+- Do not repeatedly spawn agents for the same unresolved question. Reuse an existing relevant agent with `send_input`, or continue locally.
+- In final handoff, mention any subagents that remain open intentionally; otherwise all spawned subagents should be closed before stopping.
+
 ## Change discipline
 
 - Prefer small, categorized commits that can be reverted independently.

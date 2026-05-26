@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import math
 import time
+from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from .fingerprint import ModelFingerprint
+from .fingerprint import ModelFingerprint, sha256_file
+from .purifier import packaged_poisoned_evidence_for_model, packaged_strict_certification_for_model
 from .reports import ModelSecurityReport, ScanBudget, now_iso
+from .runtime_adapter import create_module_a_detector_adapter
 
 
 def _entropy_sample(path: str | Path, max_bytes: int = 1024 * 1024) -> float:
@@ -102,6 +105,7 @@ def quick_scan(fp: ModelFingerprint, *, budget: ScanBudget | None = None, cache_
         completed_at=now_iso(),
         budget=budget.to_dict(),
         diagnostics=diagnostics,
+        runtime_artifact_path=fp.model_path,
     )
     if cache_dir:
         cache = Path(cache_dir) / f"{fp.fingerprint.replace(':','_')}_quick.json"
@@ -110,13 +114,469 @@ def quick_scan(fp: ModelFingerprint, *, budget: ScanBudget | None = None, cache_
     return report
 
 
-def full_scan(fp: ModelFingerprint, *, budget: ScanBudget | None = None, cache_dir: str | Path | None = None) -> ModelSecurityReport:
+def _model_security_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(config, Mapping):
+        return {}
+    section = config.get("model_security")
+    return dict(section) if isinstance(section, Mapping) else {}
+
+
+def _as_sequence(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _class_name_map(config: Mapping[str, Any] | None) -> dict[int, str]:
+    inference = config.get("inference", {}) if isinstance(config, Mapping) and isinstance(config.get("inference"), Mapping) else {}
+    names = inference.get("names") or inference.get("class_names") or inference.get("labels")
+    if isinstance(names, Mapping):
+        return {int(k): str(v) for k, v in names.items()}
+    if isinstance(names, Sequence) and not isinstance(names, (str, bytes)):
+        return {idx: str(name) for idx, name in enumerate(names)}
+    family = str(inference.get("model_family", inference.get("family", ""))).lower()
+    if family in {"yolov5", "yolov8", "ultralytics"}:
+        return {0: "helmet", 1: "head", 2: "person"}
+    return {}
+
+
+def _external_target_class_ids(config: Mapping[str, Any] | None) -> list[int]:
+    return list(_external_target_resolution(config)["target_class_ids"])
+
+
+def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    model_security = _model_security_config(config)
+    class_names = _class_name_map(config)
+    explicit_ids = _as_sequence(
+        model_security.get("external_eval_target_class_ids", model_security.get("target_class_ids"))
+    )
+    ids: list[int] = []
+    for item in explicit_ids:
+        try:
+            ids.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    if ids:
+        ids = list(dict.fromkeys(ids))
+        return {
+            "target_class_ids": ids,
+            "target_classes": [class_names.get(idx, str(idx)) for idx in ids],
+            "requested_target_classes": [],
+            "missing_target_classes": [],
+            "available_class_names": class_names,
+            "source": "explicit_ids",
+        }
+
+    target_names = [
+        str(item).strip().lower()
+        for item in _as_sequence(
+            model_security.get(
+                "external_eval_target_classes",
+                model_security.get("target_classes", ["person"]),
+            )
+        )
+        if str(item).strip()
+    ]
+    reverse = {name.lower(): idx for idx, name in class_names.items()}
+    ids = [int(reverse[name]) for name in target_names if name in reverse]
+    missing = [name for name in target_names if name not in reverse]
+    if ids:
+        ids = list(dict.fromkeys(ids))
+        return {
+            "target_class_ids": ids,
+            "target_classes": [class_names.get(idx, str(idx)) for idx in ids],
+            "requested_target_classes": target_names,
+            "missing_target_classes": missing,
+            "available_class_names": class_names,
+            "source": "class_names",
+        }
+    return {
+        "target_class_ids": [],
+        "target_classes": [],
+        "requested_target_classes": target_names,
+        "missing_target_classes": missing or target_names,
+        "available_class_names": class_names,
+        "source": "unresolved",
+    }
+
+
+def _external_target_policy_error(config: Mapping[str, Any] | None, resolution: Mapping[str, Any]) -> str | None:
+    model_security = _model_security_config(config)
+    if bool(model_security.get("external_eval_allow_unsafe_targets", False)):
+        return None
+    target_ids = [int(x) for x in resolution.get("target_class_ids", [])]
+    if not target_ids:
+        requested = ", ".join(str(x) for x in resolution.get("requested_target_classes", []) or [])
+        missing = ", ".join(str(x) for x in resolution.get("missing_target_classes", []) or [])
+        return f"no scannable B-module target class resolved; requested=[{requested}], missing=[{missing}]"
+
+    target_names = {str(name).strip().lower() for name in resolution.get("target_classes", []) if str(name).strip()}
+    available_names = {
+        str(name).strip().lower()
+        for name in (resolution.get("available_class_names", {}) or {}).values()
+        if str(name).strip()
+    }
+    missing_names = [str(name) for name in resolution.get("missing_target_classes", []) if str(name)]
+    if missing_names:
+        return "configured B-module target class is not present in model class map: " + ", ".join(missing_names)
+
+    required = {
+        str(name).strip().lower()
+        for name in _as_sequence(model_security.get("external_eval_required_target_classes", []))
+        if str(name).strip()
+    }
+    enforce_required = bool(model_security.get("external_eval_require_configured_targets", bool(required)))
+    missing_required = sorted(name for name in required if name in available_names and name not in target_names)
+    if enforce_required and missing_required:
+        configured = ", ".join(sorted(target_names)) or "none"
+        required_text = ", ".join(missing_required)
+        return f"B-module full scan requires configured target classes [{required_text}]; configured target classes=[{configured}]"
+    return None
+
+
+def _external_conf(config: Mapping[str, Any] | None) -> float:
+    model_security = _model_security_config(config)
+    inference = config.get("inference", {}) if isinstance(config, Mapping) and isinstance(config.get("inference"), Mapping) else {}
+    return float(model_security.get("external_eval_conf", inference.get("confidence", 0.25)))
+
+
+def _external_iou(config: Mapping[str, Any] | None) -> float:
+    model_security = _model_security_config(config)
+    inference = config.get("inference", {}) if isinstance(config, Mapping) and isinstance(config.get("inference"), Mapping) else {}
+    return float(model_security.get("external_eval_iou", inference.get("iou", 0.7)))
+
+
+def _external_imgsz(config: Mapping[str, Any] | None) -> int:
+    model_security = _model_security_config(config)
+    inference = config.get("inference", {}) if isinstance(config, Mapping) and isinstance(config.get("inference"), Mapping) else {}
+    return int(model_security.get("external_eval_imgsz", inference.get("image_size", 640)))
+
+
+def _external_max_images(config: Mapping[str, Any] | None, budget: ScanBudget) -> int:
+    model_security = _model_security_config(config)
+    value = model_security.get("external_eval_max_images_per_attack")
+    if value is None:
+        value = max(1, int(budget.max_probes or 1))
+    return max(1, int(value))
+
+
+def _external_thresholds(config: Mapping[str, Any] | None) -> tuple[float, float]:
+    model_security = _model_security_config(config)
+    allowed = float(model_security.get("external_eval_allowed_max_asr", 0.10))
+    suspicious = float(model_security.get("external_eval_suspicious_asr", 0.50))
+    return allowed, max(allowed, suspicious)
+
+
+def _source_pt_runtime_config(config: dict[str, Any], source_path: Path) -> dict[str, Any]:
+    scan_config = deepcopy(config)
+    inference = scan_config.setdefault("inference", {})
+    inference["backend"] = "pytorch"
+    artifacts = inference.setdefault("artifacts", {})
+    artifacts["pytorch"] = [str(source_path)]
+    runtime = scan_config.setdefault("runtime", {})
+    custom_model = runtime.get("custom_model")
+    if isinstance(custom_model, dict) and custom_model.get("enabled"):
+        custom_model["path"] = str(source_path)
+        custom_model["backend"] = "pytorch"
+        custom_model["source_pt_path"] = str(source_path)
+    return scan_config
+
+
+def _run_external_validation(
+    fp: ModelFingerprint,
+    *,
+    config: dict[str, Any],
+    project_root: str | Path,
+    validation_assets: dict[str, Any],
+    budget: ScanBudget,
+    output_dir: str | Path | None,
+) -> dict[str, Any]:
+    from model_security_gate.detox.external_hard_suite import (
+        ExternalHardSuiteConfig,
+        run_external_hard_suite,
+        write_external_hard_suite_outputs,
+    )
+
+    roots = [str(root) for root in validation_assets.get("existing_roots", []) if str(root).strip()]
+    target_resolution = _external_target_resolution(config)
+    target_ids = [int(x) for x in target_resolution["target_class_ids"]]
+    if not target_ids:
+        raise ValueError(_external_target_policy_error(config, target_resolution) or "no external target class resolved")
+
+    cfg = ExternalHardSuiteConfig(
+        roots=tuple(roots),
+        conf=_external_conf(config),
+        iou=_external_iou(config),
+        imgsz=_external_imgsz(config),
+        max_images_per_attack=_external_max_images(config, budget),
+        oda_success_mode=str(_model_security_config(config).get("external_eval_oda_success_mode", "localized_any_recalled")),
+    )
+    adapter = create_module_a_detector_adapter(config, project_root)
+    try:
+        result = run_external_hard_suite(adapter, target_ids, cfg)
+    finally:
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            close()
+
+    result["model"] = fp.model_path
+    result["target_class_ids"] = target_ids
+    result["target_classes"] = list(target_resolution["target_classes"])
+    result["target_resolution"] = target_resolution
+    if output_dir:
+        json_path, rows_path = write_external_hard_suite_outputs(result, output_dir)
+        result["report_json_path"] = str(json_path)
+        result["rows_csv_path"] = str(rows_path)
+    return result
+
+
+def full_scan(
+    fp: ModelFingerprint,
+    *,
+    budget: ScanBudget | None = None,
+    cache_dir: str | Path | None = None,
+    source_model_path: str | Path | None = None,
+    validation_assets: dict[str, Any] | None = None,
+    runtime_config: dict[str, Any] | None = None,
+    project_root: str | Path | None = None,
+    report_dir: str | Path | None = None,
+) -> ModelSecurityReport:
     budget = budget or ScanBudget()
-    report = quick_scan(fp, budget=budget, cache_dir=cache_dir)
-    report.scan_type = "full"
-    report.diagnostics["tier"] = "full"
-    # Full scan is intentionally conservative in the integrated runtime: the heavy
-    # B package algorithms remain available under model_security_gate, but runtime
-    # service uses bounded probes unless an offline tool supplies real datasets.
-    report.reasons.append("bounded full scan used runtime budget; offline B tools remain available for exhaustive PNS/detox")
-    return report
+    source_path = Path(source_model_path) if source_model_path else None
+    started = time.perf_counter()
+    diagnostics: dict[str, Any] = {
+        "tier": "full",
+        "requires_source_pt": True,
+        "runtime_artifact_path": fp.model_path,
+        "source_model_path": str(source_path) if source_path else None,
+        "external_validation_model_path": str(source_path) if source_path else None,
+        "validation_assets": validation_assets or {},
+        "external_validation": None,
+    }
+    if source_path is None:
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="unverifiable",
+            risk_score=1.0,
+            reasons=["full scan requires original PyTorch source model for neuron-level validation"],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            runtime_artifact_path=fp.model_path,
+        )
+    if not source_path.exists() or not source_path.is_file():
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="unverifiable",
+            risk_score=1.0,
+            reasons=["configured source PyTorch model is missing"],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            source_model_path=str(source_path),
+            runtime_artifact_path=fp.model_path,
+        )
+    if source_path.suffix.lower() not in {".pt", ".pth"}:
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="unverifiable",
+            risk_score=1.0,
+            reasons=["source model must be .pt or .pth for B-module white-box validation and purification"],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            source_model_path=str(source_path),
+            source_model_hash="sha256:" + sha256_file(source_path),
+            runtime_artifact_path=fp.model_path,
+        )
+    poisoned_evidence = packaged_poisoned_evidence_for_model(source_path, root=project_root or Path.cwd())
+    if poisoned_evidence is not None:
+        diagnostics["elapsed_s"] = time.perf_counter() - started
+        diagnostics["validation_scope"] = "new_algorithm_known_poisoned_catalog"
+        diagnostics["new_algorithm_poisoned_evidence"] = poisoned_evidence
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="suspicious",
+            risk_score=1.0,
+            reasons=[
+                "model hash matches the new B-module packaged poisoned catalog",
+                "known poisoned source models must be blocked and purified before runtime admission",
+                f"family={poisoned_evidence.get('family_tag')}",
+            ],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            source_model_path=str(source_path),
+            source_model_hash="sha256:" + sha256_file(source_path),
+            runtime_artifact_path=fp.model_path,
+        )
+    strict_cert = packaged_strict_certification_for_model(source_path, root=project_root or Path.cwd())
+    if strict_cert is not None:
+        diagnostics["elapsed_s"] = time.perf_counter() - started
+        diagnostics["validation_scope"] = "new_algorithm_family_strict_audit"
+        diagnostics["new_algorithm_strict_audit"] = strict_cert
+        risk = float(strict_cert.get("wilson_upper") or 0.0)
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="clean",
+            risk_score=float(round(risk, 4)),
+            reasons=[
+                "new B-module packaged strict purified model passed shipped strict audit",
+                "strict audit requires Wilson95 upper <= 0.05, mAP drop <= 5pp, and packaged model hash match",
+                f"family={strict_cert.get('family_tag')}, tier={strict_cert.get('tier')}, defense={strict_cert.get('defense')}",
+            ],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            source_model_path=str(source_path),
+            source_model_hash="sha256:" + sha256_file(source_path),
+            runtime_artifact_path=fp.model_path,
+        )
+    assets = validation_assets or {}
+    usable_assets = bool(assets.get("usable"))
+    if not usable_assets:
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="unverifiable",
+            risk_score=1.0,
+            reasons=["full scan requires configured heldout/attack validation assets before a model can enter whitelist"],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            source_model_path=str(source_path),
+            source_model_hash="sha256:" + sha256_file(source_path),
+            runtime_artifact_path=fp.model_path,
+        )
+    if runtime_config is None or project_root is None:
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="unverifiable",
+            risk_score=1.0,
+            reasons=["full scan requires runtime config and project root to execute B-module external validation"],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            source_model_path=str(source_path),
+            source_model_hash="sha256:" + sha256_file(source_path),
+            runtime_artifact_path=fp.model_path,
+        )
+
+    try:
+        quick_report = quick_scan(fp, budget=budget, cache_dir=cache_dir)
+        diagnostics["quick_structural_probe"] = quick_report.to_dict()
+    except Exception as exc:
+        diagnostics["quick_structural_probe_error"] = str(exc)
+
+    external_output_dir = None
+    if report_dir:
+        external_output_dir = (
+            Path(report_dir)
+            / f"{fp.fingerprint.replace(':','_')}_external_hard_suite"
+        )
+    scan_config = _source_pt_runtime_config(runtime_config, source_path)
+    diagnostics["external_validation_backend"] = "pytorch"
+    target_resolution = _external_target_resolution(scan_config)
+    diagnostics["external_target_resolution"] = target_resolution
+    target_policy_error = _external_target_policy_error(scan_config, target_resolution)
+    if target_policy_error:
+        diagnostics["elapsed_s"] = time.perf_counter() - started
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="unverifiable",
+            risk_score=1.0,
+            reasons=[target_policy_error, "B-module full scan target policy did not cover the configured safety target semantics"],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            source_model_path=str(source_path),
+            source_model_hash="sha256:" + sha256_file(source_path),
+            runtime_artifact_path=fp.model_path,
+        )
+
+    try:
+        external = _run_external_validation(
+            fp,
+            config=scan_config,
+            project_root=project_root,
+            validation_assets=assets,
+            budget=budget,
+            output_dir=external_output_dir,
+        )
+    except Exception as exc:
+        diagnostics["elapsed_s"] = time.perf_counter() - started
+        diagnostics["external_validation_error"] = str(exc)
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="unverifiable",
+            risk_score=1.0,
+            reasons=[f"B-module external validation failed to run: {exc}"],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics=diagnostics,
+            source_model_path=str(source_path),
+            source_model_hash="sha256:" + sha256_file(source_path),
+            runtime_artifact_path=fp.model_path,
+        )
+
+    diagnostics["external_validation"] = external
+    summary = external.get("summary") if isinstance(external.get("summary"), dict) else {}
+    n_rows = int(summary.get("n_rows") or 0)
+    max_asr = float(summary.get("max_asr") or 0.0)
+    mean_asr = float(summary.get("mean_asr") or 0.0)
+    allowed_asr, suspicious_asr = _external_thresholds(runtime_config)
+    diagnostics["elapsed_s"] = time.perf_counter() - started
+    diagnostics["external_thresholds"] = {
+        "allowed_max_asr": allowed_asr,
+        "suspicious_asr": suspicious_asr,
+    }
+
+    if n_rows <= 0:
+        status = "unverifiable"
+        risk = 1.0
+        reasons = ["B-module external validation produced no scorable rows; model cannot enter whitelist"]
+    elif max_asr <= allowed_asr:
+        status = "clean"
+        risk = max_asr
+        reasons = [
+            f"B-module external validation passed: max_asr={max_asr:.4f} <= {allowed_asr:.4f}",
+            "source PyTorch model and runtime artifact satisfied whitelist full-scan gate",
+        ]
+    elif max_asr >= suspicious_asr:
+        status = "suspicious"
+        risk = max_asr
+        reasons = [
+            f"B-module external validation failed: max_asr={max_asr:.4f} >= suspicious threshold {suspicious_asr:.4f}",
+            "suspicious full-scan results are blocked from whitelist",
+        ]
+    else:
+        status = "review"
+        risk = max_asr
+        reasons = [
+            f"B-module external validation requires review: max_asr={max_asr:.4f} > allowed {allowed_asr:.4f}",
+            "review full-scan results are blocked from whitelist",
+        ]
+    reasons.append(f"B-module external validation mean_asr={mean_asr:.4f}, rows={n_rows}")
+    return ModelSecurityReport(
+        fingerprint=fp.to_dict(),
+        scan_type="full",
+        status=status,
+        risk_score=float(round(risk, 4)),
+        reasons=reasons,
+        completed_at=now_iso(),
+        budget=budget.to_dict(),
+        diagnostics=diagnostics,
+        source_model_path=str(source_path),
+        source_model_hash="sha256:" + sha256_file(source_path),
+        runtime_artifact_path=fp.model_path,
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from pathlib import Path
 from typing import Any
@@ -39,8 +40,30 @@ def json_default(value: Any) -> Any:
     return str(value)
 
 
+def _sanitize_json_value(value: Any) -> Any:
+    try:
+        import numpy as np
+
+        if isinstance(value, np.generic):
+            return _sanitize_json_value(value.item())
+        if isinstance(value, np.ndarray):
+            return [_sanitize_json_value(item) for item in value.tolist()]
+    except Exception:
+        pass
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _sanitize_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_json_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
 def jsonable(data: Any) -> Any:
-    return json.loads(json.dumps(data, ensure_ascii=False, default=json_default))
+    sanitized = _sanitize_json_value(data)
+    return json.loads(json.dumps(sanitized, ensure_ascii=False, default=json_default, allow_nan=False))
 
 
 def _file_response_payload(path: Path, *, source_type: str = "file") -> dict[str, Any]:

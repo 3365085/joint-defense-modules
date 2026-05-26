@@ -599,58 +599,23 @@
         </div>
         <div id="sourceHint" class="sourceHint">点击“浏览”可打开资源管理器选择本机 MP4，也可以手动粘贴路径。</div>
         <div id="connectionStatus" class="connectStatus"></div>
-        <label>算力档位</label>
-        <select id="profile">
-          <option value="desktop_rtx">全速GPU（TensorRT）</option>
-          <option value="desktop_debug_onnx">均衡GPU（ONNX调试）</option>
-          <option value="edge_fast">边缘ONNX（兼容）</option>
-        </select>
-        <label>检测模型</label>
-        <div class="toggleGrid">
-          <label class="toggleLine">
-            <input id="enableCustomModel" type="checkbox" />
-            使用自定义模型
-          </label>
-        </div>
-        <div id="customModelPanel" style="display:none;">
-          <label>模型文件</label>
-          <div class="fieldRow">
-            <input id="customModelPath" value="" placeholder="选择 .engine / .onnx / .pt" />
-            <button class="secondary" id="browseModelBtn" type="button">浏览</button>
-          </div>
-          <label>模型后端</label>
-          <select id="customModelBackend">
-            <option value="auto">自动识别后端</option>
-            <option value="tensorrt">TensorRT Engine</option>
-            <option value="onnx">ONNX Runtime</option>
-            <option value="pytorch">PyTorch</option>
-          </select>
-          <label>模型类型</label>
-          <select id="customModelFamily">
-            <option value="auto">自动识别模型类型</option>
-            <option value="ultralytics">Ultralytics YOLOv8/YOLO11</option>
-            <option value="yolov5">原版 YOLOv5</option>
-          </select>
-          <div class="sourceHint">自定义模型只替换目标检测器，A1-A4 和 A3b 静态媒介检测仍使用当前模块参数。</div>
-        </div>
         <div class="sourceHint">
           <span id="realtimeText">MP4预览固定为 1.0x；检测由后端输入源异步处理。</span>
         </div>
 
         <section class="panel" id="modelSecurityPanel" data-testid="model-security-panel" style="margin-top:12px;">
           <div class="panelHeader" style="padding:0 0 8px 0;">
-            <div class="title">Model Security</div>
-            <div id="modelSecurityPill" class="pill">unknown</div>
+            <div class="title">B模块模型安全</div>
+            <div id="modelSecurityPill" class="pill">未检查</div>
           </div>
           <div class="sourceHint" id="modelSecuritySummary">模型可信状态尚未检查。</div>
           <div class="metrics" style="grid-template-columns: repeat(2, 1fr); margin-top:10px;">
-            <div class="metric"><b id="modelSecurityRisk">--</b><span>risk score</span></div>
-            <div class="metric"><b id="modelSecurityScanTime">--</b><span>last scan</span></div>
+            <div class="metric"><b id="modelSecurityRisk">--</b><span>风险分数</span></div>
+            <div class="metric"><b id="modelSecurityScanTime">--</b><span>最近扫描</span></div>
           </div>
-          <div class="sourceHint" id="modelSecurityFingerprint" style="word-break:break-all; margin-top:8px;">fingerprint: --</div>
           <div class="row" style="margin-top:10px;">
-            <button class="secondary" id="runModelSecurityScanBtn" type="button">Run B Scan</button>
-            <button class="secondary" id="viewModelSecurityReportBtn" type="button">View Report</button>
+            <button class="secondary" id="openModelSecurityCenterBtn" type="button">打开安全中心</button>
+            <button class="secondary" id="refreshModelSecurityBtn" type="button">刷新状态</button>
           </div>
         </section>
         <label>画面叠加</label>
@@ -755,8 +720,11 @@
     let seekControlInFlight = false;
     let lastControlRunId = 0;
     let refreshTimer = null;
-    let customModelDraftDirty = false;
+    let modelSecurityBlockState = null;
+    let lastModelSecurity = null;
+    let lastTrustRecords = [];
     const refreshIntervals = { running: 300, idle: 1200, error: 2000 };
+    const DEFAULT_RUNTIME_PROFILE = "desktop_rtx";
     function toggleSection(headerEl) {
       headerEl.classList.toggle("collapsed");
       const content = headerEl.nextElementSibling;
@@ -771,6 +739,36 @@
 
     function profileLabel(value) {
       return profileLabels[value] || value || "-";
+    }
+
+    function currentRuntimeProfile() {
+      try {
+        return localStorage.getItem("moduleA.lastProfile") || DEFAULT_RUNTIME_PROFILE;
+      } catch (_) {
+        return DEFAULT_RUNTIME_PROFILE;
+      }
+    }
+
+    function customModelOptions() {
+      let enabled = false;
+      let path = "";
+      let backend = "auto";
+      let modelFamily = "auto";
+      let sourcePtPath = "";
+      try {
+        enabled = localStorage.getItem("moduleA.lastCustomModelEnabled") === "true";
+        path = localStorage.getItem("moduleA.lastModelPath") || "";
+        backend = localStorage.getItem("moduleA.lastCustomModelBackend") || "auto";
+        modelFamily = localStorage.getItem("moduleA.lastCustomModelFamily") || "auto";
+        sourcePtPath = localStorage.getItem("moduleA.lastSourcePtPath") || "";
+      } catch (_) {}
+      return {
+        enabled: enabled && !!path,
+        path,
+        backend,
+        model_family: modelFamily,
+        source_pt_path: sourcePtPath,
+      };
     }
     function modelFamilyLabel(value) {
       const labels = {
@@ -803,6 +801,63 @@
       const node = $("empty");
       node.style.display = "grid";
       node.innerHTML = `<strong>${escapeHtml(title)}</strong><div class="hint">${escapeHtml(hint || "")}</div>`;
+    }
+
+    function modelSecurityStatus(ms) {
+      return (ms && (ms.admission_status || ms.status)) || "unknown";
+    }
+
+    function modelSecurityBlockHint(ms, fallback) {
+      ms = ms || {};
+      const status = modelSecurityStatus(ms);
+      const labels = {
+        blocked_scan_required: "模型未命中白名单，需要B模块完整扫描",
+        scanning: "B模块完整扫描正在后台运行，A模块暂未启动",
+        unverifiable: "B模块无法验证当前模型，A模块已被阻止启动",
+        suspicious: "B模块判定模型可疑，A模块已被阻止启动",
+        review: "B模块要求复核，当前策略不会放行",
+        clean_export_required: "净化模型已通过，请切换到净化 PT；如需 TensorRT 再导出加速模型",
+        purified_alternative_available: "净化模型已通过，系统会优先用净化PT启动A模块",
+        error: "B模块准入检查失败",
+      };
+      const parts = [labels[status] || fallback || "B模块模型安全准入未通过，已阻止A模块启动"];
+      if (ms.blocking_reason) {
+        const reasonText = modelSecurityReasonLabel(ms.blocking_reason) || ms.blocking_reason;
+        parts.push(`原因：${reasonText}`);
+      }
+      if (ms.blocking_reason === "source_pt_required_for_accelerated_artifact") {
+        parts.push("加速格式需要绑定同源原版PT后才能做B模块准入");
+      }
+      const assets = ms.validation_assets || {};
+      if (assets.usable === false) {
+        const roots = Array.isArray(assets.roots) ? assets.roots.filter(Boolean).join("；") : "";
+        parts.push(roots ? `验证集不可用：${roots}` : "验证集不可用");
+      }
+      if (ms.source_pt_path) parts.push(`源PT：${ms.source_pt_path}`);
+      if (ms.purified_model_path) parts.push(`净化模型：${ms.purified_model_path}`);
+      if (ms.report_path) parts.push(`报告：${ms.report_path}`);
+      return parts.join("。");
+    }
+
+    function isModelSecurityBlocking(ms) {
+      const status = modelSecurityStatus(ms);
+      const blockingStatuses = ["blocked_scan_required", "scanning", "purifying", "unverifiable", "suspicious", "review", "clean_export_required", "purified_alternative_available", "error"];
+      return !!ms && blockingStatuses.includes(status);
+    }
+
+    function showModelSecurityBlock(ms, fallback) {
+      if (!isModelSecurityBlocking(ms)) return false;
+      modelSecurityBlockState = ms;
+      const hint = modelSecurityBlockHint(ms, fallback);
+      const status = modelSecurityStatus(ms);
+      const title = (status === "scanning" || ms.scanning) ? "B模块正在扫描" : "B模块准入阻断";
+      const pill = $("statePill");
+      if (pill) {
+        pill.textContent = title;
+        pill.className = "pill alert";
+      }
+      showEmpty(title, hint);
+      return true;
     }
 
     function setStageAspect(width, height) {
@@ -865,6 +920,7 @@
     }
 
     function stateText(status) {
+      if (status.preview_mode === "model_security_blocked") return ["B模块准入阻断", "模型安全准入未通过，A模块没有启动。", "alert"];
       if (status.alert_confirmed) return ["确认告警", "检测到疑似物理扰动，建议复核画面与事件列表。", "alert"];
       if (status.running && !status.detector_ready) return ["初始化中", "正在加载检测器。", ""];
       if (status.running && status.playback_paused) return ["已暂停", "后端源时钟已暂停，检测队列保持 latest-only。", ""];
@@ -944,12 +1000,21 @@
       const runId = Number(status?.run_id || 0);
       const streamRunId = Number($("stream").getAttribute("data-run-id") || activePreviewRunId || 0);
       const streamActive = !!$("stream").getAttribute("src") && (!runId || !streamRunId || streamRunId === runId);
+      if (isModelSecurityBlocking(modelSecurityBlockState)) {
+        showModelSecurityBlock(modelSecurityBlockState);
+        return;
+      }
+      if (!(status.running || (status.frame_idx || 0) > 0 || status.source_ended)) {
+        if (!streamActive) {
+          showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
+        }
+        return;
+      }
       if ($("stream").getAttribute("src") && runId && streamRunId && streamRunId !== runId) {
         $("stream").removeAttribute("src");
         $("stream").removeAttribute("data-run-id");
         activePreviewRunId = 0;
       }
-      if (!(status.running || (status.frame_idx || 0) > 0 || status.source_ended)) return;
 
       if (status.source_ended) {
         stopEndedPreview();
@@ -959,7 +1024,7 @@
 
       if (status.running && !status.ready_for_preview) {
         if (!streamActive) {
-        showEmpty("正在初始化检测", "正在加载模型/引擎并等待首帧检测结果；不会先播放没有检测框的视频。");
+          showEmpty("正在初始化检测", "正在加载模型/引擎并准备后端预览。");
         }
         return;
       }
@@ -1216,7 +1281,9 @@
       });
       const data = await res.json();
       if (!res.ok || data.ok === false) {
-        throw new Error(data.error || res.statusText);
+        const err = new Error(data.message || data.error || res.statusText);
+        err.data = data;
+        throw err;
       }
       return data;
     }
@@ -1240,48 +1307,6 @@
       return {
         static_image_enabled: $("enableStaticImage").checked,
       };
-    }
-
-    function customModelOptions() {
-      inferCustomModelSelection();
-      return {
-        enabled: $("enableCustomModel").checked,
-        path: $("customModelPath").value,
-        backend: $("customModelBackend").value,
-        model_family: $("customModelFamily").value,
-      };
-    }
-
-    function setCustomModelDraftDirty() {
-      customModelDraftDirty = true;
-      saveLastPaths();
-    }
-
-    function syncCustomModelPanelVisibility() {
-      $("customModelPanel").style.display = $("enableCustomModel").checked ? "block" : "none";
-    }
-
-    function applyRuntimeCustomModelStatus(customStatus) {
-      if (customModelDraftDirty) return;
-      if (!customStatus || typeof customStatus !== "object") return;
-      $("enableCustomModel").checked = customStatus.enabled === true;
-      if (customStatus.path) $("customModelPath").value = customStatus.path;
-      $("customModelBackend").value = customStatus.backend || "auto";
-      $("customModelFamily").value = customStatus.model_family || "auto";
-      inferCustomModelSelection();
-      syncCustomModelPanelVisibility();
-    }
-
-    function inferCustomModelSelection() {
-      const path = ($("customModelPath").value || "").trim().toLowerCase();
-      if (!path || $("customModelBackend").value !== "auto") return;
-      if (path.endsWith(".engine")) {
-        $("customModelBackend").value = "tensorrt";
-      } else if (path.endsWith(".onnx")) {
-        $("customModelBackend").value = "onnx";
-      } else if (path.endsWith(".pt") || path.endsWith(".pth")) {
-        $("customModelBackend").value = "pytorch";
-      }
     }
 
     function updateStartButtonState(status) {
@@ -1362,59 +1387,152 @@
     function loadLastPaths() {
       try {
         const source = localStorage.getItem("moduleA.lastSourcePath");
-        const model = localStorage.getItem("moduleA.lastModelPath");
-        const modelEnabled = localStorage.getItem("moduleA.lastCustomModelEnabled");
-        const modelBackend = localStorage.getItem("moduleA.lastCustomModelBackend");
-        const modelFamily = localStorage.getItem("moduleA.lastCustomModelFamily");
         if (source) $("sourceValue").value = source;
-        if (model) $("customModelPath").value = model;
-        if (modelBackend) $("customModelBackend").value = modelBackend;
-        if (modelFamily) $("customModelFamily").value = modelFamily;
-        inferCustomModelSelection();
-        if (modelEnabled === "true") {
-          $("enableCustomModel").checked = true;
-        }
-        if (model || modelEnabled === "true") customModelDraftDirty = true;
-        syncCustomModelPanelVisibility();
       } catch (_) {}
     }
 
+    function modelSecurityStatusLabel(value) {
+      const labels = {
+        unknown: "未检查",
+        trusted: "已信任",
+        clean: "扫描通过",
+        blocked_scan_required: "需要完整扫描",
+        scanning: "扫描中",
+        unverifiable: "无法验证",
+        suspicious: "疑似风险",
+        review: "需要复核",
+        purifying: "净化中",
+        clean_export_required: "净化通过，待切换",
+        error: "异常",
+        planned: "已生成净化计划",
+        purified: "已生成净化模型",
+        scan_clean_trusted: "净化复扫通过",
+        purified_scan_review: "净化复扫需复核",
+        purified_scan_suspicious: "净化复扫疑似风险",
+        purified_scan_unverifiable: "净化复扫无法验证",
+        purified_scan_failed: "净化复扫失败",
+        idle: "空闲",
+        running: "运行中",
+      };
+      return labels[String(value || "unknown")] || String(value || "未知");
+    }
+
+    function modelSecurityReasonLabel(value) {
+      const labels = {
+        model_not_in_whitelist: "模型未命中白名单",
+        full_scan_running: "完整扫描正在运行",
+        purification_running: "净化任务正在运行",
+        no_runtime_artifact: "没有可运行模型文件",
+        source_pt_required_for_accelerated_artifact: "加速模型需要提供同源 PT",
+        purified_pt_clean_runtime_export_required: "净化 PT 已通过，请切换到净化模型；如需 TensorRT 再导出加速模型",
+        last_full_scan_review: "最近完整扫描需要复核",
+        last_full_scan_suspicious: "最近完整扫描疑似风险",
+        last_full_scan_unverifiable: "最近完整扫描无法验证",
+      };
+      return labels[String(value || "")] || String(value || "");
+    }
+
+    function modelSecurityCompactSummary(ms, status) {
+      const reasonText = modelSecurityReasonLabel(ms.blocking_reason);
+      const suffix = "详细扫描、净化、报告和白名单管理请打开安全中心。";
+      if (ms.purifying || status === "purifying") {
+        return `B模块正在净化模型；A模块会等待准入结果。${suffix}`;
+      }
+      if (ms.scanning || status === "scanning") {
+        return `B模块正在完整扫描模型；A模块暂未启动。${suffix}`;
+      }
+      if (status === "trusted") {
+        return `当前运行模型已通过B模块准入，可以启动A模块检测。${suffix}`;
+      }
+      if (status === "clean_export_required") {
+        return `净化模型已通过，请在安全中心切换到净化PT；需要加速格式时再导出绑定。`;
+      }
+      if (status === "purified_alternative_available") {
+        return `净化模型已复扫通过；点击开始检测时系统会自动切换净化PT启动A模块。${suffix}`;
+      }
+      if (status === "blocked_scan_required") {
+        return `当前模型未命中白名单，需要先做B模块完整扫描。${suffix}`;
+      }
+      if (["review", "suspicious", "unverifiable", "error"].includes(status)) {
+        return `B模块未放行当前模型${reasonText ? "：" + reasonText : ""}。${suffix}`;
+      }
+      return `模型安全状态尚未确认。${suffix}`;
+    }
 
     function renderModelSecurity(ms) {
       ms = ms || {};
-      const status = ms.status || "unknown";
+      lastModelSecurity = ms;
+      const status = ms.admission_status || ms.status || "unknown";
       const pill = $("modelSecurityPill");
       if (!pill) return;
-      pill.textContent = status;
+      pill.textContent = modelSecurityStatusLabel(status);
       const risk = ms.risk_score;
       $("modelSecurityRisk").textContent = (risk === null || risk === undefined) ? "--" : Number(risk).toFixed(3);
       $("modelSecurityScanTime").textContent = ms.last_scan_time ? String(ms.last_scan_time).replace("T", " ").slice(0, 19) : "--";
-      const fp = ms.fingerprint || "--";
-      $("modelSecurityFingerprint").textContent = "fingerprint: " + fp;
-      const modelPath = ms.model_path ? " · " + ms.model_path : "";
-      $("modelSecuritySummary").textContent = `B模块状态 ${status}${ms.scanning ? "，后台扫描中" : ""}${modelPath}`;
-      pill.className = "pill " + ((status === "trusted") ? "live" : (status === "suspicious" || status === "blocked" || status === "error") ? "alert" : "");
+      const reasonText = modelSecurityReasonLabel(ms.blocking_reason);
+      $("modelSecuritySummary").textContent = modelSecurityCompactSummary(ms, status);
+      const alertStates = ["blocked_scan_required", "unverifiable", "suspicious", "review", "clean_export_required", "purified_alternative_available", "purifying", "planned", "error"];
+      pill.className = "pill " + ((status === "trusted") ? "live" : alertStates.includes(status) ? "alert" : "");
+    }
+
+    function renderModelTrust(trust) {
+      trust = trust || {};
+      const records = trust.records || [];
+      lastTrustRecords = records;
+      void records;
+    }
+
+    async function refreshModelTrust() {
+      try {
+        const data = await api("/api/model-security/trust");
+        renderModelTrust(data.trust || {});
+        return data.trust || {};
+      } catch (err) {
+        renderModelTrust({records: []});
+        return null;
+      }
     }
 
     async function refreshModelSecurity() {
       try {
         const data = await api("/api/model-security/status", {
-          profile: $("profile").value || "default",
+          profile: currentRuntimeProfile(),
           custom_model: customModelOptions(),
         });
-        renderModelSecurity(data.model_security || {});
+        const modelSecurity = data.model_security || {};
+        renderModelSecurity(modelSecurity);
+        if (isModelSecurityBlocking(modelSecurity)) {
+          showModelSecurityBlock(modelSecurity);
+        } else {
+          modelSecurityBlockState = null;
+        }
+        refreshModelTrust();
+        return modelSecurity;
       } catch (err) {
         renderModelSecurity({status:"error", error: err.message});
+        return null;
+      }
+    }
+
+    async function refreshBlockedModelSecurityHint(fallback) {
+      const modelSecurity = await refreshModelSecurity();
+      if (!modelSecurity) return;
+      const status = modelSecurityStatus(modelSecurity);
+      if (status === "trusted" || status === "clean") {
+        modelSecurityBlockState = null;
+        setError("");
+        showEmpty("B模块准入已通过", "请重新点击开始检测启动A模块。");
+        return;
+      }
+      showModelSecurityBlock(modelSecurity, fallback);
+      if (isModelSecurityBlocking(modelSecurity)) {
+        setTimeout(() => refreshBlockedModelSecurityHint(fallback), 1500);
       }
     }
 
     function saveLastPaths() {
       try {
         if ($("sourceValue").value) localStorage.setItem("moduleA.lastSourcePath", $("sourceValue").value);
-        if ($("customModelPath").value) localStorage.setItem("moduleA.lastModelPath", $("customModelPath").value);
-        localStorage.setItem("moduleA.lastCustomModelEnabled", $("enableCustomModel").checked ? "true" : "false");
-        localStorage.setItem("moduleA.lastCustomModelBackend", $("customModelBackend").value || "auto");
-        localStorage.setItem("moduleA.lastCustomModelFamily", $("customModelFamily").value || "auto");
       } catch (_) {}
     }
 
@@ -1457,29 +1575,10 @@
           setError("");
         }
       } catch (err) {
+        if (err.data && err.data.model_security) renderModelSecurity(err.data.model_security);
         setError(err.message);
       } finally {
         $("browseBtn").disabled = false;
-      }
-    }
-
-    async function pickModelFile() {
-      setError("正在打开模型文件选择器...");
-      $("browseModelBtn").disabled = true;
-      try {
-        const data = await api("/api/pick-file", {mode: "model", current_path: $("customModelPath").value || ""});
-        if (data.path) {
-          $("customModelPath").value = data.path;
-          $("customModelBackend").value = "auto";
-          $("customModelFamily").value = "auto";
-          inferCustomModelSelection();
-          setCustomModelDraftDirty();
-          setError("");
-        }
-      } catch (err) {
-        setError(err.message);
-      } finally {
-        $("browseModelBtn").disabled = false;
       }
     }
 
@@ -1548,7 +1647,6 @@
 
     $("sourceType").onchange = updateSourceControls;
     $("browseBtn").onclick = pickFile;
-    $("browseModelBtn").onclick = pickModelFile;
     $("scanBtn").onclick = scanCameras;
     $("testSourceBtn").onclick = testSource;
     $("playPauseBtn").onclick = async () => {
@@ -1580,19 +1678,6 @@
         seekControlInFlight = false;
       }
     };
-    $("enableCustomModel").onchange = () => {
-      setCustomModelDraftDirty();
-      syncCustomModelPanelVisibility();
-      inferCustomModelSelection();
-    };
-    $("customModelPath").onchange = () => {
-      $("customModelBackend").value = "auto";
-      $("customModelFamily").value = "auto";
-      inferCustomModelSelection();
-      setCustomModelDraftDirty();
-    };
-    $("customModelBackend").onchange = setCustomModelDraftDirty;
-    $("customModelFamily").onchange = setCustomModelDraftDirty;
     $("cameraSelect").onchange = () => {};
     $("stream").addEventListener("load", () => {
       updateStageAspectFromMedia($("stream"));
@@ -1612,41 +1697,22 @@
       };
     });
 
+    $("openModelSecurityCenterBtn").onclick = () => {
+      window.location.href = "/model-security";
+    };
 
-    $("runModelSecurityScanBtn").onclick = async () => {
-      setError("正在启动B模块快速扫描...");
-      $("runModelSecurityScanBtn").disabled = true;
+    $("refreshModelSecurityBtn").onclick = async () => {
+      $("refreshModelSecurityBtn").disabled = true;
       try {
-        const data = await api("/api/model-security/scan", {
-          scan_type: "quick",
-          background: true,
-          profile: $("profile").value,
-          custom_model: customModelOptions(),
-        });
-        renderModelSecurity(data.model_security || {});
-        setError("B模块后台扫描已启动。预览和A模块检测不会被阻塞。");
+        await refreshModelSecurity();
+        await refreshModelTrust();
+        setError("");
       } catch (err) {
         setError(err.message);
       } finally {
-        $("runModelSecurityScanBtn").disabled = false;
+        $("refreshModelSecurityBtn").disabled = false;
       }
     };
-
-    $("viewModelSecurityReportBtn").onclick = async () => {
-      try {
-        const data = await api("/api/model-security/report");
-        const text = JSON.stringify(data.report || {}, null, 2);
-        const w = window.open("", "_blank");
-        if (w) {
-          w.document.write(`<pre style="white-space:pre-wrap;font-family:monospace;">${text.replace(/[&<>]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}</pre>`);
-        } else {
-          setError(text.slice(0, 4000));
-        }
-      } catch (err) {
-        setError(err.message);
-      }
-    };
-
     $("startBtn").onclick = async () => {
       if (startInFlight) return;
       setError("");
@@ -1663,14 +1729,15 @@
           updateStartButtonState(currentStatus);
           return;
         }
+        modelSecurityBlockState = null;
         hideAllPreview();
-        showEmpty("正在初始化检测", "正在加载模型/引擎并等待首帧检测结果；不会先播放没有检测框的视频。");
+        showEmpty("正在检查模型安全准入", "B模块正在核对白名单、源PT和扫描报告；如果需要净化，会自动净化并使用净化PT启动A模块。");
         await syncDrawingOptions();
         const sourceType = $("sourceType").value;
         const body = {
           source_type: sourceType,
           source: currentSourceValue(),
-          profile: $("profile").value,
+          profile: currentRuntimeProfile(),
           realtime: true,
           feature_options: featureOptions(),
           custom_model: customModelOptions(),
@@ -1678,7 +1745,7 @@
         };
         saveLastPaths();
         const data = await api("/api/start", body);
-        customModelDraftDirty = false;
+        modelSecurityBlockState = null;
         const status = data.status || {};
         lastOverlayStatus = status;
         updateRunControls(status);
@@ -1687,8 +1754,19 @@
         setTimeout(refreshModelSecurity, 2000);
         scheduleRefresh(0);
       } catch (err) {
-        setError(err.message);
-        showEmpty("启动失败", err.message || "检测启动失败，请检查输入源和模型。");
+        const blocked = err.data && err.data.error === "model_security_blocked";
+        if (blocked) {
+          const modelSecurity = err.data.model_security || {};
+          renderModelSecurity(modelSecurity);
+          const hint = modelSecurityBlockHint(modelSecurity, err.message);
+          setError(hint);
+          showModelSecurityBlock(modelSecurity, err.message);
+          setTimeout(() => refreshBlockedModelSecurityHint(err.message), 1500);
+        } else {
+          if (err.data && err.data.model_security) renderModelSecurity(err.data.model_security);
+          setError(err.message);
+          showEmpty("启动失败", err.message || "检测启动失败，请检查输入源和模型。");
+        }
       } finally {
         startInFlight = false;
         try {
@@ -1728,6 +1806,15 @@
         const data = await api("/api/status");
         let status = data.status || {};
         status = mergeOverlayStatusForPanel(status);
+        if (isModelSecurityBlocking(modelSecurityBlockState)) {
+          status = Object.assign({}, status, {
+            running: false,
+            detector_ready: false,
+            first_detection_ready: false,
+            ready_for_preview: false,
+            preview_mode: "model_security_blocked",
+          });
+        }
         if (status.source_ended) stopOverlayPolling();
         nextRefreshMs = status.running ? refreshIntervals.running : refreshIntervals.idle;
         const pill = $("statePill");
@@ -1736,7 +1823,7 @@
         pill.className = "pill " + stateClass;
         renderBranchCards(status.branch_cards || []);
         if (status.model_security) renderModelSecurity(status.model_security);
-        $("profilePill").textContent = profileLabel(status.profile || $("profile").value);
+        $("profilePill").textContent = profileLabel(status.profile || currentRuntimeProfile());
         $("backendPill").textContent = backendLabel(status);
         $("frame").textContent = status.frame_idx ?? 0;
         $("pAdv").textContent = Number(status.p_adv || 0).toFixed(3);
@@ -1749,7 +1836,6 @@
         const featureStatus = status.feature_options || {};
         if (status.running) {
           $("enableStaticImage").checked = featureStatus.static_image_enabled !== false;
-          applyRuntimeCustomModelStatus(status.custom_model || {});
         }
         const displayOptions = status.display_options || {};
         $("showBoxes").checked = displayOptions.show_boxes !== false;
@@ -1757,6 +1843,9 @@
         $("showPpeHud").checked = displayOptions.show_ppe_hud !== false;
         syncOverlayTimingFromStatus(status);
         ensurePreview(status);
+        if (isModelSecurityBlocking(modelSecurityBlockState)) {
+          showModelSecurityBlock(modelSecurityBlockState);
+        }
         if (!status.source_ended) drawOverlay(status);
         updateRunControls(status);
         updateStartButtonState(status);
@@ -1859,8 +1948,8 @@
 
     loadLastPaths();
     updateSourceControls();
-        showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
-    setTimeout(refreshModelSecurity, 1200);
+    showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
+    refreshModelSecurity();
     refresh();
   </script>
 </body>

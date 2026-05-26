@@ -69,18 +69,7 @@ def _load_yolo_module(path: str | Path):
     return yolo
 
 
-def load_state_dict_any(path: str | Path) -> dict[str, torch.Tensor]:
-    """Return a state dict from either a YOLO checkpoint or a plain torch file."""
-
-    path = Path(path)
-    # Try Ultralytics first for real YOLO .pt files.  It knows how to resolve
-    # serialized DetectionModel classes.
-    try:
-        yolo = _load_yolo_module(path)
-        return {str(k): v.detach().cpu().clone() for k, v in yolo.model.state_dict().items()}
-    except Exception:
-        pass
-
+def _load_plain_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
     obj = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(obj, torch.nn.Module):
         return {str(k): v.detach().cpu().clone() for k, v in obj.state_dict().items()}
@@ -96,6 +85,26 @@ def load_state_dict_any(path: str | Path) -> dict[str, torch.Tensor]:
         if obj and all(torch.is_tensor(v) for v in obj.values()):
             return {str(k): v.detach().cpu().clone() for k, v in obj.items()}
     raise TypeError(f"Unsupported checkpoint format for {path}")
+
+
+def load_state_dict_any(path: str | Path, *, prefer_plain: bool = False) -> dict[str, torch.Tensor]:
+    """Return a state dict from either a YOLO checkpoint or a plain torch file."""
+
+    path = Path(path)
+    if prefer_plain:
+        try:
+            return _load_plain_state_dict(path)
+        except Exception:
+            pass
+    # Try Ultralytics first for real YOLO .pt files.  It knows how to resolve
+    # serialized DetectionModel classes.
+    try:
+        yolo = _load_yolo_module(path)
+        return {str(k): v.detach().cpu().clone() for k, v in yolo.model.state_dict().items()}
+    except Exception:
+        pass
+
+    return _load_plain_state_dict(path)
 
 
 def interpolate_state_dicts(
@@ -190,6 +199,38 @@ def save_state_into_yolo_template(
     return out_path
 
 
+def save_state_into_checkpoint_template(
+    template_model: str | Path,
+    state_dict: Mapping[str, torch.Tensor],
+    out_path: str | Path,
+    strict: bool = False,
+) -> Path:
+    """Save a YOLO checkpoint by updating its serialized model module directly.
+
+    This avoids constructing an Ultralytics ``YOLO`` wrapper just to save a
+    checkpoint. On Windows that wrapper can leave native cleanup state behind in
+    short-lived processes; direct checkpoint update is also the pattern used by
+    the newer CCSync path.
+    """
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt = torch.load(template_model, map_location="cpu", weights_only=False)
+    loaded = False
+    if isinstance(ckpt, Mapping):
+        for key in ("model", "ema"):
+            module = ckpt.get(key)
+            if isinstance(module, torch.nn.Module):
+                missing, unexpected = module.load_state_dict(dict(state_dict), strict=bool(strict))
+                if strict and (missing or unexpected):
+                    raise RuntimeError(f"state_dict load mismatch for {key}: missing={missing}, unexpected={unexpected}")
+                loaded = True
+    if not loaded:
+        raise TypeError(f"{template_model} is not a module-backed YOLO checkpoint")
+    torch.save(ckpt, out_path)
+    return out_path
+
+
 def save_plain_state_dict(state_dict: Mapping[str, torch.Tensor], out_path: str | Path) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,17 +257,24 @@ def build_weight_soup_candidates(
     base_model = Path(base_model)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    base_state = load_state_dict_any(base_model)
+    base_state = load_state_dict_any(base_model, prefer_plain=True)
+    template_mode = ""
     template_yolo = None
     if use_yolo_template:
         try:
-            template_yolo = _load_yolo_module(base_model)
+            save_state_into_checkpoint_template(base_model, base_state, out_dir / ".template_probe.pt")
+            (out_dir / ".template_probe.pt").unlink(missing_ok=True)
+            template_mode = "checkpoint"
         except Exception:
-            template_yolo = None
+            try:
+                template_yolo = _load_yolo_module(base_model)
+                template_mode = "ultralytics"
+            except Exception:
+                template_yolo = None
     candidates: list[WeightSoupCandidate] = []
     for anchor_index, anchor in enumerate(anchor_models, 1):
         anchor = Path(anchor)
-        anchor_state = load_state_dict_any(anchor)
+        anchor_state = load_state_dict_any(anchor, prefer_plain=True)
         for alpha in alphas:
             state, meta = interpolate_state_dicts(
                 base_state,
@@ -238,7 +286,9 @@ def build_weight_soup_candidates(
             suffix = f"_{candidate_suffix}" if candidate_suffix else ""
             stem = f"anchor{anchor_index:02d}_{anchor.stem}{suffix}_alpha{str(float(alpha)).replace('.', 'p')}"
             out_path = out_dir / f"{stem}.pt"
-            if template_yolo is not None:
+            if template_mode == "checkpoint":
+                save_state_into_checkpoint_template(base_model, state, out_path)
+            elif template_yolo is not None:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 template_yolo.model.load_state_dict(dict(state), strict=False)
                 template_yolo.save(str(out_path))

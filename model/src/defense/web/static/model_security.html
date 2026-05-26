@@ -1,0 +1,794 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>B模块模型安全中心</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101214;
+      --panel: #181c20;
+      --panel2: #20262b;
+      --line: #353d45;
+      --text: #f4f7fa;
+      --muted: #a9b4bf;
+      --ok: #46d39a;
+      --warn: #ffc857;
+      --bad: #ff4d5e;
+      --blue: #6bb8ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 10px;
+      align-items: center;
+      min-height: 58px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel2);
+    }
+    h1 { margin: 0; font-size: 18px; letter-spacing: 0; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(330px, .75fr);
+      gap: 14px;
+      padding: 14px 18px 24px;
+    }
+    .stack { display: grid; gap: 10px; min-width: 0; }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+      min-width: 0;
+    }
+    .panelHeader {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 48px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel2);
+    }
+    .title { font-weight: 700; white-space: nowrap; }
+    .content { display: grid; gap: 10px; padding: 14px; }
+    .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .metric {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #11161b;
+    }
+    .metric b { display: block; font-size: 22px; line-height: 1.15; }
+    .metric span { color: var(--muted); font-size: 12px; }
+    .pill {
+      min-width: 76px;
+      padding: 5px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      text-align: center;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+    .pill.ok { color: var(--ok); border-color: rgba(70, 211, 154, .45); }
+    .pill.warn { color: var(--warn); border-color: rgba(255, 200, 87, .55); }
+    .pill.bad { color: var(--bad); border-color: rgba(255, 77, 94, .6); }
+    button, select, input {
+      width: 100%;
+      height: 36px;
+      border: 1px solid #46535f;
+      border-radius: 6px;
+      background: #27313a;
+      color: var(--text);
+      font-weight: 650;
+      padding: 0 10px;
+      cursor: pointer;
+    }
+    input {
+      cursor: text;
+      background: #11161b;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      padding: 0;
+      cursor: pointer;
+      flex: 0 0 auto;
+    }
+    button.primary { background: #1b5f46; border-color: #2a8a68; }
+    button.danger { background: #5e1d29; border-color: #9d3545; }
+    button:disabled { opacity: .58; cursor: not-allowed; }
+    label { display: block; color: var(--muted); font-size: 12px; }
+    .fieldRow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .checkLine {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 30px;
+      color: var(--text);
+      font-size: 13px;
+    }
+    code {
+      display: inline-block;
+      max-width: 100%;
+      color: #d7e8ff;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      overflow-wrap: anywhere;
+      word-break: break-all;
+    }
+    .field { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .field strong { color: var(--text); }
+    .notice {
+      border-left: 3px solid var(--blue);
+      background: #11161b;
+      padding: 10px 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .notice.ok { border-left-color: var(--ok); }
+    .notice.bad { border-left-color: var(--bad); }
+    .notice.warn { border-left-color: var(--warn); }
+    .record {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #11161b;
+    }
+    .recordTop {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+    }
+    .logs {
+      display: grid;
+      gap: 8px;
+      max-height: 360px;
+      overflow: auto;
+      scrollbar-gutter: stable;
+    }
+    .logItem {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #11161b;
+    }
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      color: var(--muted);
+      text-align: center;
+    }
+    @media (max-width: 980px) {
+      header, main, .grid2, .grid3 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>B模块模型安全中心</h1>
+    <button id="backBtn" type="button">返回监控台</button>
+    <button id="refreshBtn" type="button">刷新</button>
+  </header>
+
+  <main>
+    <section class="stack">
+      <section class="panel">
+        <div class="panelHeader">
+          <div class="title">运行模型配置</div>
+          <div id="configPill" class="pill">未保存</div>
+        </div>
+        <div class="content">
+          <div class="notice">这里决定A模块即将运行的模型。保存后，监控台开始检测会读取这份配置；B模块扫描、准入和白名单也按同一份配置判断。</div>
+          <label>运行档位
+            <select id="profileSelect">
+              <option value="desktop_rtx">全速GPU（TensorRT）</option>
+              <option value="desktop_debug_onnx">均衡GPU（ONNX调试）</option>
+              <option value="edge_fast">边缘ONNX（兼容）</option>
+            </select>
+          </label>
+          <label class="checkLine"><input id="enableCustomModel" type="checkbox" />使用自定义模型</label>
+          <label>自定义模型路径</label>
+          <div class="fieldRow">
+            <input id="customModelPath" placeholder="选择 .pt / .engine / .onnx 模型文件" />
+            <button id="browseModelBtn" type="button" style="width:auto;">浏览模型</button>
+          </div>
+          <label>同源原始 PT（加速模型准入必填）</label>
+          <div class="fieldRow">
+            <input id="sourcePtPath" placeholder="选择与加速模型同源的 .pt 文件" />
+            <button id="browseSourcePtBtn" type="button" style="width:auto;">浏览PT</button>
+          </div>
+          <div class="grid2">
+            <label>运行后端
+              <select id="customModelBackend">
+                <option value="auto">自动识别</option>
+                <option value="tensorrt">TensorRT（.engine）</option>
+                <option value="onnx">ONNX</option>
+                <option value="pytorch">PyTorch（.pt）</option>
+              </select>
+            </label>
+            <label>模型族
+              <select id="customModelFamily">
+                <option value="auto">自动识别</option>
+                <option value="ultralytics">Ultralytics / YOLOv8</option>
+                <option value="yolov5">YOLOv5</option>
+              </select>
+            </label>
+          </div>
+          <div class="notice">TensorRT 表示使用已导出的 .engine 加速运行；B模块准入仍以同源原始 PT 为依据。未知模型必须先完成安全扫描，不能只靠路径或手工选择放行。</div>
+          <div class="grid2">
+            <button id="saveModelConfigBtn" class="primary" type="button">保存并应用</button>
+            <button id="resetModelConfigBtn" type="button">恢复默认模型</button>
+          </div>
+          <div id="modelConfigMessage" class="field"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelHeader">
+          <div class="title">当前模型准入</div>
+          <div id="statusPill" class="pill">未检查</div>
+        </div>
+        <div class="content">
+          <div id="admissionNotice" class="notice">正在读取B模块准入状态。</div>
+          <div class="grid3">
+            <div class="metric"><b id="riskScore">--</b><span>风险分数</span></div>
+            <div class="metric"><b id="lastScan">--</b><span>最近扫描</span></div>
+            <div class="metric"><b id="whitelistHit">--</b><span>白名单命中</span></div>
+          </div>
+          <div class="grid2">
+            <div class="field"><strong>运行档位：</strong><span id="profileText">全速GPU（默认加速模型）</span></div>
+            <label>自动刷新
+              <select id="refreshSelect">
+                <option value="1500" selected>1.5秒</option>
+                <option value="3000">3秒</option>
+                <option value="0">关闭</option>
+              </select>
+            </label>
+          </div>
+          <div class="notice">检测运行档位以上方运行模型配置为准；TensorRT 代表 .engine 加速运行链路，不是空壳开关。未知模型必须先用原始 PT 做 B 模块准入。</div>
+          <div class="stack">
+            <div class="field"><strong>运行模型：</strong><code id="runtimePath">--</code></div>
+            <div class="field"><strong>源PT：</strong><code id="sourcePtStatusPath">--</code></div>
+            <div class="field"><strong>净化模型：</strong><code id="purifiedPath">--</code></div>
+            <div class="field"><strong>模型指纹：</strong><code id="fingerprint">--</code></div>
+            <div class="field"><strong>扫描报告：</strong><code id="reportPath">--</code></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelHeader">
+          <div class="title">白名单完整性</div>
+          <div id="trustStorePill" class="pill">未检查</div>
+        </div>
+        <div class="content">
+          <div id="trustStoreNotice" class="notice">正在校验白名单和系统指纹。</div>
+          <div class="field"><strong>白名单文件：</strong><code id="registryPath">--</code></div>
+          <div class="field"><strong>签名文件：</strong><code id="sealPath">--</code></div>
+          <div class="field"><strong>系统指纹：</strong><code id="hostFingerprint">--</code></div>
+          <div class="field"><strong>白名单哈希：</strong><code id="registryHash">--</code></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelHeader">
+          <div class="title">操作</div>
+          <div class="pill">系统自动写入</div>
+        </div>
+        <div class="content">
+          <div class="notice">白名单只能由原始PT完整扫描通过，或可疑模型净化后二次完整扫描通过后自动写入。用户只能删除或清空，不能手工添加。</div>
+          <div class="grid2">
+            <button id="scanBtn" class="primary" type="button">完整扫描并自动净化</button>
+            <button id="purifyBtn" type="button">净化并复扫</button>
+          </div>
+          <div class="grid2">
+            <button id="scanReportBtn" type="button">查看扫描报告</button>
+            <button id="purifyReportBtn" type="button">查看净化报告</button>
+          </div>
+          <div class="grid2">
+            <button id="logsPageBtn" type="button">打开日志页</button>
+            <button id="deleteCurrentBtn" type="button">删除当前模型信任</button>
+          </div>
+          <div class="grid2">
+            <button id="clearAllBtn" class="danger" type="button">清空白名单</button>
+          </div>
+          <div id="message" class="field"></div>
+        </div>
+      </section>
+    </section>
+
+    <aside class="stack">
+      <section class="panel">
+        <div class="panelHeader">
+          <div class="title">白名单记录</div>
+          <div id="trustCount" class="pill">0</div>
+        </div>
+        <div class="content">
+          <div id="trustRecords" class="stack"><div class="empty">正在读取白名单。</div></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelHeader">
+          <div class="title">最近日志</div>
+          <button id="refreshLogsBtn" type="button" style="width:auto;">刷新日志</button>
+        </div>
+        <div class="content">
+          <div id="logs" class="logs"><div class="empty">正在读取日志。</div></div>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let lastModelSecurity = {};
+    let refreshTimer = null;
+    const DEFAULT_RUNTIME_PROFILE = "desktop_rtx";
+    const profileLabels = {
+      desktop_rtx: "全速GPU（TensorRT）",
+      desktop_debug_onnx: "均衡GPU（ONNX调试）",
+      edge_fast: "边缘ONNX（兼容）",
+    };
+
+    function getStored(key, fallback = "") {
+      try {
+        const value = localStorage.getItem(key);
+        return value == null ? fallback : value;
+      } catch (_) {
+        return fallback;
+      }
+    }
+
+    function setStored(key, value) {
+      try { localStorage.setItem(key, String(value)); } catch (_) {}
+    }
+
+    function profileLabel(value) {
+      return profileLabels[value] || value || "未知档位";
+    }
+
+    function authHeaders(base = {}) {
+      const headers = Object.assign({}, base || {});
+      try {
+        const token = localStorage.getItem("moduleAToken") || "";
+        if (token) headers["X-Module-A-Token"] = token;
+      } catch (_) {}
+      return headers;
+    }
+
+    async function api(url, body) {
+      const options = body === undefined
+        ? { headers: authHeaders({}) }
+        : { method: "POST", headers: authHeaders({"Content-Type": "application/json"}), body: JSON.stringify(body || {}) };
+      const res = await fetch(url, options);
+      const data = await res.json();
+      if (!res.ok || data.ok === false) {
+        const err = new Error(data.message || data.error || res.statusText);
+        err.data = data;
+        throw err;
+      }
+      return data;
+    }
+
+    function currentRuntimeProfile() {
+      const selected = $("profileSelect") ? $("profileSelect").value : getStored("moduleA.lastProfile", DEFAULT_RUNTIME_PROFILE);
+      return selected || DEFAULT_RUNTIME_PROFILE;
+    }
+
+    function customModelOptions() {
+      const enabled = $("enableCustomModel") ? $("enableCustomModel").checked : getStored("moduleA.lastCustomModelEnabled", "false") === "true";
+      const path = $("customModelPath") ? $("customModelPath").value.trim() : getStored("moduleA.lastModelPath", "");
+      const backend = $("customModelBackend") ? $("customModelBackend").value : getStored("moduleA.lastCustomModelBackend", "auto");
+      const family = $("customModelFamily") ? $("customModelFamily").value : getStored("moduleA.lastCustomModelFamily", "auto");
+      const sourcePtPath = $("sourcePtPath") ? $("sourcePtPath").value.trim() : getStored("moduleA.lastSourcePtPath", "");
+      return {enabled: enabled && !!path, path, backend, model_family: family, source_pt_path: sourcePtPath};
+    }
+
+    function loadModelConfig() {
+      $("profileSelect").value = getStored("moduleA.lastProfile", DEFAULT_RUNTIME_PROFILE);
+      $("enableCustomModel").checked = getStored("moduleA.lastCustomModelEnabled", "false") === "true";
+      $("customModelPath").value = getStored("moduleA.lastModelPath", "");
+      $("sourcePtPath").value = getStored("moduleA.lastSourcePtPath", "");
+      $("customModelBackend").value = getStored("moduleA.lastCustomModelBackend", "auto");
+      $("customModelFamily").value = getStored("moduleA.lastCustomModelFamily", "auto");
+      syncModelConfigControls();
+    }
+
+    function saveModelConfig(options = {}) {
+      setStored("moduleA.lastProfile", currentRuntimeProfile());
+      setStored("moduleA.lastCustomModelEnabled", $("enableCustomModel").checked ? "true" : "false");
+      setStored("moduleA.lastModelPath", $("customModelPath").value.trim());
+      setStored("moduleA.lastSourcePtPath", $("sourcePtPath").value.trim());
+      setStored("moduleA.lastCustomModelBackend", $("customModelBackend").value || "auto");
+      setStored("moduleA.lastCustomModelFamily", $("customModelFamily").value || "auto");
+      syncModelConfigControls();
+      if (!options.silent) showConfigMessage("模型运行配置已保存。");
+    }
+
+    function resetModelConfig() {
+      $("profileSelect").value = DEFAULT_RUNTIME_PROFILE;
+      $("enableCustomModel").checked = false;
+      $("customModelPath").value = "";
+      $("sourcePtPath").value = "";
+      $("customModelBackend").value = "auto";
+      $("customModelFamily").value = "auto";
+      saveModelConfig({silent: true});
+      showConfigMessage("已恢复默认模型配置。");
+    }
+
+    function syncModelConfigControls() {
+      const enabled = $("enableCustomModel").checked;
+      $("customModelPath").disabled = !enabled;
+      $("browseModelBtn").disabled = !enabled;
+      $("sourcePtPath").disabled = !enabled;
+      $("browseSourcePtBtn").disabled = !enabled;
+      $("customModelBackend").disabled = !enabled;
+      $("customModelFamily").disabled = !enabled;
+      $("configPill").textContent = enabled ? "自定义模型" : "默认模型";
+      $("configPill").className = "pill " + (enabled ? "warn" : "ok");
+      $("profileText").textContent = profileLabel(currentRuntimeProfile());
+    }
+
+    function showConfigMessage(text) {
+      $("modelConfigMessage").textContent = text || "";
+    }
+
+    function statusLabel(value) {
+      const labels = {
+        trusted: "已信任",
+        clean: "扫描通过",
+        blocked_scan_required: "需要完整扫描",
+        scanning: "扫描中",
+        unverifiable: "无法验证",
+        suspicious: "疑似风险",
+        review: "需要复核",
+        purifying: "净化中",
+        purified_alternative_available: "净化模型可用",
+        trust_store_compromised: "白名单失效",
+        error: "异常",
+        deleted: "已删除",
+        missing: "未找到",
+        running: "运行中",
+        info: "信息",
+        ok: "正常",
+        empty_unsealed: "空白名单",
+        host_fingerprint_degraded: "指纹降级",
+      };
+      return labels[String(value || "unknown")] || String(value || "未知");
+    }
+
+    function reasonLabel(value) {
+      const labels = {
+        model_not_in_whitelist: "模型未命中白名单",
+        full_scan_running: "完整扫描正在运行",
+        purification_running: "净化任务正在运行",
+        no_runtime_artifact: "没有可运行模型文件",
+        source_pt_required_for_accelerated_artifact: "加速模型需要提供同源PT",
+        purified_pt_clean_but_runtime_not_selected: "净化PT已通过，开始检测会自动使用净化模型",
+        last_full_scan_review: "最近完整扫描需要复核",
+        last_full_scan_suspicious: "最近完整扫描疑似风险",
+        last_full_scan_unverifiable: "最近完整扫描无法验证",
+        registry_hash_mismatch: "白名单内容与签名不一致",
+        seal_missing_for_nonempty_registry: "非空白名单缺少签名文件",
+        registry_missing_but_seal_exists: "签名存在但白名单文件缺失",
+        seal_signature_mismatch: "白名单签名不匹配",
+        host_fingerprint_mismatch: "系统唯一指纹不匹配",
+        registry_json_invalid: "白名单JSON损坏",
+        seal_json_invalid: "签名JSON损坏",
+      };
+      return labels[String(value || "")] || String(value || "");
+    }
+
+    function eventLabel(value) {
+      const labels = {
+        scan_started: "扫描开始",
+        scan_completed: "扫描完成",
+        scan_failed: "扫描失败",
+        purification_started: "净化开始",
+        purification_completed: "净化完成",
+        purification_failed: "净化失败",
+        whitelist_written: "写入白名单",
+        whitelist_deleted: "删除白名单",
+        whitelist_cleared: "清空白名单",
+      };
+      return labels[String(value || "")] || String(value || "事件");
+    }
+
+    function tone(status) {
+      const text = String(status || "");
+      if (["trusted", "clean", "ok"].includes(text) || text.includes("trusted")) return "ok";
+      if (["blocked_scan_required", "scanning", "purifying", "review", "suspicious", "unverifiable", "purified_alternative_available", "empty_unsealed", "host_fingerprint_degraded"].includes(text)) return "warn";
+      if (text.includes("error") || text.includes("failed") || text.includes("compromised")) return "bad";
+      return "";
+    }
+
+    function timeText(value) {
+      if (!value) return "--";
+      return String(value).replace("T", " ").replace("+00:00", " UTC").slice(0, 23);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"]/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch]));
+    }
+
+    function showMessage(text) {
+      $("message").textContent = text || "";
+    }
+
+    function renderStatus(ms) {
+      lastModelSecurity = ms || {};
+      const status = lastModelSecurity.admission_status || lastModelSecurity.status || "unknown";
+      $("statusPill").textContent = statusLabel(status);
+      $("statusPill").className = "pill " + tone(status);
+      $("riskScore").textContent = lastModelSecurity.risk_score == null ? "--" : Number(lastModelSecurity.risk_score).toFixed(3);
+      $("lastScan").textContent = timeText(lastModelSecurity.last_scan_time);
+      $("whitelistHit").textContent = lastModelSecurity.whitelist_hit ? "是" : "否";
+      $("runtimePath").textContent = lastModelSecurity.runtime_artifact_path || lastModelSecurity.model_path || "--";
+      $("sourcePtStatusPath").textContent = lastModelSecurity.source_pt_path || "--";
+      $("purifiedPath").textContent = lastModelSecurity.purified_model_path || "--";
+      $("fingerprint").textContent = lastModelSecurity.fingerprint || "--";
+      $("reportPath").textContent = lastModelSecurity.report_path || "--";
+      $("registryPath").textContent = lastModelSecurity.registry_path || "--";
+      $("sealPath").textContent = lastModelSecurity.registry_seal_path || "--";
+      $("hostFingerprint").textContent = lastModelSecurity.host_fingerprint_hash || "--";
+      $("registryHash").textContent = lastModelSecurity.registry_hash || "--";
+
+      const storeStatus = lastModelSecurity.trust_store_status || "unknown";
+      $("trustStorePill").textContent = statusLabel(storeStatus);
+      $("trustStorePill").className = "pill " + tone(storeStatus);
+
+      const reason = reasonLabel(lastModelSecurity.blocking_reason);
+      const purificationStatus = lastModelSecurity.purification_status || "idle";
+      let text = "模型安全状态尚未确认。";
+      if (status === "trusted") text = "当前运行模型已通过B模块准入，可以启动A模块检测。";
+      else if (status === "blocked_scan_required") text = "当前模型未命中白名单，需要先对源PT执行完整扫描；若扫描判定疑似风险，系统会自动净化并复扫。";
+      else if (status === "scanning") text = "B模块正在后台完整扫描；若判定疑似风险，会自动进入净化并复扫，A模块暂未启动。";
+      else if (status === "purifying") text = "B模块正在净化并复扫候选模型，复扫通过后才会写入白名单。";
+      else if (status === "suspicious" && purificationStatus === "purified_scan_no_clean_candidate") text = "完整扫描判定疑似风险，净化候选复扫后仍未达到clean/trusted，A模块继续阻断。";
+      else if (status === "suspicious" && purificationStatus === "purified_scan_failed") text = "完整扫描判定疑似风险，但净化候选复扫失败，请查看净化报告和日志。";
+      else if (status === "suspicious") text = "完整扫描判定疑似风险；系统会尝试净化并复扫，只有复扫通过才会写入白名单。";
+      else if (status === "review") text = "完整扫描结果需要复核，当前策略不会放行，也不会自动净化。";
+      else if (status === "unverifiable") text = `当前模型无法验证${reason ? "：" + reason : ""}。`;
+      else if (status === "purified_alternative_available") text = "净化模型已经复扫通过；从监控台开始检测时，系统会自动使用净化PT启动A模块。";
+      else if (status === "trust_store_compromised") text = `白名单完整性失败：${reason || lastModelSecurity.trust_store_reason || "未知原因"}。A模块禁止启动，请清空白名单后重新扫描。`;
+      $("admissionNotice").textContent = text;
+      $("admissionNotice").className = "notice " + tone(status);
+
+      const storeReason = reasonLabel(lastModelSecurity.trust_store_reason);
+      $("trustStoreNotice").textContent = lastModelSecurity.trust_store_ok
+        ? `白名单完整性校验通过。系统指纹状态：${statusLabel(lastModelSecurity.host_fingerprint_status)}。`
+        : `白名单完整性校验失败：${storeReason || lastModelSecurity.trust_store_reason || "未知原因"}。`;
+      $("trustStoreNotice").className = "notice " + (lastModelSecurity.trust_store_ok ? "ok" : "bad");
+
+      const busy = !!lastModelSecurity.scanning || !!lastModelSecurity.purifying || status === "scanning" || status === "purifying";
+      $("scanBtn").disabled = busy;
+      $("purifyBtn").disabled = busy || status !== "suspicious";
+      $("deleteCurrentBtn").disabled = !lastModelSecurity.fingerprint || lastModelSecurity.trust_store_ok === false;
+    }
+
+    async function refreshStatus() {
+      const data = await api("/api/model-security/status", {
+        profile: currentRuntimeProfile(),
+        custom_model: customModelOptions(),
+      });
+      renderStatus(data.model_security || {});
+      return data.model_security || {};
+    }
+
+    async function refreshTrust() {
+      const data = await api("/api/model-security/trust");
+      const trust = data.trust || {};
+      const records = Array.isArray(trust.records) ? trust.records : [];
+      $("trustCount").textContent = String(records.length);
+      if (!records.length) {
+        $("trustRecords").innerHTML = '<div class="empty">白名单为空。</div>';
+        return;
+      }
+      $("trustRecords").innerHTML = records.map((rec) => `
+        <article class="record">
+          <div class="recordTop">
+            <div><strong>${escapeHtml(statusLabel(rec.status))}</strong> · ${escapeHtml(timeText(rec.last_scan_time))}</div>
+            <button data-delete-fp="${escapeHtml(rec.fingerprint || "")}" type="button" style="width:auto;">删除</button>
+          </div>
+          <div class="field"><strong>指纹：</strong><code>${escapeHtml(rec.fingerprint || "--")}</code></div>
+          <div class="field"><strong>运行模型：</strong><code>${escapeHtml(rec.runtime_model_path || "--")}</code></div>
+          <div class="field"><strong>源模型：</strong><code>${escapeHtml(rec.source_model_path || "--")}</code></div>
+          <div class="field"><strong>来源：</strong>${escapeHtml(rec.approval_source || "--")} · <strong>风险：</strong>${rec.risk_score == null ? "--" : Number(rec.risk_score).toFixed(3)}</div>
+        </article>
+      `).join("");
+    }
+
+    async function refreshLogs() {
+      const data = await api("/api/model-security/logs?limit=30");
+      const logs = data.logs || {};
+      const entries = Array.isArray(logs.entries) ? logs.entries : [];
+      if (!entries.length) {
+        $("logs").innerHTML = '<div class="empty">暂无日志。</div>';
+        return;
+      }
+      $("logs").innerHTML = entries.map((item) => `
+        <article class="logItem">
+          <div><span class="pill ${tone(item.status)}">${escapeHtml(statusLabel(item.status || "info"))}</span> <span class="pill">${escapeHtml(eventLabel(item.event))}</span></div>
+          <div class="field">${escapeHtml(timeText(item.time))}</div>
+          <div>${escapeHtml(item.message || "")}</div>
+        </article>
+      `).join("");
+    }
+
+    async function refreshAll() {
+      try {
+        await refreshStatus();
+        await refreshTrust();
+        await refreshLogs();
+      } catch (err) {
+        showMessage(err.message || String(err));
+      }
+    }
+
+    function schedule() {
+      clearTimeout(refreshTimer);
+      const interval = Number($("refreshSelect").value || 0);
+      if (interval > 0) {
+        refreshTimer = setTimeout(async () => {
+          await refreshAll();
+          schedule();
+        }, interval);
+      }
+    }
+
+    function openJsonReport(endpoint, title) {
+      api(endpoint).then((data) => {
+        const text = JSON.stringify(data.report || {}, null, 2);
+        const w = window.open("", "_blank");
+        if (w) {
+          w.document.write(`<title>${escapeHtml(title)}</title><pre style="white-space:pre-wrap;font-family:monospace;">${escapeHtml(text)}</pre>`);
+        } else {
+          showMessage(text.slice(0, 4000));
+        }
+      }).catch((err) => showMessage(err.message));
+    }
+
+    async function deleteFingerprint(fp) {
+      if (!fp) return;
+      if (!confirm("删除这个模型白名单？删除后下次启动会重新执行B模块准入。")) return;
+      await api("/api/model-security/trust/delete", {fingerprint: fp});
+      showMessage("白名单记录已删除。");
+      await refreshAll();
+    }
+
+    $("backBtn").onclick = () => { window.location.href = "/"; };
+    $("refreshBtn").onclick = refreshAll;
+    $("refreshLogsBtn").onclick = refreshLogs;
+    $("refreshSelect").onchange = schedule;
+    $("enableCustomModel").onchange = () => {
+      syncModelConfigControls();
+      showConfigMessage("配置已修改，保存后监控台会使用新模型。");
+    };
+    ["profileSelect", "customModelPath", "sourcePtPath", "customModelBackend", "customModelFamily"].forEach((id) => {
+      $(id).onchange = () => {
+        syncModelConfigControls();
+        showConfigMessage("配置已修改，保存后监控台会使用新模型。");
+      };
+    });
+    $("browseModelBtn").onclick = async () => {
+      $("browseModelBtn").disabled = true;
+      try {
+        const data = await api("/api/pick-file", {mode: "model", current_path: $("customModelPath").value || ""});
+        if (data.path) {
+          $("customModelPath").value = data.path;
+          $("enableCustomModel").checked = true;
+          syncModelConfigControls();
+          showConfigMessage("已选择运行模型，点击保存并应用后生效。");
+        }
+      } catch (err) {
+        showConfigMessage(err.message);
+      } finally {
+        syncModelConfigControls();
+      }
+    };
+    $("browseSourcePtBtn").onclick = async () => {
+      $("browseSourcePtBtn").disabled = true;
+      try {
+        const data = await api("/api/pick-file", {mode: "model", current_path: $("sourcePtPath").value || ""});
+        if (data.path) {
+          $("sourcePtPath").value = data.path;
+          $("enableCustomModel").checked = true;
+          syncModelConfigControls();
+          showConfigMessage("已选择同源 PT，点击保存并应用后生效。");
+        }
+      } catch (err) {
+        showConfigMessage(err.message);
+      } finally {
+        syncModelConfigControls();
+      }
+    };
+    $("saveModelConfigBtn").onclick = async () => {
+      saveModelConfig();
+      await refreshAll();
+    };
+    $("resetModelConfigBtn").onclick = async () => {
+      resetModelConfig();
+      await refreshAll();
+    };
+    $("scanBtn").onclick = async () => {
+      $("scanBtn").disabled = true;
+      try {
+        saveModelConfig({silent: true});
+        const data = await api("/api/model-security/scan", {scan_type: "full", background: true, auto_purify: true, profile: currentRuntimeProfile(), custom_model: customModelOptions()});
+        const scan = data.scan || {};
+        if (scan.started === false) {
+          showMessage(scan.reason === "scan_already_running" ? "B模块已有扫描任务正在运行。" : `B模块未启动：${scan.reason || "未知原因"}`);
+        } else {
+          showMessage(scan.auto_purify ? "B模块完整扫描已启动；若判定疑似风险，将自动净化并复扫。" : "B模块完整扫描已启动。");
+        }
+        await refreshAll();
+      } catch (err) {
+        showMessage(err.message);
+      } finally {
+        await refreshStatus().catch(() => {});
+      }
+    };
+    $("purifyBtn").onclick = async () => {
+      $("purifyBtn").disabled = true;
+      try {
+        saveModelConfig({silent: true});
+        await api("/api/model-security/purify", {background: true, scan_after: true, profile: currentRuntimeProfile(), custom_model: customModelOptions()});
+        showMessage("B模块净化已启动，完成后会自动复扫。");
+        await refreshAll();
+      } catch (err) {
+        showMessage(err.message);
+      } finally {
+        $("purifyBtn").disabled = false;
+      }
+    };
+    $("scanReportBtn").onclick = () => openJsonReport("/api/model-security/report", "B模块扫描报告");
+    $("purifyReportBtn").onclick = () => openJsonReport("/api/model-security/purification-report", "B模块净化报告");
+    $("logsPageBtn").onclick = () => { window.location.href = "/model-security/logs"; };
+    $("deleteCurrentBtn").onclick = () => deleteFingerprint(lastModelSecurity && lastModelSecurity.fingerprint);
+    $("clearAllBtn").onclick = async () => {
+      if (!confirm("清空全部模型白名单？所有模型下次启动前都会重新执行B模块准入。")) return;
+      await api("/api/model-security/trust/clear", {});
+      showMessage("白名单已清空。");
+      await refreshAll();
+    };
+    $("trustRecords").onclick = (event) => {
+      const target = event.target;
+      if (target && target.dataset && target.dataset.deleteFp) {
+        deleteFingerprint(target.dataset.deleteFp).catch((err) => showMessage(err.message));
+      }
+    };
+
+    loadModelConfig();
+    refreshAll().finally(schedule);
+  </script>
+</body>
+</html>

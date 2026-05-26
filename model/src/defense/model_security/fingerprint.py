@@ -8,7 +8,7 @@ from typing import Any
 
 from defense.runtime.artifacts import artifact_diagnostics
 
-SCANNER_VERSION = "model_security_runtime_v1"
+SCANNER_VERSION = "model_security_runtime_v2"
 
 
 def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>B模块运行日志</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1014;
+      --panel: #151c22;
+      --line: #2c3943;
+      --text: #e7edf3;
+      --muted: #9ba9b5;
+      --ok: #43d18d;
+      --warn: #f0b34f;
+      --bad: #f06478;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 10px;
+      align-items: center;
+      padding: 14px 18px;
+      background: #111820;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+    button, select {
+      height: 34px;
+      border-radius: 6px;
+      border: 1px solid #46535f;
+      background: #27313a;
+      color: var(--text);
+      font-weight: 650;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    main { padding: 16px 18px 24px; }
+    .summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 12px;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    .logList {
+      display: grid;
+      gap: 10px;
+    }
+    .logItem {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 12px;
+    }
+    .logTop {
+      display: grid;
+      grid-template-columns: auto auto minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .pill.ok { color: var(--ok); border-color: rgba(67, 209, 141, .4); }
+    .pill.warn { color: var(--warn); border-color: rgba(240, 179, 79, .45); }
+    .pill.bad { color: var(--bad); border-color: rgba(240, 100, 120, .45); }
+    .time { color: var(--muted); white-space: nowrap; }
+    .message { font-weight: 650; overflow-wrap: anywhere; }
+    .details {
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      word-break: break-all;
+      white-space: pre-wrap;
+    }
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 24px;
+      color: var(--muted);
+      text-align: center;
+    }
+    @media (max-width: 720px) {
+      header, .summary, .logTop { grid-template-columns: 1fr; }
+      button, select { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>B模块运行日志</h1>
+    <button id="refreshBtn" type="button">刷新</button>
+    <button id="pauseBtn" type="button">暂停自动刷新</button>
+  </header>
+  <main>
+    <div class="summary">
+      <div id="logPath">日志路径：--</div>
+      <label>显示条数 <select id="limitSelect"><option>50</option><option selected>80</option><option>120</option><option>200</option></select></label>
+    </div>
+    <div id="logs" class="logList"><div class="empty">正在读取日志...</div></div>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let paused = false;
+    let timer = null;
+
+    function authHeaders(base = {}) {
+      const headers = Object.assign({}, base || {});
+      try {
+        const token = localStorage.getItem("moduleAToken") || "";
+        if (token) headers["X-Module-A-Token"] = token;
+      } catch (_) {}
+      return headers;
+    }
+
+    function labelStatus(value) {
+      const labels = {
+        info: "信息",
+        running: "运行中",
+        clean: "扫描通过",
+        trusted: "已信任",
+        deleted: "已删除",
+        missing: "未找到",
+        review: "需要复核",
+        suspicious: "疑似风险",
+        unverifiable: "无法验证",
+        error: "异常",
+        failed: "失败",
+        scan_clean_trusted: "净化复扫通过",
+        purified: "已生成净化模型",
+        planned: "已生成计划",
+      };
+      return labels[String(value || "info")] || String(value || "信息");
+    }
+
+    function statusClass(value) {
+      const text = String(value || "");
+      if (["clean", "trusted", "deleted", "scan_clean_trusted", "purified"].includes(text)) return "ok";
+      if (["review", "suspicious", "unverifiable", "planned", "running"].includes(text)) return "warn";
+      if (["error", "failed"].some((part) => text.includes(part))) return "bad";
+      return "";
+    }
+
+    function renderLogs(payload) {
+      const logs = payload.logs || {};
+      $("logPath").textContent = "日志路径：" + (logs.log_path || "--");
+      const entries = Array.isArray(logs.entries) ? logs.entries : [];
+      if (!entries.length) {
+        $("logs").innerHTML = '<div class="empty">暂无 B 模块日志。</div>';
+        return;
+      }
+      $("logs").innerHTML = entries.map((item) => {
+        const fields = Object.keys(item)
+          .filter((key) => !["time", "event", "status", "message"].includes(key) && item[key] !== null && item[key] !== undefined && item[key] !== "")
+          .map((key) => `<div>${escapeHtml(fieldLabel(key))}：${escapeHtml(formatValue(item[key]))}</div>`)
+          .join("");
+        return `<article class="logItem">
+          <div class="logTop">
+            <span class="pill ${statusClass(item.status)}">${escapeHtml(labelStatus(item.status))}</span>
+            <span class="pill">${escapeHtml(eventLabel(item.event))}</span>
+            <span class="time">${escapeHtml(formatTime(item.time))}</span>
+          </div>
+          <div class="message">${escapeHtml(item.message || "")}</div>
+          <div class="details">${fields}</div>
+        </article>`;
+      }).join("");
+    }
+
+    function eventLabel(value) {
+      const labels = {
+        scan_started: "扫描开始",
+        scan_completed: "扫描完成",
+        scan_failed: "扫描失败",
+        purification_started: "净化开始",
+        purification_completed: "净化完成",
+        purification_failed: "净化失败",
+        whitelist_written: "写入白名单",
+        whitelist_deleted: "删除白名单",
+        whitelist_cleared: "清空白名单",
+      };
+      return labels[String(value || "")] || String(value || "事件");
+    }
+
+    function fieldLabel(key) {
+      const labels = {
+        model_path: "模型路径",
+        source_path: "来源路径",
+        output_path: "输出路径",
+        whitelist_path: "白名单路径",
+        file: "文件",
+        path: "路径",
+        reason: "原因",
+        error: "错误",
+        action: "操作",
+        count: "数量",
+        duration: "耗时",
+        elapsed: "耗时",
+      };
+      return labels[String(key || "")] || String(key || "字段");
+    }
+
+    function formatValue(value) {
+      if (value && typeof value === "object") {
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch (_) {
+          return String(value);
+        }
+      }
+      return String(value);
+    }
+
+    function formatTime(value) {
+      if (!value) return "--";
+      return String(value).replace("T", " ").replace("+00:00", " UTC");
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"]/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch]));
+    }
+
+    async function refreshLogs() {
+      try {
+        const limit = Number($("limitSelect").value || 80);
+        const res = await fetch(`/api/model-security/logs?limit=${limit}`, { headers: authHeaders({}) });
+        const data = await res.json();
+        if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+        renderLogs(data);
+      } catch (err) {
+        $("logs").innerHTML = `<div class="empty">读取日志失败：${escapeHtml(err.message || err)}</div>`;
+      }
+    }
+
+    function schedule() {
+      clearTimeout(timer);
+      if (!paused) timer = setTimeout(async () => { await refreshLogs(); schedule(); }, 1500);
+    }
+
+    $("refreshBtn").onclick = refreshLogs;
+    $("pauseBtn").onclick = () => {
+      paused = !paused;
+      $("pauseBtn").textContent = paused ? "继续自动刷新" : "暂停自动刷新";
+      schedule();
+    };
+    $("limitSelect").onchange = refreshLogs;
+    refreshLogs();
+    schedule();
+  </script>
+</body>
+</html>

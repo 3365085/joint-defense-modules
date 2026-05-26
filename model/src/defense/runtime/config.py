@@ -349,6 +349,7 @@ def normalize_custom_model_options(custom_model: dict[str, Any] | None) -> dict[
         "path": path,
         "backend": backend,
         "model_family": model_family,
+        "source_pt_path": str(custom_model.get("source_pt_path", "") or "").strip(),
     }
 
 

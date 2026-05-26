@@ -904,7 +904,7 @@ class MonitorEngine:
             detect_interval = 1.0 / max(1.0, min(detector_process_fps_cap, fps if source_type == "file" else detector_process_fps_cap))
             with self.condition:
                 if run_id == self.run_id:
-                    preview_can_start = source_type != "file"
+                    preview_can_start = True
                     self.status.update(
                         {
                             "source_fps": fps,
@@ -913,7 +913,7 @@ class MonitorEngine:
                             "ready_for_preview": preview_can_start,
                             "preview_started": preview_can_start,
                             "preview_seekable": source_type == "file",
-                            "preview_mode": "backend_source_pipeline" if preview_can_start else "waiting_first_detection",
+                            "preview_mode": "backend_source_pipeline",
                             "detector_pipeline_mode": "backend_latest_only",
                             "capture_max_side": int(capture_max_side),
                             "file_source_fps_cap": float(file_source_fps_cap or 0.0),
@@ -1010,7 +1010,7 @@ class MonitorEngine:
                     detection_bus.push(packet)
                 with self.condition:
                     if run_id == self.run_id:
-                        preview_can_start = source_type != "file" or bool(self.status.get("first_detection_ready"))
+                        preview_can_start = True
                         self.status.update(
                             {
                                 "source_time_s": packet.source_time_s,
@@ -1228,6 +1228,7 @@ class MonitorEngine:
                 waiting_for_first_file_detection = (
                     str(self.status.get("source_type") or "").lower() == "file"
                     and bool(self.status.get("realtime", True))
+                    and not bool(self.status.get("preview_never_wait_for_detection", True))
                     and not bool(self.status.get("first_detection_ready"))
                 )
             if waiting_for_first_file_detection:

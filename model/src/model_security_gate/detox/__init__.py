@@ -40,6 +40,18 @@ __all__ = [
     "RNPConfig",
     "score_rnp_channels_for_yolo",
     "apply_rnp_soft_suppression",
+    "WeightSoupBuildResult",
+    "WeightSoupCandidate",
+    "build_weight_soup_candidates",
+    "parse_alpha_grid",
+    "CCSyncConfig",
+    "CCSyncReport",
+    "CCSyncYoloConfig",
+    "CCSyncYoloResult",
+    "purify_yolo_with_ccsync",
+    "OC3TrainV4Config",
+    "OC3TrainV4Result",
+    "train_oc3_adapter_v4",
 ]
 
 
@@ -139,4 +151,38 @@ def __getattr__(name: str):
         from .rnp import RNPConfig, apply_rnp_soft_suppression, score_rnp_channels_for_yolo
 
         return {"RNPConfig": RNPConfig, "score_rnp_channels_for_yolo": score_rnp_channels_for_yolo, "apply_rnp_soft_suppression": apply_rnp_soft_suppression}[name]
+    if name in {"WeightSoupBuildResult", "WeightSoupCandidate", "build_weight_soup_candidates", "parse_alpha_grid"}:
+        from .weight_soup import (
+            WeightSoupBuildResult,
+            WeightSoupCandidate,
+            build_weight_soup_candidates,
+            parse_alpha_grid,
+        )
+
+        return {
+            "WeightSoupBuildResult": WeightSoupBuildResult,
+            "WeightSoupCandidate": WeightSoupCandidate,
+            "build_weight_soup_candidates": build_weight_soup_candidates,
+            "parse_alpha_grid": parse_alpha_grid,
+        }[name]
+    if name in {"CCSyncConfig", "CCSyncReport"}:
+        from .ccsync import CCSyncConfig, CCSyncReport
+
+        return {"CCSyncConfig": CCSyncConfig, "CCSyncReport": CCSyncReport}[name]
+    if name in {"CCSyncYoloConfig", "CCSyncYoloResult", "purify_yolo_with_ccsync"}:
+        from .ccsync_yolo import CCSyncYoloConfig, CCSyncYoloResult, purify_yolo_with_ccsync
+
+        return {
+            "CCSyncYoloConfig": CCSyncYoloConfig,
+            "CCSyncYoloResult": CCSyncYoloResult,
+            "purify_yolo_with_ccsync": purify_yolo_with_ccsync,
+        }[name]
+    if name in {"OC3TrainV4Config", "OC3TrainV4Result", "train_oc3_adapter_v4"}:
+        from .oc3 import OC3TrainV4Config, OC3TrainV4Result, train_oc3_adapter_v4
+
+        return {
+            "OC3TrainV4Config": OC3TrainV4Config,
+            "OC3TrainV4Result": OC3TrainV4Result,
+            "train_oc3_adapter_v4": train_oc3_adapter_v4,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

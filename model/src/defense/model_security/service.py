@@ -39,6 +39,8 @@ class ModelSecurityService:
         self._scan_target_fingerprint: str | None = None
         self._purify_thread: threading.Thread | None = None
         self._purify_target_fingerprint: str | None = None
+        self._last_scan_job: dict[str, Any] | None = None
+        self._last_purification_job: dict[str, Any] | None = None
 
     def _write_registry_seal(self, data: dict[str, Any]) -> None:
         write_trust_store_seal(self.registry.path, self.storage.registry_seal_path, data)
@@ -119,16 +121,16 @@ class ModelSecurityService:
         runtime = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
         custom = runtime.get("custom_model", {}) if isinstance(runtime.get("custom_model"), dict) else {}
         custom_enabled = bool(custom.get("enabled"))
+        runtime_path = self._resolve_candidate(custom.get("path")) if custom_enabled else None
+        if runtime_path and runtime_path.suffix.lower() in {".pt", ".pth"}:
+            candidates.append(runtime_path)
         for key in ("source_pt_path", "source_model_path", "source_path"):
             p = self._resolve_candidate(custom.get(key))
             if p:
                 candidates.append(p)
         if custom_enabled:
-            runtime_path = self._resolve_candidate(custom.get("path"))
             if runtime_path:
-                if runtime_path.suffix.lower() in {".pt", ".pth"}:
-                    candidates.append(runtime_path)
-                else:
+                if runtime_path.suffix.lower() not in {".pt", ".pth"}:
                     candidates.append(runtime_path.with_suffix(".pt"))
                     candidates.append(runtime_path.parent / "best.pt")
             return self._dedupe_paths(candidates)
@@ -359,6 +361,52 @@ class ModelSecurityService:
         except Exception:
             return None
 
+    def _strict_candidate_report(
+        self,
+        *,
+        fp: ModelFingerprint,
+        candidate_path: Path,
+        candidate: dict[str, Any],
+        budget: ScanBudget,
+    ) -> ModelSecurityReport | None:
+        strict = candidate.get("new_algorithm_strict_audit")
+        if not isinstance(strict, dict):
+            return None
+        expected_hash = str(candidate.get("output_model_hash") or "")
+        actual_hash = "sha256:" + sha256_file(candidate_path)
+        if expected_hash and expected_hash != actual_hash:
+            return None
+        package_hash = str(strict.get("package_model_hash") or candidate.get("source_candidate_hash") or "")
+        if package_hash and package_hash != actual_hash:
+            return None
+        wilson_upper = float(strict.get("wilson_upper") or 1.0)
+        risk = float(round(wilson_upper, 4))
+        return ModelSecurityReport(
+            fingerprint=fp.to_dict(),
+            scan_type="full",
+            status="clean",
+            risk_score=risk,
+            reasons=[
+                "new B-module packaged strict purified model passed shipped strict audit",
+                "local purified copy hash matches the audited packaged purified model",
+                f"family={strict.get('family_tag')}, tier={strict.get('tier')}, defense={strict.get('defense')}",
+            ],
+            completed_at=now_iso(),
+            budget=budget.to_dict(),
+            diagnostics={
+                "validation_scope": "new_algorithm_family_strict_audit",
+                "new_algorithm_strict_audit": {
+                    **strict,
+                    "runtime_model_path": str(candidate_path),
+                    "runtime_model_hash": actual_hash,
+                    "local_output_policy": candidate.get("local_output_policy"),
+                },
+            },
+            source_model_path=str(candidate_path),
+            source_model_hash=actual_hash,
+            runtime_artifact_path=fp.model_path,
+        )
+
     def _security_metrics(
         self,
         *,
@@ -418,6 +466,11 @@ class ModelSecurityService:
             "original_source_model_hash": original_source_model_hash,
         }
 
+    def _trusted_record_purification_report(self, rec: Any | None) -> ModelPurificationReport | None:
+        if rec is None or getattr(rec, "approval_source", "") != "purified_full_scan":
+            return None
+        return self._read_purification_report(getattr(rec, "purification_report_path", None))
+
     def _is_scanning(self, fingerprint: str | None = None) -> bool:
         running = bool(self._scan_thread and self._scan_thread.is_alive())
         if not running:
@@ -431,6 +484,42 @@ class ModelSecurityService:
         if not running:
             return False
         return fingerprint is None or self._purify_target_fingerprint == fingerprint
+
+    @staticmethod
+    def _runtime_model_for_purified_path(path: str | Path, fp: ModelFingerprint) -> dict[str, Any]:
+        purified_path = Path(path)
+        return {
+            "enabled": True,
+            "path": str(purified_path),
+            "backend": "pytorch",
+            "model_family": fp.model_family or "auto",
+            "source_pt_path": str(purified_path),
+            "status": "trusted_purified_pt",
+        }
+
+    def _trusted_purified_status(
+        self,
+        *,
+        profile: str,
+        source_fp: ModelFingerprint,
+        report: ModelPurificationReport | None,
+    ) -> dict[str, Any] | None:
+        if report is None or report.status != "scan_clean_trusted" or not report.purified_model_path:
+            return None
+        purified_path = Path(report.purified_model_path)
+        if not purified_path.exists() or not purified_path.is_file() or purified_path.suffix.lower() not in {".pt", ".pth"}:
+            return None
+        runtime_model = self._runtime_model_for_purified_path(purified_path, source_fp)
+        runtime_model.pop("status", None)
+        status = self.admission_status(profile=profile, custom_model=runtime_model)
+        if not bool(status.get("allowed", False)):
+            return None
+        return status
+
+    def _last_job_for_fingerprint(self, job: dict[str, Any] | None, fingerprint: str) -> dict[str, Any] | None:
+        if not job or job.get("fingerprint") != fingerprint:
+            return None
+        return dict(job)
 
     def admission_status(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
@@ -461,6 +550,8 @@ class ModelSecurityService:
             )
             if last_purification is None:
                 last_purification = self._load_purification_report(fp.fingerprint)
+            scan_job = self._last_job_for_fingerprint(self._last_scan_job, fp.fingerprint)
+            purification_job = self._last_job_for_fingerprint(self._last_purification_job, fp.fingerprint)
 
             status = "blocked_scan_required"
             allowed = False
@@ -497,7 +588,33 @@ class ModelSecurityService:
                 status = "unverifiable"
                 reason = "source_pt_required_for_accelerated_artifact"
 
+            purifiable_statuses = {"suspicious", "review", "unverifiable"}
+            can_purify = bool(
+                status in purifiable_statuses
+                and not scanning
+                and not purifying
+                and integrity.ok
+                and last_report is not None
+                and last_report.status in purifiable_statuses
+                and not (last_purification and last_purification.status == "scan_clean_trusted")
+            )
+            can_scan = bool(not scanning and not purifying and integrity.ok and not allowed)
+            recommended_runtime_model = None
+            if last_purification and last_purification.status == "scan_clean_trusted" and last_purification.purified_model_path:
+                recommended_runtime_model = self._runtime_model_for_purified_path(last_purification.purified_model_path, fp)
+                purified_status = self._trusted_purified_status(profile=profile, source_fp=fp, report=last_purification)
+                if purified_status is not None:
+                    recommended_runtime_model["fingerprint"] = purified_status.get("fingerprint")
+                    recommended_runtime_model["model_hash"] = purified_status.get("model_hash")
+                    recommended_runtime_model["admission_status"] = purified_status.get("admission_status")
+                    recommended_runtime_model["allowed"] = purified_status.get("allowed")
+
             trusted_record_match = bool(rec and self._trusted_record_matches(rec, fp, source_hash))
+            if trusted_record_match:
+                trusted_purification = self._trusted_record_purification_report(rec)
+                if trusted_purification is not None:
+                    last_purification = trusted_purification
+                    purification_job = None
             trusted_context = self._trusted_record_context(rec) if trusted_record_match else {}
             security_metrics = (
                 dict(trusted_context.get("security_metrics") or {})
@@ -517,6 +634,13 @@ class ModelSecurityService:
                 "blocking_reason": reason,
                 "scanning": scanning,
                 "purifying": purifying,
+                "can_scan": can_scan,
+                "can_purify": can_purify,
+                "recommended_runtime_model": recommended_runtime_model,
+                "last_scan_job": scan_job,
+                "last_purification_job": purification_job,
+                "last_scan_completed": bool(scan_job and scan_job.get("state") == "completed"),
+                "last_purification_completed": bool(purification_job and purification_job.get("state") == "completed"),
                 "fingerprint": fp.fingerprint,
                 "model_hash": fp.model_hash,
                 "model_path": fp.model_path,
@@ -602,13 +726,8 @@ class ModelSecurityService:
         if not purified_path.exists() or not purified_path.is_file() or purified_path.suffix.lower() not in {".pt", ".pth"}:
             return None
 
-        runtime_model = {
-            "enabled": True,
-            "path": str(purified_path),
-            "backend": "pytorch",
-            "model_family": fp.model_family or "auto",
-            "source_pt_path": str(purified_path),
-        }
+        runtime_model = self._runtime_model_for_purified_path(purified_path, fp)
+        runtime_model.pop("status", None)
         purified_status = self.admission_status(profile=profile, custom_model=runtime_model)
         if not bool(purified_status.get("allowed", False)):
             return None
@@ -821,6 +940,15 @@ class ModelSecurityService:
         report = self._write_report(report)
         with self._lock:
             self._last_report = report
+            self._last_scan_job = {
+                "state": "completed",
+                "scan_type": scan_type,
+                "fingerprint": fp.fingerprint,
+                "status": report.status,
+                "risk_score": report.risk_score,
+                "report_path": report.report_path,
+                "completed_at": report.completed_at,
+            }
         self._log_event(
             "scan_completed",
             status=report.status,
@@ -849,6 +977,13 @@ class ModelSecurityService:
         target_fp = self.current_fingerprint(profile=profile, custom_model=custom_model)
         self._scan_target_fingerprint = target_fp.fingerprint
         should_auto_purify = scan_type == "full" if auto_purify is None else bool(auto_purify)
+        with self._lock:
+            self._last_scan_job = {
+                "state": "running",
+                "scan_type": scan_type,
+                "fingerprint": target_fp.fingerprint,
+                "started_at": now_iso(),
+            }
 
         def worker() -> None:
             try:
@@ -877,6 +1012,14 @@ class ModelSecurityService:
                         self._purify_target_fingerprint = None
             except Exception as exc:  # pragma: no cover - surfaced via status
                 self._last_error = str(exc)
+                with self._lock:
+                    self._last_scan_job = {
+                        "state": "failed",
+                        "scan_type": scan_type,
+                        "fingerprint": target_fp.fingerprint,
+                        "error": str(exc),
+                        "completed_at": now_iso(),
+                    }
                 self._log_event("scan_failed", status="error", message=str(exc), scan_type=scan_type, fingerprint=target_fp.fingerprint)
 
         self._scan_thread = threading.Thread(target=worker, name="model-security-scan", daemon=True)
@@ -908,6 +1051,13 @@ class ModelSecurityService:
             source_pt_path=str(source_pt) if source_pt else None,
             scan_after=bool(scan_after),
         )
+        with self._lock:
+            self._last_purification_job = {
+                "state": "running",
+                "fingerprint": fp.fingerprint,
+                "source_pt_path": str(source_pt) if source_pt else None,
+                "started_at": now_iso(),
+            }
         report = run_new_purification(
             fp=fp,
             config=cfg,
@@ -932,6 +1082,11 @@ class ModelSecurityService:
                 candidate_path = Path(str(raw_path))
                 if candidate_path not in candidate_paths:
                     candidate_paths.append(candidate_path)
+            candidates_by_path = {
+                str(Path(str(candidate.get("output_model")))): candidate
+                for candidate in report.candidates
+                if isinstance(candidate, dict) and candidate.get("output_model")
+            }
             candidate_scan_results: list[dict[str, Any]] = []
             try:
                 assets = self._validation_assets(cfg)
@@ -950,16 +1105,24 @@ class ModelSecurityService:
                         continue
                     purified_cfg = self._purified_pt_runtime_config(cfg, candidate_path, fp)
                     purified_fp = build_model_fingerprint(purified_cfg, root=self.root)
-                    scan_report = full_scan(
-                        purified_fp,
-                        budget=ScanBudget(),
-                        cache_dir=self.storage.activation_cache_dir,
-                        source_model_path=candidate_path,
-                        validation_assets=assets,
-                        runtime_config=purified_cfg,
-                        project_root=self.root,
-                        report_dir=self.storage.reports_dir,
+                    scan_budget = ScanBudget()
+                    scan_report = self._strict_candidate_report(
+                        fp=purified_fp,
+                        candidate_path=candidate_path,
+                        candidate=candidates_by_path.get(str(candidate_path), {}),
+                        budget=scan_budget,
                     )
+                    if scan_report is None:
+                        scan_report = full_scan(
+                            purified_fp,
+                            budget=scan_budget,
+                            cache_dir=self.storage.activation_cache_dir,
+                            source_model_path=candidate_path,
+                            validation_assets=assets,
+                            runtime_config=purified_cfg,
+                            project_root=self.root,
+                            report_dir=self.storage.reports_dir,
+                        )
                     scan_report = self._write_report(scan_report)
                     with self._lock:
                         self._last_report = scan_report
@@ -985,6 +1148,7 @@ class ModelSecurityService:
                     report.scan_report_path = accepted_scan_report.report_path
                     report.scan_status = accepted_scan_report.status
                     report.status = "scan_clean_trusted"
+                    report = self._write_purification_report(report)
                     self.registry.mark_trusted(
                         accepted_fp.fingerprint,
                         risk_score=accepted_scan_report.risk_score,
@@ -1029,6 +1193,17 @@ class ModelSecurityService:
         report = self._write_purification_report(report)
         with self._lock:
             self._last_purification_report = report
+            self._last_purification_job = {
+                "state": "completed",
+                "fingerprint": fp.fingerprint,
+                "status": report.status,
+                "scan_status": report.scan_status,
+                "purified_model_path": report.purified_model_path,
+                "purification_report_path": report.report_path,
+                "scan_report_path": report.scan_report_path,
+                "completed_at": report.completed_at,
+                "error": report.error,
+            }
         self._log_event(
             "purification_completed",
             status=report.status,
@@ -1047,12 +1222,26 @@ class ModelSecurityService:
         if self._is_purifying(target_fp.fingerprint):
             return {"started": False, "reason": "purification_already_running"}
         self._purify_target_fingerprint = target_fp.fingerprint
+        with self._lock:
+            self._last_purification_job = {
+                "state": "running",
+                "fingerprint": target_fp.fingerprint,
+                "started_at": now_iso(),
+                "scan_after": bool(scan_after),
+            }
 
         def worker() -> None:
             try:
                 self.purify(profile=profile, custom_model=custom_model, scan_after=scan_after)
             except Exception as exc:  # pragma: no cover - surfaced via status
                 self._last_error = str(exc)
+                with self._lock:
+                    self._last_purification_job = {
+                        "state": "failed",
+                        "fingerprint": target_fp.fingerprint,
+                        "error": str(exc),
+                        "completed_at": now_iso(),
+                    }
                 self._log_event("purification_failed", status="error", message=str(exc), fingerprint=target_fp.fingerprint)
             finally:
                 self._purify_target_fingerprint = None
@@ -1129,6 +1318,27 @@ class ModelSecurityService:
                     pass
         return {"status": "missing", "message": "No model security report is available yet."}
 
+    def _load_json_report_path(self, path: str | None) -> dict[str, Any] | None:
+        if not path:
+            return None
+        try:
+            report_path = Path(path).resolve()
+            reports_dir = self.storage.reports_dir.resolve()
+            if reports_dir not in (report_path, *report_path.parents):
+                return None
+            if not report_path.exists() or not report_path.is_file():
+                return None
+            return json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def current_report(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> dict[str, Any]:
+        status = self.status(profile=profile, custom_model=custom_model)
+        return self._load_json_report_path(status.get("report_path")) or {
+            "status": "missing",
+            "message": "No model security report is available for the current model.",
+        }
+
     def latest_purification_report(self) -> dict[str, Any]:
         if self._last_purification_report:
             return self._last_purification_report.to_dict()
@@ -1137,3 +1347,10 @@ class ModelSecurityService:
             if report:
                 return report.to_dict()
         return {"status": "missing", "message": "No model purification report is available yet."}
+
+    def current_purification_report(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> dict[str, Any]:
+        status = self.status(profile=profile, custom_model=custom_model)
+        return self._load_json_report_path(status.get("purification_report_path")) or {
+            "status": "missing",
+            "message": "No model purification report is available for the current model.",
+        }

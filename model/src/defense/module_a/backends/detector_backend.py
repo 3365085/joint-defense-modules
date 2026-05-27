@@ -66,6 +66,7 @@ class UltralyticsDetectorBackend:
         device: str = "cuda:0",
         half: bool = True,
         confidence: float = 0.25,
+        candidate_confidence: float | None = None,
         image_size: int = 640,
     ):
         from ultralytics import YOLO
@@ -75,6 +76,9 @@ class UltralyticsDetectorBackend:
         self.device = str(device)
         self.half = bool(half)
         self.confidence = float(confidence)
+        self.candidate_confidence = (
+            float(candidate_confidence) if candidate_confidence is not None else None
+        )
         self.image_size = int(image_size)
         self.model = YOLO(str(self.artifact_path))
         self.names = self._normalize_names(getattr(self.model, "names", {}))
@@ -86,7 +90,7 @@ class UltralyticsDetectorBackend:
         started = time.perf_counter()
         kwargs: dict[str, Any] = {
             "verbose": False,
-            "conf": self.confidence,
+            "conf": self._prediction_confidence(),
             "imgsz": self.image_size,
         }
         if self.backend == "pytorch":
@@ -135,6 +139,13 @@ class UltralyticsDetectorBackend:
             return {idx: str(name) for idx, name in enumerate(names)}
         return {}
 
+    def _prediction_confidence(self) -> float:
+        if self.candidate_confidence is None:
+            return self.confidence
+        if not _is_head_helmet_only_names(self.names):
+            return self.confidence
+        return min(self.confidence, self.candidate_confidence)
+
 
 class YoloV5DetectorBackend:
     """Detector backend for original YOLOv5 PyTorch, ONNX, and TensorRT exports."""
@@ -146,6 +157,7 @@ class YoloV5DetectorBackend:
         device: str = "cuda:0",
         half: bool = True,
         confidence: float = 0.25,
+        candidate_confidence: float | None = None,
         image_size: int = 640,
     ):
         import torch
@@ -155,6 +167,9 @@ class YoloV5DetectorBackend:
         self.device = str(device)
         self.half = bool(half)
         self.confidence = float(confidence)
+        self.candidate_confidence = (
+            float(candidate_confidence) if candidate_confidence is not None else None
+        )
         self.image_size = int(image_size)
         self.names = {0: "helmet", 1: "head", 2: "person"}
         self.torch = torch
@@ -258,7 +273,7 @@ class YoloV5DetectorBackend:
         )
         self._non_max_suppression(
             dummy,
-            conf_thres=min(self.confidence, 0.25),
+            conf_thres=min(self._prediction_confidence(), 0.25),
             iou_thres=0.7,
             max_det=10,
         )
@@ -297,7 +312,7 @@ class YoloV5DetectorBackend:
 
         det = self._non_max_suppression(
             pred.float(),
-            conf_thres=self.confidence,
+            conf_thres=self._prediction_confidence(),
             iou_thres=0.7,
             max_det=100,
         )[0]
@@ -332,6 +347,13 @@ class YoloV5DetectorBackend:
         tensor = self.torch.from_numpy(rgb).permute(2, 0, 1).contiguous().to(self.device)
         tensor = tensor.half() if self.half and self.device.startswith("cuda") else tensor.float()
         return tensor.unsqueeze(0).div(255.0)
+
+    def _prediction_confidence(self) -> float:
+        if self.candidate_confidence is None:
+            return self.confidence
+        if not _is_head_helmet_only_names(self.names):
+            return self.confidence
+        return min(self.confidence, self.candidate_confidence)
 
     def _predict_tensorrt(self, batch: Any) -> Any:
         if (
@@ -523,13 +545,23 @@ def create_detector_backend(
 
     artifact_path = resolve_detector_artifact(project_root, candidates, backend)
     family = str(inference.get("model_family", inference.get("family", "ultralytics"))).lower()
+    confidence = float(inference.get("confidence", 0.25))
+    ppe_config = config.get("ppe_tracking", {}) if isinstance(config.get("ppe_tracking"), dict) else {}
+    candidate_confidence_value = inference.get(
+        "candidate_confidence",
+        ppe_config.get("temporal_candidate_min_confidence"),
+    )
+    candidate_confidence = (
+        float(candidate_confidence_value) if candidate_confidence_value is not None else None
+    )
     if family == "yolov5":
         return YoloV5DetectorBackend(
             artifact_path=artifact_path,
             backend=backend,
             device=str(inference.get("device", config.get("module_a", {}).get("device", "cuda:0"))),
             half=bool(inference.get("half", True)),
-            confidence=float(inference.get("confidence", 0.25)),
+            confidence=confidence,
+            candidate_confidence=candidate_confidence,
             image_size=int(
                 inference.get("image_size", config.get("module_a", {}).get("frame_size", 640))
             ),
@@ -539,11 +571,24 @@ def create_detector_backend(
         backend=backend,
         device=str(inference.get("device", config.get("module_a", {}).get("device", "cuda:0"))),
         half=bool(inference.get("half", True)),
-        confidence=float(inference.get("confidence", 0.25)),
+        confidence=confidence,
+        candidate_confidence=candidate_confidence,
         image_size=int(
             inference.get("image_size", config.get("module_a", {}).get("frame_size", 640))
         ),
     )
+
+
+def _is_head_helmet_only_names(names: dict[int, str]) -> bool:
+    labels = {str(name or "").strip().lower().replace("-", "_") for name in names.values()}
+    has_head = any("head" in label for label in labels)
+    has_helmet = any(
+        "helmet" in label or "hard_hat" in label or "hardhat" in label for label in labels
+    )
+    has_person = any(
+        "person" in label or "worker" in label or "human" in label for label in labels
+    )
+    return has_head and has_helmet and not has_person
 
 
 def _release_torch_cuda_cache() -> None:

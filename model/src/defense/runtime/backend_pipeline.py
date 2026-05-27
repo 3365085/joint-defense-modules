@@ -61,7 +61,7 @@ class PreviewBus:
                 if remaining <= 0:
                     break
                 self.condition.wait(timeout=min(0.05, remaining))
-            if self.closed and self.latest_seq <= last_seq:
+            if self.latest is None or self.latest_seq <= last_seq:
                 return None
             return self.latest
 

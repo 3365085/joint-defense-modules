@@ -137,7 +137,8 @@ def enrich_status(status: dict[str, Any]) -> dict[str, Any]:
     out["recent_ppe_events"] = recent_ppe_events
     out["recent_source_auth_events"] = recent_source_events
     out["alert_event_count"] = int(out.get("alert_event_count") or len(recent_events))
-    out["ppe_event_count"] = int(out.get("ppe_event_count") or len(recent_ppe_events))
+    active_ppe = 1 if out.get("ppe_event_active") else 0
+    out["ppe_event_count"] = int(out.get("ppe_event_count") or (len(recent_ppe_events) + active_ppe))
     active_a3b = 1 if out.get("a3b_triggered") else 0
     out["source_event_count"] = int(out.get("source_event_count") or (len(recent_source_events) + active_a3b))
     out.setdefault("realtime", True)

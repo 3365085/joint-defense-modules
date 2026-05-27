@@ -340,6 +340,36 @@ def create_app(
             )
         timeout = float(payload.get("ready_timeout_s", 45.0) or 45.0)
         status_payload = engine.wait_ready_for_preview(run_id, timeout=timeout)
+        status_error = str(status_payload.get("error") or "").strip()
+        if status_error:
+            return _json(
+                {
+                    "ok": False,
+                    "run_id": run_id,
+                    "error": "runtime_start_failed",
+                    "message": status_error,
+                    "status": enrich_status(status_payload),
+                    "model_security": admission,
+                    "model_security_runtime_replacement": start_runtime_replacement,
+                },
+                status_code=500,
+            )
+        if not bool(status_payload.get("ready_for_preview")):
+            still_starting = bool(status_payload.get("running")) and (
+                bool(status_payload.get("initializing")) or bool(status_payload.get("prewarming"))
+            )
+            return _json(
+                {
+                    "ok": False,
+                    "run_id": run_id,
+                    "error": "runtime_start_timeout" if still_starting else "runtime_start_failed",
+                    "message": "preview did not become ready",
+                    "status": enrich_status(status_payload),
+                    "model_security": admission,
+                    "model_security_runtime_replacement": start_runtime_replacement,
+                },
+                status_code=504 if still_starting else 500,
+            )
         return _json(
             {
                 "ok": True,
@@ -367,7 +397,10 @@ def create_app(
         action = str(payload.get("action") or payload.get("command") or "")
         payload.pop("action", None)
         payload.pop("command", None)
-        status_payload = _engine(request.app).control_run(run_id, action, **payload)
+        try:
+            status_payload = _engine(request.app).control_run(run_id, action, **payload)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _json({"ok": True, "status": enrich_status(status_payload)})
 
     @app.get("/api/runs/{run_id}/overlay")
@@ -382,9 +415,13 @@ def create_app(
         last_seq = 0
         while int(run_id) == int(engine.run_id):
             seq, jpeg, running = engine.wait_latest_jpeg(last_seq, timeout=0.8)
+            if int(run_id) != int(engine.run_id):
+                break
             if jpeg is None:
                 if not running:
                     break
+                continue
+            if seq <= last_seq:
                 continue
             last_seq = seq
             yield b"--frame\r\n"
@@ -517,7 +554,7 @@ def create_app(
         profile = normalize_profile(payload.get("profile", "default"))
         custom_model = payload.get("custom_model") or {}
         current_security = _model_security(request.app).status(profile=profile, custom_model=custom_model)
-        if current_security.get("admission_status") != "suspicious":
+        if not bool(current_security.get("can_purify", False)):
             return _json(
                 {
                     "ok": False,
@@ -549,12 +586,56 @@ def create_app(
     @app.get("/api/model-security/report")
     async def model_security_report(request: Request) -> JSONResponse:
         require_http_access(request)
-        return _json({"ok": True, "report": _model_security(request.app).latest_report()})
+        profile = normalize_profile(request.query_params.get("profile", "default"))
+        svc = _model_security(request.app)
+        if hasattr(svc, "current_report"):
+            report = svc.current_report(profile=profile)
+        else:
+            report = svc.latest_report()
+        return _json({"ok": True, "report": report})
+
+    @app.post("/api/model-security/report")
+    async def model_security_report_for_model(request: Request) -> JSONResponse:
+        require_http_access(request)
+        payload = await _body(request)
+        profile = normalize_profile(payload.get("profile", "default"))
+        custom_model = payload.get("custom_model") or {}
+        return _json(
+            {
+                "ok": True,
+                "report": _model_security(request.app).current_report(
+                    profile=profile,
+                    custom_model=custom_model,
+                ),
+            }
+        )
 
     @app.get("/api/model-security/purification-report")
     async def model_security_purification_report(request: Request) -> JSONResponse:
         require_http_access(request)
-        return _json({"ok": True, "report": _model_security(request.app).latest_purification_report()})
+        profile = normalize_profile(request.query_params.get("profile", "default"))
+        svc = _model_security(request.app)
+        if hasattr(svc, "current_purification_report"):
+            report = svc.current_purification_report(profile=profile)
+        else:
+            report = svc.latest_purification_report()
+        return _json({"ok": True, "report": report})
+
+    @app.post("/api/model-security/purification-report")
+    async def model_security_purification_report_for_model(request: Request) -> JSONResponse:
+        require_http_access(request)
+        payload = await _body(request)
+        profile = normalize_profile(payload.get("profile", "default"))
+        custom_model = payload.get("custom_model") or {}
+        return _json(
+            {
+                "ok": True,
+                "report": _model_security(request.app).current_purification_report(
+                    profile=profile,
+                    custom_model=custom_model,
+                ),
+            }
+        )
 
     @app.get("/api/model-security/logs")
     async def model_security_logs(request: Request, limit: int = 80) -> JSONResponse:

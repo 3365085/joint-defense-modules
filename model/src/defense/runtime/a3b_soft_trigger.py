@@ -291,6 +291,13 @@ class A3BSoftTriggerState:
                 "held_trigger": bool(held_trigger),
                 "trigger_hold_remaining": int(self.trigger_hold_remaining),
                 "blocking_failed_gates": list(blocking_failed_gates),
+                "thresholds": {
+                    "observed_threshold": float(cfg.observed_threshold),
+                    "trigger_threshold": float(cfg.trigger_threshold),
+                    "strong_single_frame_threshold": float(cfg.strong_single_frame_threshold),
+                    "observed_only_warning_threshold": float(cfg.observed_only_warning_threshold),
+                    "observed_only_track_threshold": float(cfg.observed_only_track_threshold),
+                },
                 "state": state,
             }
         )

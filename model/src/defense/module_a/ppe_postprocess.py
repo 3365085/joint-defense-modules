@@ -12,6 +12,7 @@ BARE_HEAD_HINTS = ("head", "no_helmet", "without_helmet", "bare_head")
 @dataclass(frozen=True, slots=True)
 class PPEPostprocessConfig:
     min_confidence: float = 0.25
+    candidate_min_confidence: float | None = None
     overlap_iou: float = 0.55
     helmet_head_margin: float = 0.12
     min_direct_helmet_conf: float = 0.55
@@ -291,19 +292,84 @@ def suppress_helmet_false_positives(
     }
 
 
+def _add_low_confidence_temporal_candidates(
+    suppression: dict[str, Any],
+    *,
+    all_items: Iterable[PPEDetection],
+    config: PPEPostprocessConfig,
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    candidate_min = config.candidate_min_confidence
+    if candidate_min is None:
+        return suppression
+    if candidate_min >= config.min_confidence:
+        return suppression
+    if capabilities.get("has_person_class"):
+        return suppression
+
+    out = dict(suppression)
+    weak_heads = {int(v) for v in out.get("weak_head_indices", []) or []}
+    weak_helmets = {int(v) for v in out.get("weak_helmet_indices", []) or []}
+    suppressed_heads = list(out.get("suppressed_heads", []) or [])
+    suppressed_helmets = list(out.get("suppressed_helmets", []) or [])
+    low_head_count = 0
+    low_helmet_count = 0
+
+    for item in all_items:
+        if item.confidence < candidate_min or item.confidence >= config.min_confidence:
+            continue
+        if is_bare_head_label(item.label):
+            weak_heads.add(item.index)
+            low_head_count += 1
+            suppressed_heads.append(
+                {
+                    "head_index": item.index,
+                    "head_confidence": item.confidence,
+                    "head_bbox": list(item.bbox) if item.bbox else None,
+                    "reason": "low_conf_temporal_candidate",
+                }
+            )
+        elif is_helmet_label(item.label):
+            weak_helmets.add(item.index)
+            low_helmet_count += 1
+            suppressed_helmets.append(
+                {
+                    "helmet_index": item.index,
+                    "helmet_confidence": item.confidence,
+                    "helmet_bbox": list(item.bbox) if item.bbox else None,
+                    "reason": "low_conf_temporal_candidate",
+                }
+            )
+
+    out["weak_head_indices"] = sorted(weak_heads)
+    out["weak_helmet_indices"] = sorted(weak_helmets)
+    out["suppressed_heads"] = suppressed_heads
+    out["suppressed_helmets"] = suppressed_helmets
+    out["low_conf_temporal_head_count"] = low_head_count
+    out["low_conf_temporal_helmet_count"] = low_helmet_count
+    return out
+
+
 def summarize_ppe_from_detections(
     detections: Any,
     config: PPEPostprocessConfig | None = None,
     frame_shape: tuple[int, int] | tuple[int, int, int] | None = None,
 ) -> dict[str, Any]:
     cfg = config or PPEPostprocessConfig()
-    items = [item for item in extract_ppe_detections(detections) if item.confidence >= cfg.min_confidence]
-    capabilities = infer_ppe_model_capabilities(detections, items)
+    all_items = extract_ppe_detections(detections)
+    items = [item for item in all_items if item.confidence >= cfg.min_confidence]
+    capabilities = infer_ppe_model_capabilities(detections, all_items)
     suppression = suppress_helmet_false_positives(
         items,
         cfg,
         frame_shape=frame_shape,
         has_person_class=bool(capabilities["has_person_class"]),
+    )
+    suppression = _add_low_confidence_temporal_candidates(
+        suppression,
+        all_items=all_items,
+        config=cfg,
+        capabilities=capabilities,
     )
     kept_helmets = set(suppression["kept_helmet_indices"])
 
@@ -311,11 +377,13 @@ def summarize_ppe_from_detections(
     helmet_count = 0
     raw_helmet_count = 0
     raw_head_count = 0
+    max_head_confidence = 0.0
     class_counts: dict[str, int] = {}
     for item in items:
         class_counts[item.label] = class_counts.get(item.label, 0) + 1
         if is_bare_head_label(item.label):
             raw_head_count += 1
+            max_head_confidence = max(max_head_confidence, float(item.confidence))
         elif is_helmet_label(item.label):
             raw_helmet_count += 1
             if item.index in kept_helmets:
@@ -328,6 +396,8 @@ def summarize_ppe_from_detections(
     candidate = head_count > 0
     suppressed_head_count = len(suppression.get("weak_head_indices", []) or [])
     weak_helmet_count = len(suppression.get("weak_helmet_indices", []) or [])
+    low_conf_head_count = int(suppression.get("low_conf_temporal_head_count", 0) or 0)
+    low_conf_helmet_count = int(suppression.get("low_conf_temporal_helmet_count", 0) or 0)
     inferred_person_count = max(
         person_count,
         1 if (raw_head_count > 0 or raw_helmet_count > 0 or helmet_count > 0) else 0,
@@ -346,7 +416,9 @@ def summarize_ppe_from_detections(
         reason = "helmet_evidence_present"
     elif uncertain:
         reason = (
-            "isolated_head_evidence_uncertain"
+            "low_conf_head_temporal_candidate"
+            if low_conf_head_count > 0
+            else "isolated_head_evidence_uncertain"
             if suppressed_head_count > 0
             else "person_context_without_head_or_helmet_evidence"
         )
@@ -363,9 +435,12 @@ def summarize_ppe_from_detections(
         "helmet_count": helmet_count,
         "raw_helmet_count": raw_helmet_count,
         "weak_helmet_count": weak_helmet_count,
+        "low_conf_temporal_head_count": low_conf_head_count,
+        "low_conf_temporal_helmet_count": low_conf_helmet_count,
         "promoted_helmet_count": 0,
         "effective_helmet_count": helmet_count,
         "raw_head_count": raw_head_count,
+        "max_head_confidence": max_head_confidence,
         "weak_head_count": suppressed_head_count,
         "promoted_head_count": 0,
         "effective_head_count": head_count,

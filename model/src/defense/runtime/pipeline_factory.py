@@ -126,6 +126,7 @@ class PipelineCache:
         key = (
             str(profile or "default"),
             bool((feature_options or {}).get("static_image_enabled", True)),
+            str((feature_options or {}).get("a3b_sensitivity") or "balanced"),
             bool(normalized_custom.get("enabled", False)),
             str(normalized_custom.get("path", "")),
             str(normalized_custom.get("backend", "auto")),

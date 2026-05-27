@@ -259,7 +259,11 @@ class PPEDisplayTracker:
         self._age_unmatched()
         self._prune_tracks()
         self.tracks = self._remove_shadow_tracks(self.tracks, frame_shape)
-        self.tracks = self._filter_low_context_display_tracks(self.tracks, frame_shape)
+        self.tracks = self._filter_low_context_display_tracks(
+            self.tracks,
+            frame_shape,
+            max_render_misses=max_render_misses,
+        )
         self._refresh_temporal_promotions(frame_shape)
         return [track.as_dict() for track in self._render_tracks(max_misses=max_render_misses)]
 
@@ -458,6 +462,7 @@ class PPEDisplayTracker:
                 "weak_head_conf_sum": float(item["confidence"]) if item.get("weak_evidence_label") == "head" else 0.0,
                 "weak_helmet_conf_sum": float(item["confidence"]) if item.get("weak_evidence_label") == "helmet" else 0.0,
                 "temporal_promoted_label": None,
+                "hold_after_temporal_promotion": False,
                 "source": "detected",
                 "_matched": True,
             }
@@ -479,7 +484,10 @@ class PPEDisplayTracker:
         track["misses"] = 0
         track["is_small"] = bool(item["is_small"])
         track["area_ratio"] = float(item.get("area_ratio", track.get("area_ratio", 0.0)))
-        track["hold_eligible"] = bool(item.get("hold_eligible", True))
+        next_hold_eligible = bool(item.get("hold_eligible", True))
+        if not next_hold_eligible and int(track.get("age", 0) or 0) >= self.weak_promotion_hits:
+            next_hold_eligible = bool(track.get("hold_eligible", True))
+        track["hold_eligible"] = next_hold_eligible
         track["current_weak_label"] = str(item.get("weak_evidence_label") or "")
         track["weak_reason"] = str(item.get("weak_reason") or "")
         track["source"] = "detected"
@@ -524,20 +532,25 @@ class PPEDisplayTracker:
         for track in self.tracks:
             confidence = float(track.get("confidence", 0.0))
             misses = int(track.get("misses", 0))
+            label = str(track.get("stable_label"))
+            held_within_render_cap = False
             if misses > 0:
                 if not self.show_held_boxes:
                     continue
-                if not bool(track.get("hold_eligible", True)):
+                if not bool(track.get("hold_eligible", True)) and not bool(
+                    track.get("hold_after_temporal_promotion", False)
+                ):
                     continue
                 if max_misses is not None and misses > max(0, int(max_misses)):
                     continue
-            if confidence < (0.14 if track.get("is_small") else 0.18):
+                held_within_render_cap = max_misses is not None and label in {"head", "helmet"}
+            if not held_within_render_cap and confidence < (0.14 if track.get("is_small") else 0.18):
                 continue
             rendered.append(
                 StableTrack(
                     track_id=int(track["id"]),
                     box=list(track["box"]),
-                    label=str(track["stable_label"]),
+                    label=label,
                     confidence=confidence,
                     misses=misses,
                     age=int(track.get("age", 0)),
@@ -583,12 +596,24 @@ class PPEDisplayTracker:
         self,
         tracks: list[dict[str, Any]],
         frame_shape: tuple[int, int] | tuple[int, int, int],
+        *,
+        max_render_misses: int | None = None,
     ) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
         context_tracks = [track for track in tracks if str(track.get("stable_label", "")) in {"head", "person"}]
         for track in tracks:
             label = str(track.get("stable_label", ""))
             confidence = float(track.get("confidence", 0.0))
+            misses = int(track.get("misses", 0) or 0)
+            if (
+                max_render_misses is not None
+                and misses > 0
+                and misses <= max(0, int(max_render_misses))
+                and label in {"head", "helmet"}
+                and (bool(track.get("hold_eligible", True)) or bool(track.get("hold_after_temporal_promotion", False)))
+            ):
+                filtered.append(track)
+                continue
             if label == "helmet" and confidence < (0.30 if track.get("is_small") else 0.38):
                 if str(track.get("current_weak_label") or "") == "helmet":
                     filtered.append(track)
@@ -735,6 +760,7 @@ class PPEDisplayTracker:
         ]
         for track in promoted_helmets:
             track["temporal_promoted_label"] = "helmet"
+            track["hold_after_temporal_promotion"] = True
         helmet_blockers = [
             track
             for track in helmets
@@ -748,6 +774,7 @@ class PPEDisplayTracker:
             if any(self._same_head_zone(track, helmet, frame_shape) for helmet in helmet_blockers):
                 continue
             track["temporal_promoted_label"] = "head"
+            track["hold_after_temporal_promotion"] = True
 
     def _current_temporal_promotions(
         self,

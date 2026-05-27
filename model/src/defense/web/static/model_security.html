@@ -206,14 +206,7 @@
           <div id="configPill" class="pill">未保存</div>
         </div>
         <div class="content">
-          <div class="notice">这里决定A模块即将运行的模型。保存后，监控台开始检测会读取这份配置；B模块扫描、准入和白名单也按同一份配置判断。</div>
-          <label>运行档位
-            <select id="profileSelect">
-              <option value="desktop_rtx">全速GPU（TensorRT）</option>
-              <option value="desktop_debug_onnx">均衡GPU（ONNX调试）</option>
-              <option value="edge_fast">边缘ONNX（兼容）</option>
-            </select>
-          </label>
+          <div class="notice">这里决定A模块即将运行的模型。配置变更会立即应用；陌生模型不会被直接放行，开始检测或手动扫描时会触发B模块准入流程。</div>
           <label class="checkLine"><input id="enableCustomModel" type="checkbox" />使用自定义模型</label>
           <label>自定义模型路径</label>
           <div class="fieldRow">
@@ -225,30 +218,17 @@
             <input id="sourcePtPath" placeholder="选择与加速模型同源的 .pt 文件" />
             <button id="browseSourcePtBtn" type="button" style="width:auto;">浏览PT</button>
           </div>
-          <div class="grid2">
-            <label>运行后端
-              <select id="customModelBackend">
-                <option value="auto">自动识别</option>
-                <option value="tensorrt">TensorRT（.engine）</option>
-                <option value="onnx">ONNX</option>
-                <option value="pytorch">PyTorch（.pt）</option>
-              </select>
-            </label>
-            <label>模型族
-              <select id="customModelFamily">
-                <option value="auto">自动识别</option>
-                <option value="ultralytics">Ultralytics / YOLOv8</option>
-                <option value="yolov5">YOLOv5</option>
-              </select>
-            </label>
-          </div>
-          <div class="notice">TensorRT 表示使用已导出的 .engine 加速运行；B模块准入仍以同源原始 PT 为依据。未知模型必须先完成安全扫描，不能只靠路径或手工选择放行。</div>
+          <label>模型族
+            <select id="customModelFamily">
+              <option value="auto">自动识别</option>
+              <option value="ultralytics">Ultralytics / YOLOv8</option>
+              <option value="yolov5">YOLOv5</option>
+            </select>
+          </label>
+          <div class="notice">运行后端由模型格式决定：.engine 走 TensorRT，.onnx 走 ONNX，.pt/.pth 走 PyTorch；B模块准入仍以原始 PT 或净化后 PT 为依据。</div>
           <label class="checkLine"><input id="testBypassModelSecurity" type="checkbox" />测试入口：绕过B模块安全准入直接运行当前模型</label>
           <div class="notice warn">仅用于当前阶段对比毒模型、原模型和净化模型检测效果；不会写入白名单，禁止生产使用。</div>
-          <div class="grid2">
-            <button id="saveModelConfigBtn" class="primary" type="button">保存并应用</button>
-            <button id="resetModelConfigBtn" type="button">恢复默认模型</button>
-          </div>
+          <button id="resetModelConfigBtn" type="button">恢复默认模型</button>
           <div id="modelConfigMessage" class="field"></div>
         </div>
       </section>
@@ -270,17 +250,7 @@
             <div class="metric"><b id="purifiedAsr">--</b><span>净化后ASR</span></div>
             <div class="metric"><b id="purifiedWilson">--</b><span>净化后Wilson上界</span></div>
           </div>
-          <div class="grid2">
-            <div class="field"><strong>运行档位：</strong><span id="profileText">全速GPU（默认加速模型）</span></div>
-            <label>自动刷新
-              <select id="refreshSelect">
-                <option value="1500" selected>1.5秒</option>
-                <option value="3000">3秒</option>
-                <option value="0">关闭</option>
-              </select>
-            </label>
-          </div>
-          <div class="notice">检测运行档位以上方运行模型配置为准；TensorRT 代表 .engine 加速运行链路，不是空壳开关。未知模型必须先用原始 PT 做 B 模块准入。</div>
+          <div class="notice">安全页只在打开、手动刷新、配置变更或任务操作后更新状态；扫描和净化进度会写入日志页。</div>
           <div class="stack">
             <div class="field"><strong>运行模型：</strong><code id="runtimePath">--</code></div>
             <div class="field"><strong>源PT：</strong><code id="sourcePtStatusPath">--</code></div>
@@ -358,14 +328,11 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
-    let lastModelSecurity = {};
-    let refreshTimer = null;
     const DEFAULT_RUNTIME_PROFILE = "desktop_rtx";
-    const profileLabels = {
-      desktop_rtx: "全速GPU（TensorRT）",
-      desktop_debug_onnx: "均衡GPU（ONNX调试）",
-      edge_fast: "边缘ONNX（兼容）",
-    };
+    let lastModelSecurity = {};
+    let taskPollTimer = null;
+    let lastBusyState = false;
+    let taskRefreshInFlight = false;
 
     function getStored(key, fallback = "") {
       try {
@@ -380,8 +347,9 @@
       try { localStorage.setItem(key, String(value)); } catch (_) {}
     }
 
-    function profileLabel(value) {
-      return profileLabels[value] || value || "未知档位";
+    function currentRuntimeProfile() {
+      const value = getStored("moduleA.lastProfile", DEFAULT_RUNTIME_PROFILE);
+      return value || DEFAULT_RUNTIME_PROFILE;
     }
 
     function authHeaders(base = {}) {
@@ -407,17 +375,13 @@
       return data;
     }
 
-    function currentRuntimeProfile() {
-      const selected = $("profileSelect") ? $("profileSelect").value : getStored("moduleA.lastProfile", DEFAULT_RUNTIME_PROFILE);
-      return selected || DEFAULT_RUNTIME_PROFILE;
-    }
-
     function customModelOptions() {
       const enabled = $("enableCustomModel") ? $("enableCustomModel").checked : getStored("moduleA.lastCustomModelEnabled", "false") === "true";
       const path = $("customModelPath") ? $("customModelPath").value.trim() : getStored("moduleA.lastModelPath", "");
-      const backend = $("customModelBackend") ? $("customModelBackend").value : getStored("moduleA.lastCustomModelBackend", "auto");
+      const backend = "auto";
       const family = $("customModelFamily") ? $("customModelFamily").value : getStored("moduleA.lastCustomModelFamily", "auto");
-      const sourcePtPath = $("sourcePtPath") ? $("sourcePtPath").value.trim() : getStored("moduleA.lastSourcePtPath", "");
+      let sourcePtPath = $("sourcePtPath") ? $("sourcePtPath").value.trim() : getStored("moduleA.lastSourcePtPath", "");
+      if (/\.(pt|pth)$/i.test(path)) sourcePtPath = path;
       return {enabled: enabled && !!path, path, backend, model_family: family, source_pt_path: sourcePtPath};
     }
 
@@ -426,34 +390,31 @@
     }
 
     function loadModelConfig() {
-      $("profileSelect").value = getStored("moduleA.lastProfile", DEFAULT_RUNTIME_PROFILE);
       $("enableCustomModel").checked = getStored("moduleA.lastCustomModelEnabled", "false") === "true";
       $("customModelPath").value = getStored("moduleA.lastModelPath", "");
       $("sourcePtPath").value = getStored("moduleA.lastSourcePtPath", "");
-      $("customModelBackend").value = getStored("moduleA.lastCustomModelBackend", "auto");
       $("customModelFamily").value = getStored("moduleA.lastCustomModelFamily", "auto");
       $("testBypassModelSecurity").checked = modelSecurityBypassEnabled();
       syncModelConfigControls();
     }
 
     function saveModelConfig(options = {}) {
-      setStored("moduleA.lastProfile", currentRuntimeProfile());
       setStored("moduleA.lastCustomModelEnabled", $("enableCustomModel").checked ? "true" : "false");
       setStored("moduleA.lastModelPath", $("customModelPath").value.trim());
+      if (/\.(pt|pth)$/i.test($("customModelPath").value.trim())) {
+        $("sourcePtPath").value = $("customModelPath").value.trim();
+      }
       setStored("moduleA.lastSourcePtPath", $("sourcePtPath").value.trim());
-      setStored("moduleA.lastCustomModelBackend", $("customModelBackend").value || "auto");
       setStored("moduleA.lastCustomModelFamily", $("customModelFamily").value || "auto");
       setStored("moduleA.testBypassModelSecurity", $("testBypassModelSecurity").checked ? "true" : "false");
       syncModelConfigControls();
-      if (!options.silent) showConfigMessage("模型运行配置已保存。");
+      if (!options.silent) showConfigMessage("配置已应用。陌生模型会在开始检测或手动扫描时进入B模块准入。");
     }
 
     function resetModelConfig() {
-      $("profileSelect").value = DEFAULT_RUNTIME_PROFILE;
       $("enableCustomModel").checked = false;
       $("customModelPath").value = "";
       $("sourcePtPath").value = "";
-      $("customModelBackend").value = "auto";
       $("customModelFamily").value = "auto";
       $("testBypassModelSecurity").checked = false;
       saveModelConfig({silent: true});
@@ -466,11 +427,9 @@
       $("browseModelBtn").disabled = !enabled;
       $("sourcePtPath").disabled = !enabled;
       $("browseSourcePtBtn").disabled = !enabled;
-      $("customModelBackend").disabled = !enabled;
       $("customModelFamily").disabled = !enabled;
       $("configPill").textContent = enabled ? "自定义模型" : "默认模型";
       $("configPill").className = "pill " + (enabled ? "warn" : "ok");
-      $("profileText").textContent = profileLabel(currentRuntimeProfile());
     }
 
     function showConfigMessage(text) {
@@ -571,6 +530,61 @@
       $("message").textContent = text || "";
     }
 
+    function isTaskBusy(ms = lastModelSecurity) {
+      const status = (ms && (ms.admission_status || ms.status)) || "";
+      return !!(ms && (ms.scanning || ms.purifying)) || status === "scanning" || status === "purifying";
+    }
+
+    function statusAllowsPurify(ms) {
+      const status = (ms && (ms.admission_status || ms.status)) || "";
+      return status === "suspicious";
+    }
+
+    function canRunAction(ms, key, fallback) {
+      return ms && Object.prototype.hasOwnProperty.call(ms, key) ? ms[key] === true : fallback;
+    }
+
+    function rememberButtonText(button) {
+      if (!button.dataset.defaultText) button.dataset.defaultText = button.textContent;
+      return button.dataset.defaultText;
+    }
+
+    function renderActionButtons(ms, busy) {
+      const scanBtn = $("scanBtn");
+      const purifyBtn = $("purifyBtn");
+      const canScan = canRunAction(ms, "can_scan", true);
+      const canPurify = canRunAction(ms, "can_purify", statusAllowsPurify(ms));
+      scanBtn.disabled = busy || !canScan;
+      purifyBtn.disabled = busy || !canPurify;
+      scanBtn.textContent = busy ? "\u4efb\u52a1\u8fd0\u884c\u4e2d..." : rememberButtonText(scanBtn);
+      purifyBtn.textContent = busy ? "\u4efb\u52a1\u8fd0\u884c\u4e2d..." : rememberButtonText(purifyBtn);
+    }
+
+    async function refreshTaskProgress() {
+      if (taskRefreshInFlight) return;
+      taskRefreshInFlight = true;
+      try {
+        const ms = await refreshStatus();
+        await refreshLogs();
+        if (!isTaskBusy(ms)) await refreshTrust();
+      } catch (err) {
+        showMessage(err.message || String(err));
+      } finally {
+        taskRefreshInFlight = false;
+      }
+    }
+
+    function updateTaskPolling(busy) {
+      if (busy && !taskPollTimer) {
+        taskPollTimer = window.setInterval(refreshTaskProgress, 2000);
+      } else if (!busy && taskPollTimer) {
+        window.clearInterval(taskPollTimer);
+        taskPollTimer = null;
+      }
+      if (lastBusyState && !busy) window.setTimeout(() => refreshAll(), 300);
+      lastBusyState = busy;
+    }
+
     function renderStatus(ms) {
       lastModelSecurity = ms || {};
       const status = lastModelSecurity.admission_status || lastModelSecurity.status || "unknown";
@@ -621,10 +635,10 @@
         : `白名单完整性校验失败：${storeReason || lastModelSecurity.trust_store_reason || "未知原因"}。`;
       $("trustStoreNotice").className = "notice " + (lastModelSecurity.trust_store_ok ? "ok" : "bad");
 
-      const busy = !!lastModelSecurity.scanning || !!lastModelSecurity.purifying || status === "scanning" || status === "purifying";
-      $("scanBtn").disabled = busy;
-      $("purifyBtn").disabled = busy || status !== "suspicious";
+      const busy = isTaskBusy(lastModelSecurity);
+      renderActionButtons(lastModelSecurity, busy);
       $("deleteCurrentBtn").disabled = !lastModelSecurity.fingerprint || lastModelSecurity.trust_store_ok === false;
+      updateTaskPolling(busy);
     }
 
     async function refreshStatus() {
@@ -688,19 +702,8 @@
       }
     }
 
-    function schedule() {
-      clearTimeout(refreshTimer);
-      const interval = Number($("refreshSelect").value || 0);
-      if (interval > 0) {
-        refreshTimer = setTimeout(async () => {
-          await refreshAll();
-          schedule();
-        }, interval);
-      }
-    }
-
     function openJsonReport(endpoint, title) {
-      api(endpoint).then((data) => {
+      api(endpoint, {profile: currentRuntimeProfile(), custom_model: customModelOptions()}).then((data) => {
         const text = JSON.stringify(data.report || {}, null, 2);
         const w = window.open("", "_blank");
         if (w) {
@@ -722,16 +725,17 @@
     $("backBtn").onclick = () => { window.location.href = "/"; };
     $("refreshBtn").onclick = refreshAll;
     $("refreshLogsBtn").onclick = refreshLogs;
-    $("refreshSelect").onchange = schedule;
+    async function applyModelConfigChange(message = "配置已应用。") {
+      saveModelConfig({silent: true});
+      showConfigMessage(message);
+      await refreshStatus().catch((err) => showConfigMessage(err.message || String(err)));
+    }
     $("enableCustomModel").onchange = () => {
       syncModelConfigControls();
-      showConfigMessage("配置已修改，保存后监控台会使用新模型。");
+      applyModelConfigChange();
     };
-    ["profileSelect", "customModelPath", "sourcePtPath", "customModelBackend", "customModelFamily", "testBypassModelSecurity"].forEach((id) => {
-      $(id).onchange = () => {
-        syncModelConfigControls();
-        showConfigMessage("配置已修改，保存后监控台会使用新模型。");
-      };
+    ["customModelPath", "sourcePtPath", "customModelFamily", "testBypassModelSecurity"].forEach((id) => {
+      $(id).onchange = () => applyModelConfigChange();
     });
     $("browseModelBtn").onclick = async () => {
       $("browseModelBtn").disabled = true;
@@ -741,7 +745,7 @@
           $("customModelPath").value = data.path;
           $("enableCustomModel").checked = true;
           syncModelConfigControls();
-          showConfigMessage("已选择运行模型，点击保存并应用后生效。");
+          await applyModelConfigChange("已选择运行模型并应用。陌生模型会在启动检测或手动扫描时进入B模块准入。");
         }
       } catch (err) {
         showConfigMessage(err.message);
@@ -757,17 +761,13 @@
           $("sourcePtPath").value = data.path;
           $("enableCustomModel").checked = true;
           syncModelConfigControls();
-          showConfigMessage("已选择同源 PT，点击保存并应用后生效。");
+          await applyModelConfigChange("已选择同源 PT 并应用。");
         }
       } catch (err) {
         showConfigMessage(err.message);
       } finally {
         syncModelConfigControls();
       }
-    };
-    $("saveModelConfigBtn").onclick = async () => {
-      saveModelConfig();
-      await refreshAll();
     };
     $("resetModelConfigBtn").onclick = async () => {
       resetModelConfig();
@@ -801,7 +801,8 @@
       } catch (err) {
         showMessage(err.message);
       } finally {
-        $("purifyBtn").disabled = false;
+        await refreshStatus().catch(() => {});
+        await refreshLogs().catch(() => {});
       }
     };
     $("scanReportBtn").onclick = () => openJsonReport("/api/model-security/report", "B模块扫描报告");
@@ -822,7 +823,7 @@
     };
 
     loadModelConfig();
-    refreshAll().finally(schedule);
+    refreshAll();
   </script>
 </body>
 </html>

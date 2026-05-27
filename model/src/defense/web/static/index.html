@@ -608,20 +608,10 @@
             <div class="title">B模块模型安全</div>
             <div id="modelSecurityPill" class="pill">未检查</div>
           </div>
-          <div class="sourceHint" id="modelSecuritySummary">模型可信状态尚未检查。</div>
-          <div class="metrics" style="grid-template-columns: repeat(2, 1fr); margin-top:10px;">
-            <div class="metric"><b id="modelSecurityRisk">--</b><span>风险分数</span></div>
-            <div class="metric"><b id="modelSecurityScanTime">--</b><span>最近扫描</span></div>
-          </div>
+          <div class="sourceHint" id="modelSecuritySummary">详细扫描、净化、报告和白名单管理请打开安全中心。</div>
           <div class="row" style="margin-top:10px;">
             <button class="secondary" id="openModelSecurityCenterBtn" type="button">打开安全中心</button>
-            <button class="secondary" id="refreshModelSecurityBtn" type="button">刷新状态</button>
           </div>
-          <label class="toggleLine" style="margin-top:10px;">
-            <input id="testBypassModelSecurity" type="checkbox" />
-            测试入口：绕过B模块安全准入直接运行当前模型
-          </label>
-          <div class="sourceHint">仅用于当前阶段对比毒模型/净化模型效果；不会写入白名单，禁止生产使用。</div>
         </section>
         <label>画面叠加</label>
         <div class="toggleGrid">
@@ -633,6 +623,9 @@
         <div class="toggleGrid">
           <label class="toggleLine"><input id="enableStaticImage" type="checkbox" checked />翻拍/假目标检测（A3b）</label>
         </div>
+        <label>A3b灵敏度 <span id="a3bSensitivityText" class="hint">均衡</span>
+          <input id="a3bSensitivity" type="range" min="0" max="3" step="1" value="1" />
+        </label>
         <div class="row">
           <button class="primary" id="startBtn">开始检测</button>
           <button class="danger" id="stopBtn">停止</button>
@@ -778,31 +771,12 @@
 
     function modelSecurityBypassEnabled() {
       try {
-        const node = $("testBypassModelSecurity");
-        if (node) return !!node.checked;
         return localStorage.getItem("moduleA.testBypassModelSecurity") === "true";
       } catch (_) {
         return false;
       }
     }
 
-    function loadModelSecurityBypassOption() {
-      const node = $("testBypassModelSecurity");
-      if (!node) return;
-      try {
-        node.checked = localStorage.getItem("moduleA.testBypassModelSecurity") === "true";
-      } catch (_) {
-        node.checked = false;
-      }
-    }
-
-    function saveModelSecurityBypassOption() {
-      const node = $("testBypassModelSecurity");
-      if (!node) return;
-      try {
-        localStorage.setItem("moduleA.testBypassModelSecurity", node.checked ? "true" : "false");
-      } catch (_) {}
-    }
     function modelFamilyLabel(value) {
       const labels = {
         auto: "自动",
@@ -880,6 +854,7 @@
 
     function showModelSecurityBlock(ms, fallback) {
       if (!isModelSecurityBlocking(ms)) return false;
+      hideAllPreview();
       modelSecurityBlockState = ms;
       const hint = modelSecurityBlockHint(ms, fallback);
       const status = modelSecurityStatus(ms);
@@ -952,7 +927,33 @@
       return reasonTags(reason).join("、");
     }
 
+    function normalizeLifecycleStatus(status) {
+      const out = Object.assign({}, status || {});
+      if (out.source_ended) {
+        out.running = false;
+        out.ready_for_preview = false;
+        out.preview_started = false;
+        out.preview_fps = 0;
+        out.preview_mode = "source_ended";
+        out.detector_pipeline_mode = "ended";
+        if (Number(out.source_duration_s || 0) > 0) {
+          const duration = Number(out.source_duration_s || 0);
+          const sourceTime = Number(out.source_time_s ?? out.video_time_s ?? duration);
+          out.source_time_s = Number.isFinite(sourceTime) && sourceTime > 0
+            ? Math.min(Math.max(sourceTime, 0), duration)
+            : duration;
+          out.video_time_s = out.source_time_s;
+        }
+      } else if (!out.running) {
+        out.ready_for_preview = false;
+        out.preview_started = false;
+        out.preview_fps = 0;
+      }
+      return out;
+    }
+
     function stateText(status) {
+      if (status.source_ended) return ["播放结束", "MP4 已到达末尾，可重新开始检测。", ""];
       if (status.preview_mode === "model_security_blocked") return ["B模块准入阻断", "模型安全准入未通过，A模块没有启动。", "alert"];
       if (status.alert_confirmed) return ["确认告警", "检测到疑似物理扰动，建议复核画面与事件列表。", "alert"];
       if (status.running && !status.detector_ready) return ["初始化中", "正在加载检测器。", ""];
@@ -960,7 +961,6 @@
       if (status.running && status.preview_mode === "source_waiting_for_frames") return ["等待帧", "输入源暂时无新帧，预览线程不会阻塞检测。", ""];
       if (status.running && !status.first_detection_ready) return ["首帧检测", "后端预览已启动，检测线程正在生成首个结果。", ""];
       if (status.running) return ["检测中", "视频流正在分析，暂无确认告警。", "live"];
-      if (status.source_ended) return ["播放结束", "MP4 已到达末尾，可重新开始检测。", ""];
       if ((status.frame_idx || 0) > 0) return ["已停止", "上一次检测已结束，可切换输入源重新开始。", ""];
       return ["系统待机", "尚未开始检测。", ""];
     }
@@ -998,13 +998,7 @@
     }
 
     function stopEndedPreview() {
-      stopOverlayPolling();
-      previewStarting = false;
-      activePreviewRunId = 0;
-      $("stream").removeAttribute("src");
-      $("stream").removeAttribute("data-run-id");
-      $("stream").style.display = "none";
-      $("overlayCanvas").classList.remove("activePreview");
+      hideAllPreview();
     }
 
     function startMjpegPreview(previewStatus) {
@@ -1033,6 +1027,9 @@
       const runId = Number(status?.run_id || 0);
       const streamRunId = Number($("stream").getAttribute("data-run-id") || activePreviewRunId || 0);
       const streamActive = !!$("stream").getAttribute("src") && (!runId || !streamRunId || streamRunId === runId);
+      if (status?.running && isModelSecurityBlocking(modelSecurityBlockState)) {
+        modelSecurityBlockState = null;
+      }
       if (isModelSecurityBlocking(modelSecurityBlockState)) {
         showModelSecurityBlock(modelSecurityBlockState);
         return;
@@ -1047,6 +1044,16 @@
         $("stream").removeAttribute("src");
         $("stream").removeAttribute("data-run-id");
         activePreviewRunId = 0;
+      }
+
+      if (!status.running && !status.source_ended) {
+        hideAllPreview();
+        if ((status.frame_idx || 0) > 0) {
+          showEmpty("已停止", "检测已停止，预览流已关闭，可重新开始检测。");
+        } else {
+          showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
+        }
+        return;
       }
 
       if (status.source_ended) {
@@ -1119,7 +1126,7 @@
     }
 
     function mergeOverlayStatusForPanel(status) {
-      const base = status || {};
+      const base = normalizeLifecycleStatus(status || {});
       const latest = latestOverlayStatusRecord();
       if (!latest) return base;
       const runId = Number(base.run_id || activePreviewRunId || 0);
@@ -1132,7 +1139,7 @@
       if (latestSeq < statusSeq && latestFrame <= statusFrame) return base;
       const merged = Object.assign({}, base, latest, {
         run_id: runId || latestRunId,
-        running: base.source_ended ? false : (base.running || activePreviewRunId === (runId || latestRunId)),
+        running: !!base.running,
         source_ended: !!base.source_ended,
         recent_events: base.recent_events || [],
         recent_ppe_events: base.recent_ppe_events || [],
@@ -1146,10 +1153,29 @@
         custom_model: base.custom_model || {},
         error: base.error || "",
       });
+      const lifecycleKeys = [
+        "running", "source_ended", "source_time_s", "video_time_s",
+        "ready_for_preview", "preview_started", "first_detection_ready",
+        "preview_mode", "detector_pipeline_mode", "preview_fps",
+        "playback_paused", "playback_speed", "source_duration_s",
+        "source_frame_count", "preview_seq", "source_type", "source",
+      ];
+      lifecycleKeys.forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(base, key)) merged[key] = base[key];
+      });
+      if (!base.running) {
+        merged.ready_for_preview = false;
+        merged.preview_started = false;
+        merged.preview_fps = 0;
+      }
       if (!Array.isArray(merged.branch_cards) || !merged.branch_cards.length) {
         merged.branch_cards = base.branch_cards || [];
       }
-      return merged;
+      if (merged.ppe_event_active) {
+        const completedPpeCount = Array.isArray(merged.recent_ppe_events) ? merged.recent_ppe_events.length : 0;
+        merged.ppe_event_count = Math.max(Number(merged.ppe_event_count || 0), completedPpeCount + 1);
+      }
+      return normalizeLifecycleStatus(merged);
     }
 
     function selectOverlayRecord(videoTime) {
@@ -1351,11 +1377,33 @@
     function featureOptions() {
       return {
         static_image_enabled: $("enableStaticImage").checked,
+        a3b_sensitivity: currentA3bSensitivity(),
       };
+    }
+
+    const a3bSensitivityLevels = ["conservative", "balanced", "sensitive", "high"];
+    const a3bSensitivityLabels = {
+      conservative: "保守",
+      balanced: "均衡",
+      sensitive: "灵敏",
+      high: "高灵敏",
+    };
+
+    function currentA3bSensitivity() {
+      const index = Math.max(0, Math.min(3, Number($("a3bSensitivity").value || 1)));
+      return a3bSensitivityLevels[index] || "balanced";
+    }
+
+    function setA3bSensitivity(value) {
+      const normalized = a3bSensitivityLevels.includes(String(value)) ? String(value) : "balanced";
+      $("a3bSensitivity").value = String(Math.max(0, a3bSensitivityLevels.indexOf(normalized)));
+      $("a3bSensitivityText").textContent = a3bSensitivityLabels[normalized] || "均衡";
+      try { localStorage.setItem("moduleA.a3bSensitivity", normalized); } catch (_) {}
     }
 
     function updateStartButtonState(status) {
       if (startInFlight) return;
+      status = normalizeLifecycleStatus(status || {});
       const button = $("startBtn");
       const runId = Number(status?.run_id || 0);
       const streamRunId = Number($("stream").getAttribute("data-run-id") || activePreviewRunId || 0);
@@ -1382,6 +1430,7 @@
     }
 
     function updateRunControls(status) {
+      status = normalizeLifecycleStatus(status || {});
       const running = !!status?.running;
       const isFile = (status?.source_type || $("sourceType").value) === "file";
       const duration = Number(status?.source_duration_s || 0);
@@ -1397,8 +1446,11 @@
         $("seekSlider").disabled = true;
         $("seekSlider").max = "0";
         if (!seekControlInFlight) $("seekSlider").value = "0";
-        $("clockText").textContent = "0:00 / 0:00";
-        $("pipelineText").textContent = running ? (status?.detector_pipeline_mode || "running") : "idle";
+        $("clockText").textContent = isFile && duration > 0
+          ? `${fmtSeconds(sourceTime)} / ${fmtSeconds(duration)}`
+          : "0:00 / 0:00";
+        const pipelineMode = status?.source_ended ? "ended" : (running ? (status?.detector_pipeline_mode || "running") : "idle");
+        $("pipelineText").textContent = pipelineMode;
         lastControlRunId = Number(status?.run_id || lastControlRunId || 0);
         return;
       }
@@ -1434,6 +1486,11 @@
         const source = localStorage.getItem("moduleA.lastSourcePath");
         if (source) $("sourceValue").value = source;
       } catch (_) {}
+      try {
+        setA3bSensitivity(localStorage.getItem("moduleA.a3bSensitivity") || "balanced");
+      } catch (_) {
+        setA3bSensitivity("balanced");
+      }
     }
 
     function modelSecurityStatusLabel(value) {
@@ -1515,11 +1572,8 @@
       const pill = $("modelSecurityPill");
       if (!pill) return;
       pill.textContent = modelSecurityStatusLabel(status);
-      const risk = ms.risk_score;
-      $("modelSecurityRisk").textContent = (risk === null || risk === undefined) ? "--" : Number(risk).toFixed(3);
-      $("modelSecurityScanTime").textContent = ms.last_scan_time ? String(ms.last_scan_time).replace("T", " ").slice(0, 19) : "--";
-      const reasonText = modelSecurityReasonLabel(ms.blocking_reason);
-      $("modelSecuritySummary").textContent = modelSecurityCompactSummary(ms, status);
+      const summaryNode = $("modelSecuritySummary");
+      if (summaryNode) summaryNode.textContent = modelSecurityCompactSummary(ms, status);
       const alertStates = ["blocked_scan_required", "unverifiable", "suspicious", "review", "clean_export_required", "purified_alternative_available", "purifying", "planned", "error"];
       pill.className = "pill " + ((status === "trusted") ? "live" : alertStates.includes(status) ? "alert" : "");
     }
@@ -1550,9 +1604,7 @@
         });
         const modelSecurity = data.model_security || {};
         renderModelSecurity(modelSecurity);
-        if (isModelSecurityBlocking(modelSecurity)) {
-          showModelSecurityBlock(modelSecurity);
-        } else {
+        if (!isModelSecurityBlocking(modelSecurity)) {
           modelSecurityBlockState = null;
         }
         refreshModelTrust();
@@ -1750,24 +1802,7 @@
       window.location.href = "/model-security";
     };
 
-    $("refreshModelSecurityBtn").onclick = async () => {
-      $("refreshModelSecurityBtn").disabled = true;
-      try {
-        await refreshModelSecurity();
-        await refreshModelTrust();
-        setError("");
-      } catch (err) {
-        setError(err.message);
-      } finally {
-        $("refreshModelSecurityBtn").disabled = false;
-      }
-    };
-    if ($("testBypassModelSecurity")) {
-      $("testBypassModelSecurity").onchange = () => {
-        saveModelSecurityBypassOption();
-        setError($("testBypassModelSecurity").checked ? "测试绕过已启用：下一次开始检测会跳过B模块准入。" : "");
-      };
-    }
+    $("a3bSensitivity").oninput = () => setA3bSensitivity(currentA3bSensitivity());
     $("startBtn").onclick = async () => {
       if (startInFlight) return;
       setError("");
@@ -1777,7 +1812,7 @@
       $("startBtn").textContent = "初始化中";
       try {
         const current = await api("/api/status");
-        const currentStatus = current.status || {};
+        const currentStatus = normalizeLifecycleStatus(current.status || {});
         if (currentStatus.running) {
           lastOverlayStatus = currentStatus;
           ensurePreview(currentStatus);
@@ -1806,11 +1841,11 @@
         saveLastPaths();
         const data = await api("/api/start", body);
         modelSecurityBlockState = null;
-        const status = data.status || {};
+        const status = normalizeLifecycleStatus(data.status || {});
         lastOverlayStatus = status;
         updateRunControls(status);
         updateStartButtonState(status);
-        startMjpegPreview(status);
+        ensurePreview(status);
         setTimeout(refreshModelSecurity, 2000);
         scheduleRefresh(0);
       } catch (err) {
@@ -1864,8 +1899,15 @@
       let nextRefreshMs = refreshIntervals.idle;
       try {
         const data = await api("/api/status");
-        let status = data.status || {};
+        let status = normalizeLifecycleStatus(data.status || {});
         status = mergeOverlayStatusForPanel(status);
+        status = normalizeLifecycleStatus(status);
+        if (status.running && isModelSecurityBlocking(modelSecurityBlockState)) {
+          modelSecurityBlockState = null;
+        }
+        if (!status.running || status.source_ended) {
+          modelSecurityBlockState = null;
+        }
         if (isModelSecurityBlocking(modelSecurityBlockState)) {
           status = Object.assign({}, status, {
             running: false,
@@ -1891,11 +1933,13 @@
         $("alerts").textContent = status.alert_event_count || 0;
         $("ppeAlerts").textContent = status.ppe_event_count || 0;
         $("ppeCounts").textContent = `头${status.ppe_head_count || 0}/帽${status.ppe_helmet_count || 0}/人${status.ppe_inferred_person_count ?? status.ppe_person_count ?? 0}`;
-        $("ppePill").textContent = status.ppe_warning ? "未戴帽" : "业务通道";
-        $("ppePill").className = "pill " + (status.ppe_warning ? "alert" : "");
+        const ppeActive = !!(status.ppe_warning || status.ppe_event_active);
+        $("ppePill").textContent = ppeActive ? "未戴帽" : "业务通道";
+        $("ppePill").className = "pill " + (ppeActive ? "alert" : "");
         const featureStatus = status.feature_options || {};
         if (status.running) {
           $("enableStaticImage").checked = featureStatus.static_image_enabled !== false;
+          if (featureStatus.a3b_sensitivity) setA3bSensitivity(featureStatus.a3b_sensitivity);
         }
         const displayOptions = status.display_options || {};
         $("showBoxes").checked = displayOptions.show_boxes !== false;
@@ -1939,7 +1983,19 @@
           </div>
         `;
         }).join("") || '<div class="empty"><strong>暂无确认告警</strong><div class="hint">一旦连续帧触发，告警会出现在这里。</div></div>';
-        const ppeEvents = status.recent_ppe_events || [];
+        const completedPpeEvents = status.recent_ppe_events || [];
+        const activePpeEvent = status.ppe_event_active ? [{
+          active: true,
+          event_id: "实时",
+          trigger_frame: status.frame_idx || 0,
+          last_warning_frame: status.frame_idx || 0,
+          ppe_inferred_person_count: status.ppe_inferred_person_count ?? status.ppe_person_count ?? 0,
+          ppe_raw_person_count: status.ppe_raw_person_count ?? status.ppe_person_count ?? 0,
+          ppe_head_count: status.ppe_head_count || 0,
+          ppe_helmet_count: status.ppe_helmet_count || 0,
+          reason: status.ppe_reason || status.ppe_event_last_reason || "已确认未戴安全帽",
+        }] : null;
+        const ppeEvents = activePpeEvent ? [activePpeEvent, ...completedPpeEvents] : completedPpeEvents;
         $("ppeEvents").innerHTML = ppeEvents.map((evt) => {
           const eventId = evt.event_id ?? "-";
           const startFrame = evt.trigger_frame ?? evt.started_frame ?? 0;
@@ -2007,7 +2063,6 @@
     }
 
     loadLastPaths();
-    loadModelSecurityBypassOption();
     updateSourceControls();
     showEmpty("等待输入源", "选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。");
     refreshModelSecurity();

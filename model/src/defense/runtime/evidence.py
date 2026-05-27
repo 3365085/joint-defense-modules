@@ -51,6 +51,7 @@ class EventState:
     frame_count: int = 0
     max_score: float = 0.0
     reasons: set[str] = field(default_factory=set)
+    metadata: dict[str, Any] = field(default_factory=dict)
     representative_path: str | None = None
 
 
@@ -119,7 +120,7 @@ class EvidenceSession:
         completed: list[dict[str, Any]] = []
         channels = {
             "module_a": bool(status.get("alert_confirmed") or status.get("attack_state_active")),
-            "ppe": bool(status.get("ppe_warning") or status.get("ppe_confirmed")),
+            "ppe": bool(status.get("ppe_event_active") or status.get("ppe_warning") or status.get("ppe_confirmed")),
             "a3b": bool(status.get("a3b_triggered")),
         }
         for channel, active in channels.items():
@@ -132,6 +133,7 @@ class EvidenceSession:
                 reason = self._channel_reason(channel, status)
                 if reason:
                     event.reasons.add(reason)
+                self._merge_event_metadata(event, self._channel_metadata(channel, status, ppe))
                 if event.frame_count < self.max_frames_per_event and (frame_idx - event.started_frame) % self.sample_every == 0:
                     saved = self._write_event_frame(event, frame_idx, frame, info, ppe)
                     if event.representative_path is None:
@@ -212,6 +214,7 @@ class EvidenceSession:
             "evidence_representative_path": event.representative_path or "",
             "close_reason": reason,
         }
+        summary.update(event.metadata)
         write_json(event.event_dir / "event.json", summary)
         append_jsonl(self.events_jsonl, summary)
         self.saved_events.append(summary)
@@ -238,7 +241,12 @@ class EvidenceSession:
         if channel == "module_a":
             return float(status.get("p_adv") or 0.0)
         if channel == "ppe":
-            return float(status.get("ppe_window_positive") or 0.0)
+            return float(
+                status.get("ppe_window_positive")
+                or status.get("ppe_fast_window_positive")
+                or status.get("ppe_missing_helmet_count")
+                or 0.0
+            )
         if channel == "a3b":
             return float(
                 status.get("a3b_event_score")
@@ -254,7 +262,64 @@ class EvidenceSession:
         if channel == "module_a":
             return str(status.get("reason") or "")
         if channel == "ppe":
-            return str(status.get("ppe_reason") or "")
+            return str(status.get("ppe_reason") or status.get("ppe_event_last_reason") or "")
         if channel == "a3b":
             return str(status.get("a3b_triggered_source") or "")
         return ""
+
+    @staticmethod
+    def _channel_metadata(channel: str, status: dict[str, Any], ppe: dict[str, Any]) -> dict[str, Any]:
+        if channel != "ppe":
+            return {}
+        person_count = _int(status.get("ppe_person_count", ppe.get("person_count")))
+        raw_person_count = _int(status.get("ppe_raw_person_count", ppe.get("raw_person_count", person_count)))
+        inferred_person_count = _int(
+            status.get("ppe_inferred_person_count", ppe.get("inferred_person_count", person_count))
+        )
+        head_count = _int(status.get("ppe_head_count", ppe.get("head_count")))
+        helmet_count = _int(status.get("ppe_helmet_count", ppe.get("helmet_count")))
+        missing_helmet_count = _int(status.get("ppe_missing_helmet_count", ppe.get("missing_helmet_count")))
+        reason = str(status.get("ppe_reason") or status.get("ppe_event_last_reason") or ppe.get("reason") or "")
+        return {
+            "person_count": person_count,
+            "raw_person_count": raw_person_count,
+            "inferred_person_count": inferred_person_count,
+            "head_count": head_count,
+            "helmet_count": helmet_count,
+            "missing_helmet_count": missing_helmet_count,
+            "ppe_person_count": person_count,
+            "ppe_raw_person_count": raw_person_count,
+            "ppe_inferred_person_count": inferred_person_count,
+            "ppe_head_count": head_count,
+            "ppe_helmet_count": helmet_count,
+            "ppe_missing_helmet_count": missing_helmet_count,
+            "ppe_confirmed_source": str(status.get("ppe_confirmed_source") or ppe.get("confirmed_source") or ""),
+            "ppe_event_last_reason": reason,
+            "ppe_event_last_confirmed_source": str(
+                status.get("ppe_event_last_confirmed_source") or ppe.get("event_last_confirmed_source") or ""
+            ),
+        }
+
+    @staticmethod
+    def _merge_event_metadata(event: EventState, metadata: dict[str, Any]) -> None:
+        for key, value in metadata.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                if value:
+                    event.metadata[key] = value
+                continue
+            if key.endswith("_count") or key in {"person_count", "raw_person_count", "inferred_person_count", "head_count", "helmet_count", "missing_helmet_count"}:
+                current = _int(event.metadata.get(key))
+                incoming = _int(value)
+                if key not in event.metadata or incoming > current:
+                    event.metadata[key] = incoming
+                continue
+            event.metadata[key] = value
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0

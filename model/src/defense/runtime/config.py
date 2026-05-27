@@ -162,6 +162,65 @@ def apply_feature_options(config: dict[str, Any], options: dict[str, Any]) -> No
     module_a = config.setdefault("module_a", {})
     if "static_image_enabled" in options:
         module_a["static_image_enabled"] = bool(options["static_image_enabled"])
+    sensitivity = normalize_a3b_sensitivity(options.get("a3b_sensitivity", ""))
+    if sensitivity:
+        apply_a3b_sensitivity(config, sensitivity)
+
+
+def normalize_a3b_sensitivity(value: Any) -> str:
+    sensitivity = str(value or "").strip().lower()
+    return sensitivity if sensitivity in A3B_SENSITIVITY_PRESETS else ""
+
+
+A3B_SENSITIVITY_PRESETS: dict[str, dict[str, Any]] = {
+    "conservative": {
+        "observed_threshold": 0.46,
+        "trigger_threshold": 0.66,
+        "strong_single_frame_threshold": 0.82,
+        "observed_only_warning_threshold": 0.55,
+        "observed_only_track_threshold": 0.55,
+        "static_image_interval": 4,
+    },
+    "balanced": {
+        "observed_threshold": 0.42,
+        "trigger_threshold": 0.62,
+        "strong_single_frame_threshold": 0.78,
+        "observed_only_warning_threshold": 0.50,
+        "observed_only_track_threshold": 0.50,
+        "static_image_interval": 4,
+    },
+    "sensitive": {
+        "observed_threshold": 0.38,
+        "trigger_threshold": 0.58,
+        "strong_single_frame_threshold": 0.74,
+        "observed_only_warning_threshold": 0.46,
+        "observed_only_track_threshold": 0.46,
+        "static_image_interval": 3,
+    },
+    "high": {
+        "observed_threshold": 0.34,
+        "trigger_threshold": 0.54,
+        "strong_single_frame_threshold": 0.70,
+        "observed_only_warning_threshold": 0.42,
+        "observed_only_track_threshold": 0.42,
+        "static_image_interval": 2,
+    },
+}
+
+
+def apply_a3b_sensitivity(config: dict[str, Any], sensitivity: str) -> None:
+    sensitivity = normalize_a3b_sensitivity(sensitivity)
+    preset = A3B_SENSITIVITY_PRESETS.get(sensitivity)
+    if preset is None:
+        return
+    a3b = config.setdefault("a3b", {})
+    for key, value in preset.items():
+        if key == "static_image_interval":
+            module_a = config.setdefault("module_a", {})
+            module_a[key] = int(value)
+        else:
+            a3b[key] = value
+    a3b["sensitivity"] = sensitivity
 
 
 def infer_backend_from_model_path(path: Path, fallback: str = "onnx") -> str:
@@ -358,6 +417,10 @@ def apply_custom_model(config: dict[str, Any], custom_model: dict[str, Any]) -> 
     if not resolved.get("enabled"):
         return resolved
     path = Path(str(resolved.get("path", ""))).expanduser()
+    if path.suffix.lower() in {".pt", ".pth"}:
+        source_pt_path = str(resolved.get("source_pt_path", "") or "").strip()
+        if not source_pt_path or Path(source_pt_path).expanduser() != path:
+            resolved["source_pt_path"] = str(path)
     backend = str(resolved.get("backend", "auto"))
     inferred_backend = infer_backend_from_model_path(path, "")
     if backend == "auto":

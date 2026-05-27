@@ -8,6 +8,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from defense.module_a.ppe_postprocess import PPEPostprocessConfig
 from defense.module_a.postprocess import PPEDisplayTracker, merge_roi_detections
 from .a3b_soft_trigger import A3BSoftTriggerState
 from .pipeline_factory import PipelineBundle
@@ -102,8 +103,30 @@ class FrameProcessor:
         self.pipeline = bundle.pipeline
         config = bundle.config if isinstance(bundle.config, dict) else {}
         ppe_config = config.get("ppe_tracking", {}) if isinstance(config.get("ppe_tracking"), dict) else {}
+        inference_config = config.get("inference", {}) if isinstance(config.get("inference"), dict) else {}
+        runtime_config = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
+        business_min_confidence = float(
+            ppe_config.get("business_min_confidence", inference_config.get("confidence", 0.25))
+        )
+        candidate_min_confidence = ppe_config.get("temporal_candidate_min_confidence")
+        self.ppe_postprocess_config = PPEPostprocessConfig(
+            min_confidence=business_min_confidence,
+            candidate_min_confidence=(
+                float(candidate_min_confidence)
+                if candidate_min_confidence is not None
+                else None
+            ),
+        )
         hold_frames = int(ppe_config.get("max_missed_frames", 10 if ppe_config else 8))
-        self.ppe_state = SafetyHelmetState()
+        self.ppe_state = SafetyHelmetState(
+            window=int(ppe_config.get("alert_window", 6)),
+            trigger_count=int(ppe_config.get("alert_trigger_count", 3)),
+            hold_frames=int(ppe_config.get("alert_hold_frames", 12)),
+            event_hold_frames=int(ppe_config.get("event_hold_frames", 45)),
+            fast_window=int(ppe_config.get("fast_alert_window", 3)),
+            fast_trigger_count=int(ppe_config.get("fast_alert_trigger_count", 2)),
+            fast_min_confidence=float(ppe_config.get("fast_alert_min_head_confidence", 0.65)),
+        )
         self.ppe_tracker = PPEDisplayTracker(
             history=9,
             hold_frames=hold_frames,
@@ -127,6 +150,9 @@ class FrameProcessor:
             weak_edge_min_avg_confidence=float(ppe_config.get("weak_edge_min_avg_confidence", 0.45)),
         )
         self.ppe_tracking_enabled = bool(ppe_config.get("enabled", True))
+        self.ppe_roi_redetect_enabled = bool(
+            ppe_config.get("roi_redetect_enabled", runtime_config.get("ppe_roi_redetect_enabled", False))
+        )
         a3b_config = config.get("a3b", {}) if isinstance(config.get("a3b"), dict) else {}
         self.a3b_soft = A3BSoftTriggerState(a3b_config)
         self.processing_history: deque[float] = deque(maxlen=30)
@@ -166,7 +192,11 @@ class FrameProcessor:
             if self.processing_history
             else 0.0
         )
-        budget_ok = (not realtime) or not self.processing_history or avg_processing_ms <= target_frame_budget_ms * 0.85
+        budget_ok = (
+            bool(self.ppe_roi_redetect_enabled)
+            and (not realtime)
+            and (not self.processing_history or avg_processing_ms <= target_frame_budget_ms * 0.85)
+        )
         if display_options.get("show_boxes", True) and budget_ok:
             rois = self.ppe_tracker.recommend_redetect_rois(
                 detections,
@@ -196,6 +226,7 @@ class FrameProcessor:
             ppe_tracker=self.ppe_tracker,
             tracking_enabled=self.ppe_tracking_enabled,
             max_render_misses=_ppe_max_render_misses(source_type=source_type, realtime=realtime),
+            postprocess_config=self.ppe_postprocess_config,
         )
         ppe = ppe_result.ppe
         ppe_tracks = ppe_result.tracks
@@ -347,6 +378,11 @@ class FrameProcessor:
             "ppe_warning": bool(ppe.get("warning", False)),
             "ppe_candidate": bool(ppe.get("candidate", False)),
             "ppe_confirmed": bool(ppe.get("confirmed", False)),
+            "ppe_confirmed_source": str(ppe.get("confirmed_source", "")),
+            "ppe_event_active": bool(ppe.get("event_active", False)),
+            "ppe_event_hold_remaining": _int(ppe.get("event_hold_remaining")),
+            "ppe_event_last_reason": str(ppe.get("event_last_reason", "")),
+            "ppe_event_last_confirmed_source": str(ppe.get("event_last_confirmed_source", "")),
             "ppe_person_count": _int(ppe.get("person_count")),
             "ppe_raw_person_count": _int(ppe.get("raw_person_count", ppe.get("person_count"))),
             "ppe_inferred_person_count": _int(ppe.get("inferred_person_count", ppe.get("person_count"))),
@@ -368,6 +404,9 @@ class FrameProcessor:
             "ppe_reason": str(ppe.get("reason", "")),
             "ppe_window_positive": _int(ppe.get("window_positive")),
             "ppe_window": _int(ppe.get("window")),
+            "ppe_fast_window_positive": _int(ppe.get("fast_window_positive")),
+            "ppe_fast_window": _int(ppe.get("fast_window")),
+            "ppe_fast_trigger_count": _int(ppe.get("fast_trigger_count")),
             "ppe_track_count": len(ppe_tracks),
             "ppe_tracks": [dict(track) for track in ppe_tracks],
             "ppe_class_counts": ppe.get("class_counts", {}),
@@ -391,7 +430,7 @@ class FrameProcessor:
 
 def _ppe_max_render_misses(*, source_type: str, realtime: bool) -> int | None:
     if str(source_type or "").lower() == "file" and bool(realtime):
-        return 0
+        return 2
     return None
 
 

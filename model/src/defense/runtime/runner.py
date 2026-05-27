@@ -351,6 +351,11 @@ class MonitorEngine:
             "ppe_warning": False,
             "ppe_candidate": False,
             "ppe_confirmed": False,
+            "ppe_confirmed_source": "",
+            "ppe_event_active": False,
+            "ppe_event_hold_remaining": 0,
+            "ppe_event_last_reason": "",
+            "ppe_event_last_confirmed_source": "",
             "ppe_person_count": 0,
             "ppe_raw_person_count": 0,
             "ppe_inferred_person_count": 0,
@@ -394,6 +399,8 @@ class MonitorEngine:
             "source_ended": False,
             "stream_reconnects": 0,
             "stream_last_frame_age_ms": 0.0,
+            "source_decode_recoveries": 0,
+            "source_decode_last_recovery_frame": 0,
             "preview_start_time_s": 0.0,
             "preview_render_fps": 0.0,
             "preview_max_side": 960,
@@ -480,6 +487,7 @@ class MonitorEngine:
         self.stop(release_pipeline_cache=False)
         feature_options = {
             "static_image_enabled": bool((feature_options or {}).get("static_image_enabled", True)),
+            "a3b_sensitivity": str((feature_options or {}).get("a3b_sensitivity") or "balanced"),
         }
         custom_model_options = normalize_custom_model_options(custom_model)
         self.stop_event.clear()
@@ -720,6 +728,8 @@ class MonitorEngine:
         for thread in threads:
             if thread is current:
                 continue
+            if thread.ident is None:
+                continue
             thread.join(timeout=self.thread_join_timeout_s)
             if thread.is_alive():
                 alive_after_join.append(thread.name)
@@ -739,6 +749,9 @@ class MonitorEngine:
             self.status["first_detection_ready"] = False
             self.status["playback_paused"] = False
             self.status["source_ended"] = False
+            self.status["preview_fps"] = 0.0
+            self.status["preview_mode"] = "stopped"
+            self.status["detector_pipeline_mode"] = "idle"
             self.status["stop_threads_pending"] = alive_after_join
             if alive_after_join:
                 self.status["warning"] = "worker_threads_did_not_stop"
@@ -754,6 +767,8 @@ class MonitorEngine:
         with self.condition:
             if int(run_id or 0) != self.run_id:
                 raise RuntimeError("run_id does not match current run")
+            if not bool(self.status.get("running")) or bool(self.status.get("source_ended")):
+                raise RuntimeError("run is not active")
             if action == "play":
                 self._playback_paused = False
                 self.status["playback_paused"] = False
@@ -769,11 +784,12 @@ class MonitorEngine:
                 if duration > 0:
                     target = min(target, max(0.0, duration - 0.001))
                 self._seek_request_s = target
-                self._source_epoch += 1
+                self._source_epoch = max(
+                    int(self._source_epoch),
+                    int(self.status.get("source_epoch") or self._source_epoch or 0),
+                ) + 1
                 self.overlay_timeline.clear()
-                self.overlay_seq = 0
                 self.latest_jpeg = None
-                self.latest_jpeg_seq = 0
                 self.preview_publish_times.clear()
                 self._preview_last_overlay = None
                 if self.detection_bus is not None:
@@ -783,10 +799,10 @@ class MonitorEngine:
                         "source_epoch": self._source_epoch,
                         "source_time_s": target,
                         "video_time_s": target,
-                        "overlay_seq": 0,
+                        "overlay_seq": int(self.overlay_seq),
                         "first_detection_ready": False,
                         "source_ended": False,
-                        "preview_seq": 0,
+                        "preview_seq": int(self.latest_jpeg_seq),
                         "preview_fps": 0.0,
                     }
                 )
@@ -825,8 +841,14 @@ class MonitorEngine:
     def wait_latest_jpeg(self, last_seq: int, timeout: float = 0.5) -> tuple[int, bytes | None, bool]:
         deadline = time.perf_counter() + max(0.0, timeout)
         with self.condition:
+            if not self.status.get("running"):
+                return self.latest_jpeg_seq, None, False
             while self.latest_jpeg_seq == last_seq and self.status.get("running") and time.perf_counter() < deadline:
                 self.condition.wait(timeout=min(0.05, max(0.0, deadline - time.perf_counter())))
+            if not self.status.get("running"):
+                return self.latest_jpeg_seq, None, False
+            if self.latest_jpeg_seq <= last_seq:
+                return self.latest_jpeg_seq, None, True
             return self.latest_jpeg_seq, self.latest_jpeg, bool(self.status.get("running"))
 
     @staticmethod
@@ -862,6 +884,45 @@ class MonitorEngine:
         if cap <= 0.0:
             return 1.0
         return max(1.0, fps / max(1.0, min(fps, cap)))
+
+    @staticmethod
+    def _near_file_eof(cap: cv2.VideoCapture, frame_count: int, *, tolerance: int = 3) -> bool:
+        if frame_count <= 0:
+            return False
+        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+        return pos >= max(0, int(frame_count) - int(tolerance))
+
+    def _recover_file_decode_gap(
+        self,
+        cap: cv2.VideoCapture,
+        frame_count: int,
+        run_id: int,
+        *,
+        max_skip_frames: int = 3,
+    ) -> Any | None:
+        if self._near_file_eof(cap, frame_count):
+            return None
+        base_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+        for offset in range(1, max(1, int(max_skip_frames)) + 1):
+            if self.stop_event.is_set():
+                return None
+            target = max(0, base_pos + offset)
+            if frame_count > 0 and target >= frame_count:
+                return None
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                ok, frame = cap.read()
+            except Exception:
+                ok, frame = False, None
+            if ok and frame is not None:
+                with self.condition:
+                    if run_id == self.run_id:
+                        recoveries = int(self.status.get("source_decode_recoveries") or 0) + 1
+                        self.status["source_decode_recoveries"] = recoveries
+                        self.status["source_decode_last_recovery_frame"] = target
+                        self.condition.notify_all()
+                return frame
+        return None
 
     def _backend_capture_loop(
         self,
@@ -959,9 +1020,12 @@ class MonitorEngine:
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     if source_type == "file":
-                        break
+                        recovered_frame = self._recover_file_decode_gap(cap, frame_count, run_id)
+                        if recovered_frame is None:
+                            break
+                        frame = recovered_frame
                     now = time.perf_counter()
-                    if now - last_frame_seen >= 5.0:
+                    if source_type != "file" and now - last_frame_seen >= 5.0:
                         reconnects += 1
                         with self.condition:
                             if run_id == self.run_id:
@@ -976,17 +1040,18 @@ class MonitorEngine:
                         cap = open_capture(source_type, source)
                         last_frame_seen = time.perf_counter()
                     time.sleep(0.03)
-                    continue
+                    if source_type != "file":
+                        continue
 
                 last_frame_seen = time.perf_counter()
                 original_h, original_w = frame.shape[:2]
                 frame, capture_resized = self._resize_capture_frame(frame, int(capture_max_side))
                 h, w = frame.shape[:2]
                 source_time_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+                frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or packet_seq + 1)
                 if source_time_s <= 0.0 and fps > 0:
-                    source_time_s = packet_seq / fps
+                    source_time_s = max(0, frame_idx - 1) / fps
                 packet_seq += 1
-                frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or packet_seq)
                 packet = FramePacket(
                     seq=packet_seq,
                     frame_idx=max(0, frame_idx - 1),
@@ -1054,6 +1119,8 @@ class MonitorEngine:
                     source_ended = source_type == "file" and not self.stop_event.is_set()
                     self.status["source_ended"] = source_ended
                     self.status["preview_started"] = False
+                    self.status["ready_for_preview"] = False
+                    self.latest_jpeg = None
                     if source_ended:
                         final_time_s = float(self.status.get("source_time_s") or 0.0)
                         if self._source_duration_s > 0:
@@ -1065,6 +1132,8 @@ class MonitorEngine:
                                 "preview_fps": 0.0,
                                 "preview_mode": "source_ended",
                                 "detector_pipeline_mode": "ended",
+                                "ready_for_preview": False,
+                                "preview_started": False,
                             }
                         )
                     self.status["stopped_at"] = datetime.now().isoformat(timespec="seconds")
@@ -1216,12 +1285,12 @@ class MonitorEngine:
         last_seq = 0
         while run_id == self.run_id and not self.stop_event.is_set():
             started = time.perf_counter()
-            packet = preview_bus.latest_packet_if_open()
-            if packet is None:
-                packet = preview_bus.wait_for_frame(last_seq, timeout=interval)
+            packet = preview_bus.wait_for_frame(last_seq, timeout=interval)
             if packet is None:
                 if preview_bus.closed:
                     break
+                continue
+            if packet.seq <= last_seq:
                 continue
             last_seq = packet.seq
             with self.condition:
@@ -1261,14 +1330,14 @@ class MonitorEngine:
             )
             if file_realtime_preview:
                 # File preview follows the video clock. A long held overlay makes
-                # stale boxes visibly trail moving content, so cap display-only
-                # smoothing to a short bridge between detector frames.
+                # stale boxes trail moving content, but a too-short bridge drops
+                # boxes whenever detection falls slightly below the target FPS.
                 detector_fps = max(1.0, float(self.status.get("detector_process_fps_cap") or 15.0))
-                bridge_s = min(0.18, max(0.12, 2.4 / detector_fps))
+                bridge_s = min(0.36, max(0.20, 3.2 / detector_fps))
                 match_s = min(match_s, bridge_s)
                 hold_s = min(hold_s, bridge_s)
-                max_age_s = min(max_age_s, bridge_s)
-                interp_s = min(interp_s, max(bridge_s * 2.0, 0.16))
+                max_age_s = min(max_age_s, max(bridge_s, 0.32))
+                interp_s = min(interp_s, max(bridge_s * 2.0, 0.28))
         if not records:
             return None
         records.sort(key=lambda item: float(item.get("video_time_s") or 0.0))
@@ -1287,7 +1356,7 @@ class MonitorEngine:
                     prev,
                     next_item,
                     source_time_s,
-                    keep_unmatched_tracks=not file_realtime_preview,
+                    keep_unmatched_tracks=True,
                 )
                 if mixed is not None:
                     mixed["overlay_display_source"] = "interpolated"
@@ -1307,14 +1376,13 @@ class MonitorEngine:
                 out["held"] = True
                 out["overlay_display_source"] = "held"
                 tracks = []
-                if not file_realtime_preview:
-                    for track in out.get("ppe_tracks", []) or []:
-                        if not bool(track.get("hold_eligible", True)):
-                            continue
-                        clone = dict(track)
-                        clone["box"] = list(track.get("box") or [])
-                        clone["source"] = "held"
-                        tracks.append(clone)
+                for track in out.get("ppe_tracks", []) or []:
+                    if not bool(track.get("hold_eligible", True)):
+                        continue
+                    clone = dict(track)
+                    clone["box"] = list(track.get("box") or [])
+                    clone["source"] = "held"
+                    tracks.append(clone)
                 out["ppe_tracks"] = tracks
                 return out
         return None
@@ -1362,7 +1430,11 @@ class MonitorEngine:
         }
         ppe = {
             "warning": bool(overlay.get("ppe_warning")),
-            "confirmed": bool(overlay.get("ppe_warning")),
+            "confirmed": bool(overlay.get("ppe_confirmed")),
+            "event_active": bool(overlay.get("ppe_event_active")),
+            "event_hold_remaining": int(overlay.get("ppe_event_hold_remaining") or 0),
+            "event_last_reason": overlay.get("ppe_event_last_reason") or "",
+            "event_last_confirmed_source": overlay.get("ppe_event_last_confirmed_source") or "",
             "person_count": int(overlay.get("ppe_person_count") or 0),
             "raw_person_count": int(overlay.get("ppe_raw_person_count", overlay.get("ppe_person_count")) or 0),
             "inferred_person_count": int(overlay.get("ppe_inferred_person_count", overlay.get("ppe_person_count")) or 0),
@@ -1404,7 +1476,25 @@ class MonitorEngine:
                 display_options=display_options,
                 frame_idx=processed.frame_idx,
             )
-            self._publish_preview(encode_jpeg(rendered, quality=82), run_id)
+            source_epoch = None
+            if extra_status and "source_epoch" in extra_status:
+                try:
+                    source_epoch = int(extra_status["source_epoch"])
+                except (TypeError, ValueError):
+                    source_epoch = None
+            self._publish_preview(encode_jpeg(rendered, quality=82), run_id, source_epoch=source_epoch)
+        processed_epoch = None
+        if extra_status and "source_epoch" in extra_status:
+            try:
+                processed_epoch = int(extra_status["source_epoch"])
+            except (TypeError, ValueError):
+                processed_epoch = None
+        with self.condition:
+            if run_id != self.run_id or self.stop_event.is_set():
+                return
+            current_epoch = int(self.status.get("source_epoch") or 0)
+            if processed_epoch is not None and processed_epoch != current_epoch:
+                return
         completed = evidence.update(
             frame_idx=processed.frame_idx,
             frame=processed.frame_640,
@@ -1418,7 +1508,10 @@ class MonitorEngine:
             record_status.update(extra_status)
         overlay_record = self._build_overlay_record(record_status, processed.ppe_tracks)
         with self.condition:
-            if run_id != self.run_id:
+            if run_id != self.run_id or self.stop_event.is_set():
+                return
+            current_epoch = int(self.status.get("source_epoch") or 0)
+            if processed_epoch is not None and processed_epoch != current_epoch:
                 return
             self.overlay_seq += 1
             overlay_record["overlay_seq"] = self.overlay_seq
@@ -1460,6 +1553,7 @@ class MonitorEngine:
                 "preview_fps": 0.0,
                 "preview_mode": "source_ended",
                 "detector_pipeline_mode": "ended",
+                "ready_for_preview": False,
                 "preview_started": False,
                 "timing_ms": self.status.get("timing_ms", processed.status.get("timing_ms", 0.0)),
                 "processing_ms": self.status.get("processing_ms", processed.status.get("processing_ms", 0.0)),
@@ -1503,14 +1597,18 @@ class MonitorEngine:
             display_options=self.display_options,
         )
 
-    def _publish_preview(self, jpeg: bytes, run_id: int) -> None:
+    def _publish_preview(self, jpeg: bytes, run_id: int, *, source_epoch: int | None = None) -> None:
         now = time.perf_counter()
         with self.condition:
             if run_id != self.run_id:
                 return
+            if source_epoch is not None and int(self.status.get("source_epoch") or 0) != int(source_epoch):
+                return
             if self.status.get("source_ended"):
+                self.latest_jpeg = None
                 self.status["preview_fps"] = 0.0
                 self.status["preview_started"] = False
+                self.status["ready_for_preview"] = False
                 self.status["detector_pipeline_mode"] = "ended"
                 self.condition.notify_all()
                 return
@@ -1550,5 +1648,11 @@ class MonitorEngine:
             self.status["running"] = False
             self.status["initializing"] = False
             self.status["prewarming"] = False
+            self.status["ready_for_preview"] = False
+            self.status["preview_started"] = False
+            self.status["preview_fps"] = 0.0
+            self.status["preview_mode"] = "error"
+            self.status["detector_pipeline_mode"] = "error"
+            self.latest_jpeg = None
             self.status["stopped_at"] = datetime.now().isoformat(timespec="seconds")
             self.condition.notify_all()

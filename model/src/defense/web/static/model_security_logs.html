@@ -110,27 +110,27 @@
     }
     @media (max-width: 720px) {
       header, .summary, .logTop { grid-template-columns: 1fr; }
-      button, select { width: 100%; }
+      button { width: 100%; }
     }
   </style>
 </head>
 <body>
   <header>
     <h1>B模块运行日志</h1>
-    <button id="refreshBtn" type="button">刷新</button>
-    <button id="pauseBtn" type="button">暂停自动刷新</button>
+    <button id="backBtn" type="button">返回安全中心</button>
+    <button id="refreshBtn" type="button">刷新日志</button>
   </header>
   <main>
     <div class="summary">
       <div id="logPath">日志路径：--</div>
-      <label>显示条数 <select id="limitSelect"><option>50</option><option selected>80</option><option>120</option><option>200</option></select></label>
+      <div id="autoRefreshState">手动刷新</div>
     </div>
     <div id="logs" class="logList"><div class="empty">正在读取日志...</div></div>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    let paused = false;
-    let timer = null;
+    const LOG_LIMIT = 200;
+    let refreshInFlight = false;
 
     function authHeaders(base = {}) {
       const headers = Object.assign({}, base || {});
@@ -154,6 +154,20 @@
         unverifiable: "无法验证",
         error: "异常",
         failed: "失败",
+        warn: "警告",
+        blocked_scan_required: "需要完整扫描",
+        scanning: "扫描中",
+        purifying: "净化中",
+        clean_export_required: "净化通过，待切换",
+        purified_alternative_available: "净化模型可用",
+        purified_scan_review: "净化复扫需复核",
+        purified_scan_suspicious: "净化复扫疑似风险",
+        purified_scan_unverifiable: "净化复扫无法验证",
+        purified_scan_failed: "净化复扫失败",
+        purified_scan_no_clean_candidate: "净化候选未通过",
+        trust_store_compromised: "白名单完整性异常",
+        empty_unsealed: "白名单为空且未封存",
+        host_fingerprint_degraded: "主机指纹降级",
         scan_clean_trusted: "净化复扫通过",
         purified: "已生成净化模型",
         planned: "已生成计划",
@@ -164,7 +178,7 @@
     function statusClass(value) {
       const text = String(value || "");
       if (["clean", "trusted", "deleted", "scan_clean_trusted", "purified"].includes(text)) return "ok";
-      if (["review", "suspicious", "unverifiable", "planned", "running"].includes(text)) return "warn";
+      if (["review", "suspicious", "unverifiable", "planned", "running", "warn", "blocked_scan_required", "scanning", "purifying", "clean_export_required", "purified_alternative_available", "purified_scan_no_clean_candidate"].includes(text)) return "warn";
       if (["error", "failed"].some((part) => text.includes(part))) return "bad";
       return "";
     }
@@ -173,6 +187,7 @@
       const logs = payload.logs || {};
       $("logPath").textContent = "日志路径：" + (logs.log_path || "--");
       const entries = Array.isArray(logs.entries) ? logs.entries : [];
+      $("autoRefreshState").textContent = "手动刷新";
       if (!entries.length) {
         $("logs").innerHTML = '<div class="empty">暂无 B 模块日志。</div>';
         return;
@@ -188,7 +203,7 @@
             <span class="pill">${escapeHtml(eventLabel(item.event))}</span>
             <span class="time">${escapeHtml(formatTime(item.time))}</span>
           </div>
-          <div class="message">${escapeHtml(item.message || "")}</div>
+          <div class="message">${escapeHtml(formatMessage(item.message || ""))}</div>
           <div class="details">${fields}</div>
         </article>`;
       }).join("");
@@ -202,6 +217,8 @@
         purification_started: "净化开始",
         purification_completed: "净化完成",
         purification_failed: "净化失败",
+        purification_auto_queued: "自动净化排队",
+        model_security_bypassed: "测试绕过准入",
         whitelist_written: "写入白名单",
         whitelist_deleted: "删除白名单",
         whitelist_cleared: "清空白名单",
@@ -214,7 +231,28 @@
         model_path: "模型路径",
         source_path: "来源路径",
         output_path: "输出路径",
+        runtime_model_path: "运行模型路径",
+        purified_model_path: "净化模型路径",
+        purification_report_path: "净化报告路径",
+        report_path: "扫描报告路径",
+        scan_report_path: "复扫报告路径",
         whitelist_path: "白名单路径",
+        fingerprint: "模型指纹",
+        model_hash: "模型哈希",
+        source_pt_hash: "源PT哈希",
+        source_pt_path: "源PT路径",
+        runtime_artifact_path: "运行模型路径",
+        runtime_artifact_hash: "运行模型哈希",
+        scan_type: "扫描类型",
+        scan_status: "复扫状态",
+        auto_purify: "自动净化",
+        approval_source: "批准来源",
+        blocking_reason: "阻断原因",
+        purified_asr: "净化后ASR",
+        original_asr: "原始ASR",
+        purified_wilson_upper: "净化后Wilson上界",
+        original_wilson_upper: "原始Wilson上界",
+        risk_score: "风险分数",
         file: "文件",
         path: "路径",
         reason: "原因",
@@ -227,7 +265,28 @@
       return labels[String(key || "")] || String(key || "字段");
     }
 
+    function formatMessage(value) {
+      let text = String(value || "");
+      const replacements = {
+        "quick": "快速诊断",
+        "full": "完整扫描",
+        "review": "需要复核",
+        "clean": "扫描通过",
+        "trusted": "已信任",
+        "suspicious": "疑似风险",
+        "unverifiable": "无法验证",
+        "failed": "失败",
+        "error": "异常",
+      };
+      Object.keys(replacements).forEach((key) => {
+        text = text.replace(new RegExp(key, "g"), replacements[key]);
+      });
+      return text;
+    }
+
     function formatValue(value) {
+      if (value === true) return "是";
+      if (value === false) return "否";
       if (value && typeof value === "object") {
         try {
           return JSON.stringify(value, null, 2);
@@ -235,7 +294,31 @@
           return String(value);
         }
       }
-      return String(value);
+      const text = String(value);
+      const labels = {
+        full: "完整扫描",
+        quick: "快速诊断",
+        true: "是",
+        false: "否",
+        trusted: "已信任",
+        clean: "扫描通过",
+        review: "需要复核",
+        suspicious: "疑似风险",
+        unverifiable: "无法验证",
+        running: "运行中",
+        failed: "失败",
+        error: "异常",
+        auto_purify: "自动净化",
+        purified_full_scan: "净化模型完整复扫",
+        clean_full_scan: "原始模型完整扫描",
+        source_model_directory_with_purified_done_suffix: "源模型目录，净化完毕后缀",
+        model_not_in_whitelist: "模型未命中白名单",
+        full_scan_running: "完整扫描正在运行",
+        purification_running: "净化任务正在运行",
+        source_pt_required_for_accelerated_artifact: "加速模型需要提供同源PT",
+        purified_pt_clean_runtime_export_required: "净化PT已通过，待切换运行模型",
+      };
+      return labels[text] || text;
     }
 
     function formatTime(value) {
@@ -248,31 +331,23 @@
     }
 
     async function refreshLogs() {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
       try {
-        const limit = Number($("limitSelect").value || 80);
-        const res = await fetch(`/api/model-security/logs?limit=${limit}`, { headers: authHeaders({}) });
+        const res = await fetch(`/api/model-security/logs?limit=${LOG_LIMIT}`, { headers: authHeaders({}) });
         const data = await res.json();
         if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
         renderLogs(data);
       } catch (err) {
         $("logs").innerHTML = `<div class="empty">读取日志失败：${escapeHtml(err.message || err)}</div>`;
+      } finally {
+        refreshInFlight = false;
       }
     }
 
-    function schedule() {
-      clearTimeout(timer);
-      if (!paused) timer = setTimeout(async () => { await refreshLogs(); schedule(); }, 1500);
-    }
-
+    $("backBtn").onclick = () => { window.location.href = "/model-security"; };
     $("refreshBtn").onclick = refreshLogs;
-    $("pauseBtn").onclick = () => {
-      paused = !paused;
-      $("pauseBtn").textContent = paused ? "继续自动刷新" : "暂停自动刷新";
-      schedule();
-    };
-    $("limitSelect").onchange = refreshLogs;
     refreshLogs();
-    schedule();
   </script>
 </body>
 </html>

@@ -61,6 +61,31 @@ def _safe_slug(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value).strip("_") or "model"
 
 
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"Unable to choose a unique path for {path}")
+
+
+def _purified_done_path(source_pt: Path, *, suffix: str = "") -> Path:
+    marker = "净化完毕"
+    extra = f"_{_safe_slug(suffix)}" if suffix else ""
+    return _unique_path(source_pt.with_name(f"{source_pt.stem}_{marker}{extra}{source_pt.suffix.lower()}"))
+
+
+def _copy_candidate_to_purified_done(source_pt: Path, candidate_path: str | Path, *, suffix: str = "") -> Path:
+    source = Path(candidate_path)
+    target = _purified_done_path(source_pt, suffix=suffix)
+    if source.resolve() != target.resolve():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    return target
+
+
 def _known_poisoned_attack_metrics(family_tag: str) -> dict[str, Any] | None:
     metrics = _PACKAGED_POISONED_ATTACK_METRICS.get(str(family_tag or "").strip().lower())
     return dict(metrics) if metrics else None
@@ -387,11 +412,8 @@ def _stage_packaged_candidates(source_pt: Path, *, root: str | Path, out_dir: Pa
     staged: list[dict[str, Any]] = []
     staged_dir = out_dir / "packaged_strict"
     family_tag = _family_tag_for_model(source_pt, root=root)
-    for source_candidate in _packaged_purified_candidates(source_pt, root=root):
-        staged_dir.mkdir(parents=True, exist_ok=True)
-        target = staged_dir / f"{_safe_slug(source_candidate.stem)}{source_candidate.suffix.lower()}"
-        if source_candidate.resolve() != target.resolve():
-            shutil.copy2(source_candidate, target)
+    for index, source_candidate in enumerate(_packaged_purified_candidates(source_pt, root=root), 1):
+        target = _copy_candidate_to_purified_done(source_pt, source_candidate, suffix="" if index == 1 else str(index))
         certification = packaged_strict_certification_for_model(source_candidate, root=root)
         item = {
             "candidate_source": "packaged_strict_purified",
@@ -403,6 +425,8 @@ def _stage_packaged_candidates(source_pt: Path, *, root: str | Path, out_dir: Pa
             "requires_full_scan": True,
             "validation_scope": "new_algorithm_family_strict_audit",
         }
+        if source_candidate.parent != target.parent:
+            item["local_output_policy"] = "source_model_directory_with_purified_done_suffix"
         if certification is not None:
             item["new_algorithm_strict_audit"] = certification
         staged.append(item)
@@ -593,11 +617,17 @@ def run_new_purification(
         else:
             selected = result.candidates[0]
             report.diagnostics["selection_policy"] = "pending_full_scan_first_candidate"
-        purified = Path(selected.output_model)
+        original_output = Path(selected.output_model)
+        purified = _copy_candidate_to_purified_done(source_pt, original_output)
         report.purified_model_path = str(purified)
         report.purified_model_hash = "sha256:" + sha256_file(purified)
         report.status = "candidate_generated"
-        report.diagnostics["selected_candidate"] = selected.to_dict()
+        selected_candidate = selected.to_dict()
+        selected_candidate["original_output_model"] = str(original_output)
+        selected_candidate["output_model"] = str(purified)
+        selected_candidate["output_model_hash"] = report.purified_model_hash
+        selected_candidate["local_output_policy"] = "source_model_directory_with_purified_done_suffix"
+        report.diagnostics["selected_candidate"] = selected_candidate
         report.diagnostics["candidate_manifest"] = str(out_dir / "weight_soup" / "weight_soup_candidates_manifest.json")
         return report
     except Exception as exc:

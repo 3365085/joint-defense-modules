@@ -111,6 +111,105 @@ def test_trust_records_backfills_old_purified_metrics_from_reports(tmp_path: Pat
     assert records[0]["security_metrics"]["purified_wilson_upper"] == 0.004401095733793813
 
 
+def test_trusted_purified_status_prefers_registry_bound_purification_report(tmp_path: Path):
+    svc = ModelSecurityService(root=tmp_path)
+    poisoned = tmp_path / "poisoned.pt"
+    purified = tmp_path / "poisoned_净化完毕.pt"
+    poisoned.write_bytes(b"poisoned-model" * 128)
+    purified.write_bytes(b"purified-model" * 128)
+    custom_model = {
+        "enabled": True,
+        "path": str(purified),
+        "backend": "pytorch",
+        "model_family": "yolov5",
+        "source_pt_path": str(purified),
+    }
+    purified_fp = svc.current_fingerprint(custom_model=custom_model)
+    purified_report = ModelSecurityReport(
+        fingerprint={
+            "fingerprint": purified_fp.fingerprint,
+            "model_hash": purified_fp.model_hash,
+        },
+        scan_type="full",
+        status="clean",
+        risk_score=0.0044,
+        source_model_path=str(purified),
+        source_model_hash=purified_fp.model_hash,
+        diagnostics={
+            "new_algorithm_strict_audit": {
+                "family_tag": "b4",
+                "k": 0,
+                "N": 869,
+                "wilson_upper": 0.004401095733793813,
+            }
+        },
+    )
+    svc._write_report(purified_report)
+    original_report = ModelSecurityReport(
+        fingerprint={"fingerprint": "sha256:poisoned", "model_hash": "sha256:poisoned-model"},
+        scan_type="full",
+        status="suspicious",
+        risk_score=1.0,
+        source_model_path=str(poisoned),
+        source_model_hash="sha256:poisoned-model",
+        diagnostics={
+            "new_algorithm_poisoned_evidence": {
+                "family_tag": "b4",
+                "original_attack_metrics": {"max_asr": 1.0, "attack": "sig_lowfreq_hi_oda", "source": "unit"},
+            }
+        },
+    )
+    svc._write_report(original_report)
+    trusted_purification = ModelPurificationReport(
+        fingerprint=original_report.fingerprint,
+        status="scan_clean_trusted",
+        strategy="autodetox_backbone_soup",
+        source_model_path=str(poisoned),
+        source_model_hash="sha256:poisoned-model",
+        purified_model_path=str(purified),
+        purified_model_hash=purified_fp.model_hash,
+        scan_report_path=purified_report.report_path,
+        scan_status="clean",
+    )
+    trusted_path = svc.storage.reports_dir / "sha256_poisoned_purification.json"
+    trusted_purification.write(trusted_path)
+    stale_purification = ModelPurificationReport(
+        fingerprint={"fingerprint": purified_fp.fingerprint, "model_hash": purified_fp.model_hash},
+        status="planned",
+        strategy="autodetox_backbone_soup",
+        source_model_path=str(purified),
+        source_model_hash=purified_fp.model_hash,
+        error="clean_anchor_required_for_backbone_soup",
+    )
+    stale_purification.write(svc.storage.reports_dir / f"{purified_fp.fingerprint.replace(':','_')}_purification.json")
+    svc.registry.mark_trusted(
+        purified_fp.fingerprint,
+        risk_score=0.0044,
+        report_path=purified_report.report_path,
+        runtime_model_hash=purified_fp.model_hash,
+        runtime_model_path=str(purified),
+        source_model_hash=purified_fp.model_hash,
+        source_model_path=str(purified),
+        original_source_model_hash="sha256:poisoned-model",
+        original_source_model_path=str(poisoned),
+        scanner_version=purified_fp.scanner_version,
+        class_names_hash=purified_fp.class_names_hash,
+        ppe_mapping_hash=purified_fp.ppe_mapping_hash,
+        purification_report_path=str(trusted_path),
+        security_metrics={"original_asr": 1.0, "purified_asr": 0.0},
+        approval_source="purified_full_scan",
+    )
+
+    status = svc.status(custom_model=custom_model)
+
+    assert status["admission_status"] == "trusted"
+    assert status["purification_status"] == "scan_clean_trusted"
+    assert status["purification_report_path"] == str(trusted_path)
+    assert status["purified_model_path"] == str(purified)
+    assert status["security_metrics"]["original_asr"] == 1.0
+    assert status["security_metrics"]["purified_asr"] == 0.0
+
+
 def test_packaged_purification_candidates_follow_hash_when_model_is_renamed(tmp_path: Path, monkeypatch):
     package = tmp_path / "new_algorithm"
     poisoned_dir = package / "models" / "poisoned"

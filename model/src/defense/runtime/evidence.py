@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import base64
+import sqlite3
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +40,388 @@ def append_jsonl(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fp:
         fp.write(json.dumps(data, ensure_ascii=False, default=str) + "\n")
+
+
+def _evidence_db_path(root: str | Path | None = None) -> Path:
+    return _resolved_root(root) / "evidence_index.sqlite3"
+
+
+def _ensure_evidence_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_events (
+            event_key TEXT PRIMARY KEY,
+            channel TEXT NOT NULL,
+            source_type TEXT,
+            source TEXT,
+            profile TEXT,
+            session_dir TEXT,
+            event_dir TEXT NOT NULL,
+            started_at TEXT,
+            ended_at TEXT,
+            started_frame INTEGER,
+            last_active_frame INTEGER,
+            frame_count INTEGER,
+            max_score REAL,
+            reason TEXT,
+            clip_path TEXT,
+            representative_path TEXT,
+            event_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_events_ended_at ON evidence_events(ended_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_events_channel ON evidence_events(channel)")
+
+
+def _index_evidence_event(summary: dict[str, Any], *, root: str | Path | None = None) -> None:
+    try:
+        event_dir = Path(str(summary.get("event_dir") or "")).resolve()
+        if not event_dir:
+            return
+        base = _resolved_root(root)
+        if not _is_under(event_dir, base):
+            return
+        event_key = str(summary.get("evidence_event_key") or _event_key(event_dir, root=base))
+        now = datetime.now().isoformat(timespec="seconds")
+        db_path = _evidence_db_path(base)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(db_path), timeout=5.0) as conn:
+            _ensure_evidence_db(conn)
+            conn.execute(
+                """
+                INSERT INTO evidence_events (
+                    event_key, channel, source_type, source, profile, session_dir, event_dir,
+                    started_at, ended_at, started_frame, last_active_frame, frame_count,
+                    max_score, reason, clip_path, representative_path, event_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    channel=excluded.channel,
+                    source_type=excluded.source_type,
+                    source=excluded.source,
+                    profile=excluded.profile,
+                    session_dir=excluded.session_dir,
+                    event_dir=excluded.event_dir,
+                    started_at=excluded.started_at,
+                    ended_at=excluded.ended_at,
+                    started_frame=excluded.started_frame,
+                    last_active_frame=excluded.last_active_frame,
+                    frame_count=excluded.frame_count,
+                    max_score=excluded.max_score,
+                    reason=excluded.reason,
+                    clip_path=excluded.clip_path,
+                    representative_path=excluded.representative_path,
+                    event_json=excluded.event_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    event_key,
+                    str(summary.get("channel") or ""),
+                    str(summary.get("source_type") or ""),
+                    str(summary.get("source") or ""),
+                    str(summary.get("profile") or ""),
+                    str(summary.get("session_dir") or ""),
+                    str(summary.get("event_dir") or ""),
+                    str(summary.get("started_at") or ""),
+                    str(summary.get("ended_at") or ""),
+                    _int(summary.get("started_frame")),
+                    _int(summary.get("last_active_frame")),
+                    _int(summary.get("frame_count")),
+                    float(summary.get("max_score") or 0.0),
+                    str(summary.get("reason") or summary.get("ppe_event_last_reason") or ""),
+                    str(summary.get("evidence_clip_path") or ""),
+                    str(summary.get("evidence_representative_path") or summary.get("representative_path") or ""),
+                    json.dumps(summary, ensure_ascii=False, default=str),
+                    now,
+                ),
+            )
+    except Exception:
+        return
+
+
+def _resolved_root(root: str | Path | None = None) -> Path:
+    return (Path(root) if root else default_evidence_root()).resolve()
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def evidence_token_for_path(path: str | Path, *, root: str | Path | None = None) -> str:
+    base = _resolved_root(root)
+    target = Path(path).resolve()
+    if not _is_under(target, base):
+        raise ValueError("evidence_path_outside_root")
+    rel = target.relative_to(base).as_posix()
+    return base64.urlsafe_b64encode(rel.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def evidence_path_from_token(token: str, *, root: str | Path | None = None) -> Path:
+    text = str(token or "").strip()
+    if not text:
+        raise ValueError("empty_evidence_token")
+    padded = text + ("=" * (-len(text) % 4))
+    try:
+        rel = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except Exception as exc:
+        raise ValueError("invalid_evidence_token") from exc
+    base = _resolved_root(root)
+    target = (base / rel).resolve()
+    if not _is_under(target, base):
+        raise ValueError("evidence_path_outside_root")
+    return target
+
+
+def _event_key(event_dir: Path, *, root: str | Path | None = None) -> str:
+    return evidence_token_for_path(event_dir, root=root)
+
+
+def _file_url(path: str | Path, *, root: str | Path | None = None) -> str:
+    return f"/api/evidence/file?token={evidence_token_for_path(path, root=root)}"
+
+
+def _event_preview_url(event_dir: Path, *, root: str | Path | None = None) -> str:
+    return f"/evidence?event={_event_key(event_dir, root=root)}"
+
+
+def enrich_evidence_summary(summary: dict[str, Any], *, root: str | Path | None = None) -> dict[str, Any]:
+    data = dict(summary or {})
+    event_dir = Path(str(data.get("event_dir") or ""))
+    if not event_dir:
+        return data
+    base = _resolved_root(root)
+    event_dir = event_dir.resolve()
+    if not _is_under(event_dir, base):
+        return data
+    try:
+        key = _event_key(event_dir, root=base)
+        data["evidence_event_key"] = key
+        data["evidence_preview_url"] = _event_preview_url(event_dir, root=base)
+    except ValueError:
+        return data
+    rep = str(data.get("evidence_representative_path") or data.get("representative_path") or "")
+    if rep:
+        try:
+            data["evidence_representative_url"] = _file_url(rep, root=base)
+        except ValueError:
+            pass
+    clip = str(data.get("evidence_clip_path") or "")
+    if clip and data.get("evidence_clip_browser_playable", True) is not False:
+        try:
+            data["evidence_clip_url"] = _file_url(clip, root=base)
+        except ValueError:
+            pass
+    return data
+
+
+def _ffmpeg_exe() -> str | None:
+    try:
+        import imageio_ffmpeg
+
+        return str(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        return None
+
+
+def _concat_file_line(path: Path) -> str:
+    text = path.as_posix().replace("'", "'\\''")
+    return f"file '{text}'"
+
+
+def _write_browser_mp4_from_frames(
+    event_dir: Path,
+    frame_paths: list[Path],
+    *,
+    fps: int,
+) -> tuple[Path | None, dict[str, Any]]:
+    if not frame_paths:
+        return None, {"evidence_clip_status": "no_frames", "evidence_clip_browser_playable": False}
+    ffmpeg = _ffmpeg_exe()
+    if not ffmpeg:
+        return None, {
+            "evidence_clip_status": "ffmpeg_unavailable",
+            "evidence_clip_codec": "",
+            "evidence_clip_browser_playable": False,
+        }
+    fps = max(1, int(fps))
+    duration = 1.0 / float(fps)
+    list_path = event_dir / "clip_frames.txt"
+    tmp_path = event_dir / "clip.tmp.mp4"
+    out_path = event_dir / "clip.mp4"
+    lines: list[str] = []
+    for path in frame_paths:
+        rel = path.resolve().relative_to(event_dir.resolve())
+        lines.append(_concat_file_line(rel))
+        lines.append(f"duration {duration:.6f}")
+    lines.append(_concat_file_line(frame_paths[-1].resolve().relative_to(event_dir.resolve())))
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        list_path.name,
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+        "-r",
+        str(fps),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-profile:v",
+        "baseline",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        tmp_path.name,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(event_dir),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            return None, {
+                "evidence_clip_status": "h264_encode_failed",
+                "evidence_clip_error": (result.stderr or result.stdout or "").strip()[:800],
+                "evidence_clip_codec": "",
+                "evidence_clip_browser_playable": False,
+            }
+        tmp_path.replace(out_path)
+        return out_path, {
+            "evidence_clip_status": "ok",
+            "evidence_clip_codec": "h264",
+            "evidence_clip_fps": fps,
+            "evidence_clip_browser_playable": True,
+        }
+    except Exception as exc:
+        return None, {
+            "evidence_clip_status": "h264_encode_exception",
+            "evidence_clip_error": str(exc)[:800],
+            "evidence_clip_codec": "",
+            "evidence_clip_browser_playable": False,
+        }
+    finally:
+        try:
+            list_path.unlink(missing_ok=True)
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _repair_event_clip_if_needed(data: dict[str, Any], *, root: str | Path | None = None) -> dict[str, Any]:
+    if data.get("evidence_clip_codec") == "h264" and data.get("evidence_clip_browser_playable", True) is not False:
+        return data
+    event_dir = Path(str(data.get("event_dir") or ""))
+    if not event_dir:
+        return data
+    base = _resolved_root(root)
+    event_dir = event_dir.resolve()
+    if not _is_under(event_dir, base):
+        return data
+    frames_dir = event_dir / "frames"
+    frame_paths = sorted(frames_dir.glob("*.jpg")) if frames_dir.exists() else []
+    if not frame_paths:
+        return data
+    fps = _int(data.get("evidence_clip_fps") or data.get("clip_fps") or 6) or 6
+    clip_path, clip_meta = _write_browser_mp4_from_frames(event_dir, frame_paths, fps=fps)
+    data.update(clip_meta)
+    if clip_path:
+        data["evidence_clip_path"] = str(clip_path)
+    data = enrich_evidence_summary(data, root=base)
+    try:
+        write_json(event_dir / "event.json", data)
+        _index_evidence_event(data, root=base)
+    except Exception:
+        pass
+    return data
+
+
+def load_evidence_event(key: str, *, root: str | Path | None = None) -> dict[str, Any]:
+    event_dir = evidence_path_from_token(key, root=root)
+    event_path = event_dir / "event.json"
+    if not event_path.exists() or not event_path.is_file():
+        raise FileNotFoundError("evidence_event_not_found")
+    data = json.loads(event_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("invalid_evidence_event")
+    data = enrich_evidence_summary(data, root=root)
+    data = _repair_event_clip_if_needed(data, root=root)
+    frames_dir = event_dir / "frames"
+    frames: list[dict[str, Any]] = []
+    if frames_dir.exists() and frames_dir.is_dir():
+        for path in sorted(frames_dir.glob("*.jpg")):
+            try:
+                frames.append({"name": path.name, "url": _file_url(path, root=root)})
+            except ValueError:
+                continue
+    data["frames"] = frames
+    data["frame_count"] = int(data.get("frame_count") or len(frames))
+    return data
+
+
+def list_evidence_events(*, root: str | Path | None = None, limit: int = 50) -> dict[str, Any]:
+    base = _resolved_root(root)
+    events_by_key: dict[str, dict[str, Any]] = {}
+    max_limit = max(1, min(int(limit or 50), 200))
+    db_path = _evidence_db_path(base)
+    if db_path.exists():
+        try:
+            with sqlite3.connect(str(db_path), timeout=5.0) as conn:
+                _ensure_evidence_db(conn)
+                rows = conn.execute(
+                    "SELECT event_json FROM evidence_events ORDER BY ended_at DESC, updated_at DESC LIMIT ?",
+                    (max_limit,),
+                ).fetchall()
+            for (raw,) in rows:
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(item, dict):
+                    enriched = enrich_evidence_summary(item, root=base)
+                    key = str(enriched.get("evidence_event_key") or "")
+                    if key:
+                        events_by_key[key] = enriched
+        except Exception:
+            events_by_key = {}
+    if base.exists():
+        event_paths = sorted(base.glob("*/*/event_*/event.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for event_path in event_paths[: max_limit * 2]:
+            try:
+                item = json.loads(event_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                enriched = enrich_evidence_summary(item, root=base)
+                key = str(enriched.get("evidence_event_key") or "")
+                if key and key not in events_by_key:
+                    events_by_key[key] = enriched
+                _index_evidence_event(enriched, root=base)
+    events = sorted(
+        events_by_key.values(),
+        key=lambda item: str(item.get("ended_at") or item.get("started_at") or ""),
+        reverse=True,
+    )[:max_limit]
+    return {"root": str(base), "database": str(db_path), "count": len(events), "events": events}
 
 
 @dataclass(slots=True)
@@ -75,6 +460,7 @@ class EvidenceSession:
         post_frames: int = 18,
         sample_every: int = 3,
         max_frames_per_event: int = 80,
+        clip_fps: int = 6,
     ) -> None:
         self.enabled = bool(enabled)
         self.source_type = str(source_type)
@@ -85,6 +471,7 @@ class EvidenceSession:
         self.post_frames = max(0, int(post_frames))
         self.sample_every = max(1, int(sample_every))
         self.max_frames_per_event = max(1, int(max_frames_per_event))
+        self.clip_fps = max(1, int(clip_fps))
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_dir = self.root / f"{stamp}_{safe_path_part(source_type)}_{safe_path_part(Path(source).stem or source)}_{safe_path_part(profile)}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -189,9 +576,14 @@ class EvidenceSession:
         peak_score = round(float(event.max_score), 6)
         reasons = sorted(event.reasons)
         frames_dir = event.event_dir / "frames"
+        clip_path = self._write_event_clip(event)
         summary = {
             "channel": event.channel,
             "event_id": event.event_id,
+            "source_type": self.source_type,
+            "source": self.source,
+            "profile": self.profile,
+            "session_dir": str(self.session_dir),
             "event_dir": str(event.event_dir),
             "started_at": event.started_at,
             "ended_at": datetime.now().isoformat(timespec="seconds"),
@@ -212,14 +604,27 @@ class EvidenceSession:
             "evidence_saved_frame_count": event.frame_count,
             "evidence_frames_dir": str(frames_dir),
             "evidence_representative_path": event.representative_path or "",
+            "evidence_clip_path": str(clip_path) if clip_path else "",
             "close_reason": reason,
         }
         summary.update(event.metadata)
+        summary = enrich_evidence_summary(summary, root=self.root)
         write_json(event.event_dir / "event.json", summary)
         append_jsonl(self.events_jsonl, summary)
+        _index_evidence_event(summary, root=self.root)
         self.saved_events.append(summary)
         self._write_manifest(opened=True)
         return summary
+
+    def _write_event_clip(self, event: EventState) -> Path | None:
+        frames_dir = event.event_dir / "frames"
+        frame_paths = sorted(frames_dir.glob("*.jpg"))
+        if not frame_paths:
+            event.metadata.update({"evidence_clip_status": "no_frames", "evidence_clip_browser_playable": False})
+            return None
+        clip_path, clip_meta = _write_browser_mp4_from_frames(event.event_dir, frame_paths, fps=self.clip_fps)
+        event.metadata.update(clip_meta)
+        return clip_path
 
     def _write_manifest(self, *, opened: bool) -> None:
         write_json(

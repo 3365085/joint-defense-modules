@@ -94,6 +94,16 @@ class ModelSecurityService:
         entries.reverse()
         return {"log_path": str(self.log_path), "count": len(entries), "entries": entries}
 
+    def clear_logs(self) -> dict[str, Any]:
+        with self._lock:
+            try:
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                self.log_path.write_text("", encoding="utf-8")
+            except Exception as exc:
+                return {"log_path": str(self.log_path), "cleared": False, "error": str(exc)}
+            self._log_event("logs_cleared", status="deleted", message="已清空B模块运行日志")
+        return {"log_path": str(self.log_path), "cleared": True, "entries": self.recent_logs(limit=20).get("entries", [])}
+
     def _config(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> dict[str, Any]:
         return load_runtime_config(config_path=self.config_path, profile=profile or "default", custom_model=custom_model or {})
 

@@ -65,17 +65,19 @@
       background: var(--panel2);
     }
     .title { font-weight: 700; white-space: nowrap; }
-    .content { display: grid; gap: 10px; padding: 14px; }
-    .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-    .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .content { display: grid; gap: 10px; padding: 12px; }
+    .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .actionGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 8px; }
+    .pathGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
     .metric {
       min-width: 0;
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 12px;
+      padding: 8px 10px;
       background: #11161b;
     }
-    .metric b { display: block; font-size: 22px; line-height: 1.15; }
+    .metric b { display: block; font-size: 18px; line-height: 1.1; }
     .metric span { color: var(--muted); font-size: 12px; }
     .pill {
       min-width: 76px;
@@ -145,7 +147,7 @@
     .notice {
       border-left: 3px solid var(--blue);
       background: #11161b;
-      padding: 10px 12px;
+      padding: 8px 10px;
       color: var(--muted);
       line-height: 1.6;
     }
@@ -186,8 +188,21 @@
       color: var(--muted);
       text-align: center;
     }
+    .headerActions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex: 0 0 auto;
+    }
+    .headerActions button { width: auto; }
+    details.panel > summary.panelHeader {
+      cursor: pointer;
+      list-style: none;
+    }
+    details.panel > summary.panelHeader::-webkit-details-marker { display: none; }
+    details.panel:not([open]) .content { display: none; }
     @media (max-width: 980px) {
-      header, main, .grid2, .grid3 { grid-template-columns: 1fr; }
+      header, main, .grid2, .grid3, .pathGrid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -228,7 +243,6 @@
           <div class="notice">运行后端由模型格式决定：.engine 走 TensorRT，.onnx 走 ONNX，.pt/.pth 走 PyTorch；B模块准入仍以原始 PT 或净化后 PT 为依据。</div>
           <label class="checkLine"><input id="testBypassModelSecurity" type="checkbox" />测试入口：绕过B模块安全准入直接运行当前模型</label>
           <div class="notice warn">仅用于当前阶段对比毒模型、原模型和净化模型检测效果；不会写入白名单，禁止生产使用。</div>
-          <button id="resetModelConfigBtn" type="button">恢复默认模型</button>
           <div id="modelConfigMessage" class="field"></div>
         </div>
       </section>
@@ -251,7 +265,7 @@
             <div class="metric"><b id="purifiedWilson">--</b><span>净化后Wilson上界</span></div>
           </div>
           <div class="notice">安全页只在打开、手动刷新、配置变更或任务操作后更新状态；扫描和净化进度会写入日志页。</div>
-          <div class="stack">
+          <div class="pathGrid">
             <div class="field"><strong>运行模型：</strong><code id="runtimePath">--</code></div>
             <div class="field"><strong>源PT：</strong><code id="sourcePtStatusPath">--</code></div>
             <div class="field"><strong>原始源模型：</strong><code id="originalSourcePath">--</code></div>
@@ -264,38 +278,18 @@
 
       <section class="panel">
         <div class="panelHeader">
-          <div class="title">白名单完整性</div>
-          <div id="trustStorePill" class="pill">未检查</div>
-        </div>
-        <div class="content">
-          <div id="trustStoreNotice" class="notice">正在校验白名单和系统指纹。</div>
-          <div class="field"><strong>白名单文件：</strong><code id="registryPath">--</code></div>
-          <div class="field"><strong>签名文件：</strong><code id="sealPath">--</code></div>
-          <div class="field"><strong>系统指纹：</strong><code id="hostFingerprint">--</code></div>
-          <div class="field"><strong>白名单哈希：</strong><code id="registryHash">--</code></div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panelHeader">
           <div class="title">操作</div>
           <div class="pill">系统自动写入</div>
         </div>
         <div class="content">
           <div class="notice">白名单只能由原始PT完整扫描通过，或可疑模型净化后二次完整扫描通过后自动写入。用户只能删除或清空，不能手工添加。</div>
-          <div class="grid2">
+          <div class="actionGrid">
             <button id="scanBtn" class="primary" type="button">完整扫描并自动净化</button>
             <button id="purifyBtn" type="button">净化并复扫</button>
-          </div>
-          <div class="grid2">
             <button id="scanReportBtn" type="button">查看扫描报告</button>
             <button id="purifyReportBtn" type="button">查看净化报告</button>
-          </div>
-          <div class="grid2">
             <button id="logsPageBtn" type="button">打开日志页</button>
             <button id="deleteCurrentBtn" type="button">删除当前模型信任</button>
-          </div>
-          <div class="grid2">
             <button id="clearAllBtn" class="danger" type="button">清空白名单</button>
           </div>
           <div id="message" class="field"></div>
@@ -317,12 +311,29 @@
       <section class="panel">
         <div class="panelHeader">
           <div class="title">最近日志</div>
-          <button id="refreshLogsBtn" type="button" style="width:auto;">刷新日志</button>
+          <div class="headerActions">
+            <button id="refreshLogsBtn" type="button">刷新日志</button>
+            <button id="clearLogsBtn" class="danger" type="button">清空日志</button>
+          </div>
         </div>
         <div class="content">
           <div id="logs" class="logs"><div class="empty">正在读取日志。</div></div>
         </div>
       </section>
+
+      <details class="panel">
+        <summary class="panelHeader">
+          <div class="title">白名单完整性</div>
+          <div id="trustStorePill" class="pill">未检查</div>
+        </summary>
+        <div class="content">
+          <div id="trustStoreNotice" class="notice">正在校验白名单和系统指纹。</div>
+          <div class="field"><strong>白名单文件：</strong><code id="registryPath">--</code></div>
+          <div class="field"><strong>签名文件：</strong><code id="sealPath">--</code></div>
+          <div class="field"><strong>系统指纹：</strong><code id="hostFingerprint">--</code></div>
+          <div class="field"><strong>白名单哈希：</strong><code id="registryHash">--</code></div>
+        </div>
+      </details>
     </aside>
   </main>
 
@@ -390,6 +401,7 @@
     }
 
     function loadModelConfig() {
+      try { localStorage.removeItem("moduleA.lastCustomModelBackend"); } catch (_) {}
       $("enableCustomModel").checked = getStored("moduleA.lastCustomModelEnabled", "false") === "true";
       $("customModelPath").value = getStored("moduleA.lastModelPath", "");
       $("sourcePtPath").value = getStored("moduleA.lastSourcePtPath", "");
@@ -409,16 +421,6 @@
       setStored("moduleA.testBypassModelSecurity", $("testBypassModelSecurity").checked ? "true" : "false");
       syncModelConfigControls();
       if (!options.silent) showConfigMessage("配置已应用。陌生模型会在开始检测或手动扫描时进入B模块准入。");
-    }
-
-    function resetModelConfig() {
-      $("enableCustomModel").checked = false;
-      $("customModelPath").value = "";
-      $("sourcePtPath").value = "";
-      $("customModelFamily").value = "auto";
-      $("testBypassModelSecurity").checked = false;
-      saveModelConfig({silent: true});
-      showConfigMessage("已恢复默认模型配置。");
     }
 
     function syncModelConfigControls() {
@@ -494,6 +496,7 @@
         whitelist_written: "写入白名单",
         whitelist_deleted: "删除白名单",
         whitelist_cleared: "清空白名单",
+        logs_cleared: "清空日志",
       };
       return labels[String(value || "")] || String(value || "事件");
     }
@@ -725,6 +728,19 @@
     $("backBtn").onclick = () => { window.location.href = "/"; };
     $("refreshBtn").onclick = refreshAll;
     $("refreshLogsBtn").onclick = refreshLogs;
+    $("clearLogsBtn").onclick = async () => {
+      if (!confirm("清空 B 模块运行日志？此操作不会删除扫描报告、净化报告或白名单。")) return;
+      $("clearLogsBtn").disabled = true;
+      try {
+        await api("/api/model-security/logs/clear", {});
+        showMessage("B模块运行日志已清空。");
+        await refreshLogs();
+      } catch (err) {
+        showMessage(err.message || String(err));
+      } finally {
+        $("clearLogsBtn").disabled = false;
+      }
+    };
     async function applyModelConfigChange(message = "配置已应用。") {
       saveModelConfig({silent: true});
       showConfigMessage(message);
@@ -768,10 +784,6 @@
       } finally {
         syncModelConfigControls();
       }
-    };
-    $("resetModelConfigBtn").onclick = async () => {
-      resetModelConfig();
-      await refreshAll();
     };
     $("scanBtn").onclick = async () => {
       $("scanBtn").disabled = true;

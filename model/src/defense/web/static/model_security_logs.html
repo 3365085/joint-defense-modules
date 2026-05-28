@@ -28,7 +28,7 @@
       top: 0;
       z-index: 2;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
       gap: 10px;
       align-items: center;
       padding: 14px 18px;
@@ -119,6 +119,7 @@
     <h1>B模块运行日志</h1>
     <button id="backBtn" type="button">返回安全中心</button>
     <button id="refreshBtn" type="button">刷新日志</button>
+    <button id="clearBtn" type="button">清空日志</button>
   </header>
   <main>
     <div class="summary">
@@ -222,6 +223,7 @@
         whitelist_written: "写入白名单",
         whitelist_deleted: "删除白名单",
         whitelist_cleared: "清空白名单",
+        logs_cleared: "清空日志",
       };
       return labels[String(value || "")] || String(value || "事件");
     }
@@ -345,8 +347,28 @@
       }
     }
 
+    async function clearLogs() {
+      if (!confirm("清空 B 模块运行日志？扫描报告、净化报告和白名单不会被删除。")) return;
+      $("clearBtn").disabled = true;
+      try {
+        const res = await fetch("/api/model-security/logs/clear", {
+          method: "POST",
+          headers: authHeaders({"Content-Type": "application/json"}),
+          body: "{}",
+        });
+        const data = await res.json();
+        if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+        renderLogs(data);
+      } catch (err) {
+        $("logs").innerHTML = `<div class="empty">清空日志失败：${escapeHtml(err.message || err)}</div>`;
+      } finally {
+        $("clearBtn").disabled = false;
+      }
+    }
+
     $("backBtn").onclick = () => { window.location.href = "/model-security"; };
     $("refreshBtn").onclick = refreshLogs;
+    $("clearBtn").onclick = clearLogs;
     refreshLogs();
   </script>
 </body>

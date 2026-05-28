@@ -1187,6 +1187,8 @@ class MonitorEngine:
                 pre_frames=int(runtime_config.get("evidence_pre_frames", 12)),
                 post_frames=int(runtime_config.get("evidence_post_frames", 18)),
                 sample_every=max(1, int(max(1, self._source_fps) / max(1, int(runtime_config.get("evidence_fps", 15))))),
+                max_frames_per_event=int(runtime_config.get("evidence_max_frames_per_event", 40)),
+                clip_fps=int(runtime_config.get("evidence_clip_fps", 6)),
             )
             process_fps_cap = float(runtime_config.get("detector_process_fps_cap", runtime_config.get("process_fps_cap", 15)) or 15)
             target_frame_budget_ms = 1000.0 / max(1.0, min(self._source_fps, process_fps_cap))

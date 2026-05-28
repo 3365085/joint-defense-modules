@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>事件证据预览</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101214;
+      --panel: #181c20;
+      --panel2: #20262b;
+      --line: #353d45;
+      --text: #f4f7fa;
+      --muted: #a9b4bf;
+      --danger: #ff4d5e;
+      --warn: #ffc857;
+      --blue: #6bb8ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 10px;
+      align-items: center;
+      padding: 12px 18px;
+      background: var(--panel2);
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 18px; letter-spacing: 0; }
+    button, a.button {
+      height: 34px;
+      border: 1px solid #46535f;
+      border-radius: 6px;
+      background: #27313a;
+      color: var(--text);
+      font-weight: 650;
+      padding: 0 12px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 14px;
+      padding: 14px 18px 24px;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+      min-width: 0;
+    }
+    .panelHeader {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      min-height: 46px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel2);
+    }
+    .title { font-weight: 700; }
+    .content { display: grid; gap: 10px; padding: 14px; }
+    .preview {
+      display: grid;
+      gap: 12px;
+    }
+    video, img {
+      width: 100%;
+      max-height: calc(100vh - 180px);
+      object-fit: contain;
+      background: #080a0c;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .metaGrid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #11161b;
+    }
+    .metric b { display: block; font-size: 18px; line-height: 1.1; }
+    .metric span { color: var(--muted); font-size: 12px; }
+    .frames {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 8px;
+      max-height: 52vh;
+      overflow: auto;
+    }
+    .frames a {
+      display: block;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #11161b;
+      text-decoration: none;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .frames img {
+      border: 0;
+      border-radius: 0;
+      height: 80px;
+      object-fit: cover;
+    }
+    .frames span { display: block; padding: 5px 7px; overflow-wrap: anywhere; }
+    code {
+      display: block;
+      color: #d7e8ff;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      overflow-wrap: anywhere;
+    }
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 22px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .warn { color: var(--warn); }
+    .clipFallback {
+      display: none;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      color: var(--warn);
+      background: #14191e;
+    }
+    @media (max-width: 900px) {
+      header, main, .metaGrid { grid-template-columns: 1fr; }
+      button, a.button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>事件证据预览</h1>
+    <button id="backBtn" type="button">返回监控台</button>
+    <button id="refreshBtn" type="button">刷新</button>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="panelHeader">
+        <div class="title">预览</div>
+        <a id="downloadClip" class="button" href="#" target="_blank" style="display:none;">打开视频文件</a>
+      </div>
+      <div class="content preview" id="preview"><div class="empty">正在读取事件证据。</div></div>
+    </section>
+    <aside class="panel">
+      <div class="panelHeader"><div class="title">事件信息</div></div>
+      <div class="content" id="meta"><div class="empty">暂无事件信息。</div></div>
+    </aside>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const params = new URLSearchParams(window.location.search);
+    const eventKey = params.get("event") || "";
+
+    function authHeaders(base = {}) {
+      const headers = Object.assign({}, base || {});
+      try {
+        const token = localStorage.getItem("moduleAToken") || "";
+        if (token) headers["X-Module-A-Token"] = token;
+      } catch (_) {}
+      return headers;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"]/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch]));
+    }
+
+    function channelLabel(value) {
+      const labels = {ppe: "安全帽告警", module_a: "模块A告警", a3b: "A3b警告", source_auth: "视频源真实性"};
+      return labels[String(value || "")] || String(value || "事件");
+    }
+
+    function renderEvent(event) {
+      const frames = Array.isArray(event.frames) ? event.frames : [];
+      $("downloadClip").style.display = event.evidence_clip_url ? "inline-flex" : "none";
+      $("downloadClip").href = event.evidence_clip_url || "#";
+      const poster = event.evidence_representative_url ? ` poster="${event.evidence_representative_url}"` : "";
+      const media = event.evidence_clip_url
+        ? `<video id="clipVideo" src="${event.evidence_clip_url}"${poster} controls autoplay muted playsinline preload="metadata"></video>
+           <div id="clipFallback" class="clipFallback">视频片段无法播放，已保留关键帧和原始文件链接。状态：${escapeHtml(event.evidence_clip_status || "unknown")}</div>`
+        : (event.evidence_representative_url ? `<img src="${event.evidence_representative_url}" alt="代表帧" />` : '<div class="empty">该事件还没有可预览媒体。</div>');
+      $("preview").innerHTML = `
+        ${media}
+        <section class="panel">
+          <div class="panelHeader"><div class="title">关键帧</div><div class="warn">${frames.length} 张</div></div>
+          <div class="content">
+            <div class="frames">${frames.map((frame) => `
+              <a href="${frame.url}" target="_blank">
+                <img src="${frame.url}" alt="${escapeHtml(frame.name)}" />
+                <span>${escapeHtml(frame.name)}</span>
+              </a>`).join("") || '<div class="empty">暂无关键帧。</div>'}</div>
+          </div>
+        </section>`;
+      $("meta").innerHTML = `
+        <div class="metaGrid">
+          <div class="metric"><b>${escapeHtml(channelLabel(event.channel))}</b><span>事件类型</span></div>
+          <div class="metric"><b>${escapeHtml(event.started_frame ?? "--")}</b><span>开始帧</span></div>
+          <div class="metric"><b>${escapeHtml(event.last_active_frame ?? "--")}</b><span>结束帧</span></div>
+          <div class="metric"><b>${escapeHtml(event.evidence_saved_frame_count ?? frames.length)}</b><span>保存关键帧</span></div>
+          <div class="metric"><b>${escapeHtml(event.ppe_missing_helmet_count ?? event.missing_helmet_count ?? "--")}</b><span>未戴帽数</span></div>
+          <div class="metric"><b>${escapeHtml(event.max_score ?? event.peak_score ?? "--")}</b><span>峰值</span></div>
+        </div>
+        <div><strong>视频片段</strong><code>${escapeHtml(event.evidence_clip_codec || event.evidence_clip_status || "未生成")}</code></div>
+        <div><strong>输入源</strong><code>${escapeHtml(event.source || "--")}</code></div>
+        <div><strong>原因</strong><code>${escapeHtml(event.reason || event.ppe_event_last_reason || event.close_reason || "--")}</code></div>
+        <div><strong>事件目录</strong><code>${escapeHtml(event.event_dir || "--")}</code></div>`;
+      const video = $("clipVideo");
+      const fallback = $("clipFallback");
+      if (video && fallback) {
+        video.addEventListener("error", () => {
+          fallback.style.display = "block";
+        });
+      }
+    }
+
+    async function loadEvent() {
+      if (!eventKey) {
+        $("preview").innerHTML = '<div class="empty">缺少事件标识。</div>';
+        return;
+      }
+      try {
+        const res = await fetch(`/api/evidence/events/${encodeURIComponent(eventKey)}`, { headers: authHeaders({}) });
+        const data = await res.json();
+        if (!res.ok || data.ok === false) throw new Error(data.detail || data.error || res.statusText);
+        renderEvent(data.event || {});
+      } catch (err) {
+        $("preview").innerHTML = `<div class="empty">读取事件失败：${escapeHtml(err.message || err)}</div>`;
+      }
+    }
+
+    $("backBtn").onclick = () => { window.location.href = "/"; };
+    $("refreshBtn").onclick = loadEvent;
+    loadEvent();
+  </script>
+</body>
+</html>

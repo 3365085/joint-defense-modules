@@ -203,6 +203,33 @@
       font-size: 12px;
       line-height: 1.5;
     }
+    .inlinePanel {
+      margin-top: 12px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #11161b;
+    }
+    .inlinePanel .panelHeader {
+      min-height: 0;
+      padding: 0;
+      border-bottom: 0;
+      background: transparent;
+      align-items: flex-start;
+    }
+    .inlinePanel .pill {
+      min-width: auto;
+      flex: 0 0 auto;
+    }
+    .inlinePanel .actions {
+      display: flex;
+      justify-content: flex-start;
+      margin-top: 10px;
+    }
+    .inlinePanel .actions button {
+      width: auto;
+      min-width: 128px;
+    }
     .connectStatus {
       min-height: 20px;
       margin-top: 7px;
@@ -236,6 +263,21 @@
       width: 16px;
       height: 16px;
       flex: 0 0 auto;
+    }
+    .sensitivityMeta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .sensitivityMeta span {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 5px 7px;
+      background: #11161b;
     }
     .verdict {
       border: 1px solid var(--line);
@@ -492,6 +534,11 @@
       background: #17212a;
       font-size: 12px;
     }
+    .evidenceLinks a.primaryLink {
+      color: #ffd7dd;
+      border-color: rgba(255,77,94,.55);
+      background: rgba(255,77,94,.10);
+    }
     .evidenceLinks span { color: var(--muted); }
     details {
       margin-top: 8px;
@@ -603,13 +650,13 @@
           <span id="realtimeText">MP4预览固定为 1.0x；检测由后端输入源异步处理。</span>
         </div>
 
-        <section class="panel" id="modelSecurityPanel" data-testid="model-security-panel" style="margin-top:12px;">
-          <div class="panelHeader" style="padding:0 0 8px 0;">
+        <section class="inlinePanel" id="modelSecurityPanel" data-testid="model-security-panel">
+          <div class="panelHeader">
             <div class="title">B模块模型安全</div>
             <div id="modelSecurityPill" class="pill">未检查</div>
           </div>
           <div class="sourceHint" id="modelSecuritySummary">详细扫描、净化、报告和白名单管理请打开安全中心。</div>
-          <div class="row" style="margin-top:10px;">
+          <div class="actions">
             <button class="secondary" id="openModelSecurityCenterBtn" type="button">打开安全中心</button>
           </div>
         </section>
@@ -626,6 +673,7 @@
         <label>A3b灵敏度 <span id="a3bSensitivityText" class="hint">均衡</span>
           <input id="a3bSensitivity" type="range" min="0" max="3" step="1" value="1" />
         </label>
+        <div class="sensitivityMeta" id="a3bSensitivityMeta"></div>
         <div class="row">
           <button class="primary" id="startBtn">开始检测</button>
           <button class="danger" id="stopBtn">停止</button>
@@ -750,20 +798,19 @@
     function customModelOptions() {
       let enabled = false;
       let path = "";
-      let backend = "auto";
       let modelFamily = "auto";
       let sourcePtPath = "";
       try {
         enabled = localStorage.getItem("moduleA.lastCustomModelEnabled") === "true";
         path = localStorage.getItem("moduleA.lastModelPath") || "";
-        backend = localStorage.getItem("moduleA.lastCustomModelBackend") || "auto";
+        localStorage.removeItem("moduleA.lastCustomModelBackend");
         modelFamily = localStorage.getItem("moduleA.lastCustomModelFamily") || "auto";
         sourcePtPath = localStorage.getItem("moduleA.lastSourcePtPath") || "";
       } catch (_) {}
       return {
         enabled: enabled && !!path,
         path,
-        backend,
+        backend: "auto",
         model_family: modelFamily,
         source_pt_path: sourcePtPath,
       };
@@ -1289,17 +1336,20 @@
 
     function evidenceLinks(evt) {
       if (!evt.evidence_saved) {
-        return '<div class="evidenceLinks"><span>证据保存中，事件结束后生成视频和帧。</span></div>';
+        return '<div class="evidenceLinks"><span>证据生成中，事件结束后可打开预览。</span></div>';
       }
       const links = [];
+      if (evt.evidence_preview_url) {
+        links.push(`<a class="primaryLink" href="${evt.evidence_preview_url}" target="_blank">打开事件预览</a>`);
+      }
       if (evt.evidence_clip_url) {
-        links.push(`<a href="${evt.evidence_clip_url}" target="_blank">查看证据视频</a>`);
+        links.push(`<a href="${evt.evidence_clip_url}" target="_blank">视频片段</a>`);
       }
       if (evt.evidence_representative_url) {
-        links.push(`<a href="${evt.evidence_representative_url}" target="_blank">查看代表帧</a>`);
+        links.push(`<a href="${evt.evidence_representative_url}" target="_blank">代表帧</a>`);
       }
-      if (evt.evidence_frames_dir) {
-        links.push(`<span>逐帧已保存 ${evt.evidence_saved_frame_count || 0} 张</span>`);
+      if (evt.evidence_saved_frame_count) {
+        links.push(`<span>关键帧 ${evt.evidence_saved_frame_count || 0} 张</span>`);
       }
       return `<div class="evidenceLinks">${links.join("") || "<span>证据已保存</span>"}</div>`;
     }
@@ -1388,6 +1438,12 @@
       sensitive: "灵敏",
       high: "高灵敏",
     };
+    const a3bSensitivityParams = {
+      conservative: {observe: "0.46", confirm: "0.66", strong: "0.82", interval: "4帧"},
+      balanced: {observe: "0.42", confirm: "0.62", strong: "0.78", interval: "4帧"},
+      sensitive: {observe: "0.38", confirm: "0.58", strong: "0.74", interval: "3帧"},
+      high: {observe: "0.34", confirm: "0.54", strong: "0.70", interval: "2帧"},
+    };
 
     function currentA3bSensitivity() {
       const index = Math.max(0, Math.min(3, Number($("a3bSensitivity").value || 1)));
@@ -1398,6 +1454,16 @@
       const normalized = a3bSensitivityLevels.includes(String(value)) ? String(value) : "balanced";
       $("a3bSensitivity").value = String(Math.max(0, a3bSensitivityLevels.indexOf(normalized)));
       $("a3bSensitivityText").textContent = a3bSensitivityLabels[normalized] || "均衡";
+      const params = a3bSensitivityParams[normalized] || a3bSensitivityParams.balanced;
+      const meta = $("a3bSensitivityMeta");
+      if (meta) {
+        meta.innerHTML = `
+          <span>观察阈值 ${params.observe}</span>
+          <span>确认阈值 ${params.confirm}</span>
+          <span>单帧强触发 ${params.strong}</span>
+          <span>检测间隔 ${params.interval}</span>
+        `;
+      }
       try { localStorage.setItem("moduleA.a3bSensitivity", normalized); } catch (_) {}
     }
 

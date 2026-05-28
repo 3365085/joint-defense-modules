@@ -12,6 +12,11 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 
 from defense.runtime import MonitorEngine, PipelineCache, list_profiles, sample_sources, scan_camera_devices
 from defense.runtime.config import DEFAULT_CONFIG_PATH, project_root
+from defense.runtime.evidence import (
+    evidence_path_from_token,
+    list_evidence_events,
+    load_evidence_event,
+)
 from defense.model_security import ModelSecurityService
 
 from .contracts import websocket_completed_payload, websocket_status_payload
@@ -195,6 +200,10 @@ def create_app(
     @app.get("/model-security")
     async def model_security_page() -> FileResponse:
         return FileResponse(STATIC_DIR / "model_security.html", media_type="text/html; charset=utf-8", headers=_no_cache_headers())
+
+    @app.get("/evidence")
+    async def evidence_page() -> FileResponse:
+        return FileResponse(STATIC_DIR / "evidence.html", media_type="text/html; charset=utf-8", headers=_no_cache_headers())
 
     @app.get("/static/{path:path}")
     async def static_file(path: str) -> FileResponse:
@@ -496,6 +505,35 @@ def create_app(
             return PlainTextResponse("current media not available", status_code=404)
         return FileResponse(path)
 
+    @app.get("/api/evidence/events")
+    async def evidence_events(request: Request, limit: int = 50) -> JSONResponse:
+        require_http_access(request)
+        return _json({"ok": True, "evidence": list_evidence_events(limit=limit)})
+
+    @app.get("/api/evidence/events/{event_key}")
+    async def evidence_event(request: Request, event_key: str) -> JSONResponse:
+        require_http_access(request)
+        try:
+            return _json({"ok": True, "event": load_evidence_event(event_key)})
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/evidence/file")
+    async def evidence_file(request: Request, token: str) -> Any:
+        require_http_access(request)
+        try:
+            target = evidence_path_from_token(token)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail="evidence_file_not_found")
+        media_type = "video/mp4" if target.suffix.lower() == ".mp4" else None
+        if target.suffix.lower() in {".jpg", ".jpeg"}:
+            media_type = "image/jpeg"
+        return FileResponse(target, media_type=media_type, headers=_no_cache_headers())
+
 
     @app.get("/api/model-security/status")
     async def model_security_status(request: Request, profile: str = "default") -> JSONResponse:
@@ -641,6 +679,11 @@ def create_app(
     async def model_security_logs(request: Request, limit: int = 80) -> JSONResponse:
         require_http_access(request)
         return _json({"ok": True, "logs": _model_security(request.app).recent_logs(limit=limit)})
+
+    @app.post("/api/model-security/logs/clear")
+    async def model_security_logs_clear(request: Request) -> JSONResponse:
+        require_http_access(request)
+        return _json({"ok": True, "logs": _model_security(request.app).clear_logs()})
 
     @app.post("/api/model-security/trust")
     async def model_security_trust(request: Request) -> JSONResponse:

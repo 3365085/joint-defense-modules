@@ -443,7 +443,7 @@ def _alpha_grid(config: Mapping[str, Any]) -> list[float]:
 
 
 def _autodetox_target_classes(model_security: Mapping[str, Any]) -> tuple[str, ...]:
-    raw = model_security.get("external_eval_target_classes", ("helmet", "head"))
+    raw = model_security.get("external_eval_target_classes", ("helmet",))
     if isinstance(raw, (str, bytes)):
         values = [raw]
     elif isinstance(raw, Sequence):
@@ -455,7 +455,7 @@ def _autodetox_target_classes(model_security: Mapping[str, Any]) -> tuple[str, .
         for value in values
         if str(value).strip() and str(value).strip().lower() != "person"
     )
-    return targets or ("helmet", "head")
+    return targets or ("helmet",)
 
 
 def _write_autodetox_plan(

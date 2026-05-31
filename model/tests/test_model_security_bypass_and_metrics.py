@@ -8,6 +8,7 @@ from defense.model_security import ModelSecurityService
 from defense.model_security import purifier
 from defense.model_security.registry import ModelTrustRegistry
 from defense.model_security.reports import ModelPurificationReport, ModelSecurityReport
+from defense.model_security.scanner import _filter_external_contract_noise
 from defense.web.fastapi_app import create_app
 
 
@@ -255,6 +256,94 @@ def test_packaged_purification_candidates_follow_hash_when_model_is_renamed(tmp_
     staged = purifier._stage_packaged_candidates(renamed_poisoned, root=tmp_path, out_dir=tmp_path / "out")
     assert staged[0]["family_tag"] == "v2"
     assert staged[0]["new_algorithm_strict_audit"]["wilson_upper"] == 0.0475
+
+
+def test_external_contract_noise_does_not_drive_full_scan_asr():
+    external = {
+        "summary": {"n_rows": 3, "max_asr": 1.0, "mean_asr": 0.5, "asr_matrix": {}, "top_attacks": []},
+        "rows": [
+            {
+                "suite": "mask_bd_external_eval",
+                "attack": "badnet_oga_mask_bd_v2_visible_A_audited_clean_source",
+                "goal": "oga",
+                "success": True,
+                "success_reason": "target_false_positive_on_negative",
+            },
+            {
+                "suite": "mask_bd_external_eval",
+                "attack": "badnet_oga_mask_bd_v2_visible_A_clean_negative_expanded_medium",
+                "goal": "oga",
+                "success": True,
+                "success_reason": "target_false_positive_on_negative",
+            },
+            {
+                "suite": "poison_benchmark_cuda_tuned_remap_v2",
+                "attack": "semantic_green_cleanlabel",
+                "goal": "semantic",
+                "success": False,
+                "success_reason": "semantic_gt_target_recalled",
+            },
+        ],
+    }
+
+    filtered = _filter_external_contract_noise(external, {"model_security": {"external_eval_strict_contract": False}})
+
+    assert filtered["ignored_contract_rows"] == 2
+    assert filtered["summary"]["n_rows"] == 1
+    assert filtered["summary"]["max_asr"] == 0.0
+
+
+def test_accelerated_export_writes_trusted_record_and_catalog(tmp_path: Path, monkeypatch):
+    source = tmp_path / "clean.pt"
+    source.write_bytes(b"trusted-source" * 128)
+    svc = ModelSecurityService(root=tmp_path)
+    custom_model = {
+        "enabled": True,
+        "path": str(source),
+        "backend": "pytorch",
+        "model_family": "ultralytics",
+        "source_pt_path": str(source),
+    }
+    fp = svc.current_fingerprint(custom_model=custom_model)
+    report = ModelSecurityReport(
+        fingerprint=fp.to_dict(),
+        scan_type="full",
+        status="clean",
+        risk_score=0.0,
+        source_model_path=str(source),
+        source_model_hash=fp.model_hash,
+    )
+    svc._write_report(report)
+    svc.registry.mark_trusted(
+        fp.fingerprint,
+        risk_score=0.0,
+        report_path=report.report_path,
+        runtime_model_hash=fp.model_hash,
+        runtime_model_path=str(source),
+        source_model_hash=fp.model_hash,
+        source_model_path=str(source),
+        scanner_version=fp.scanner_version,
+        class_names_hash=fp.class_names_hash,
+        ppe_mapping_hash=fp.ppe_mapping_hash,
+        approval_source="full_scan",
+    )
+
+    def fake_export(*, source_pt: Path, target_path: Path, export_format: str) -> Path:
+        assert export_format == "onnx"
+        target_path.write_bytes(b"exported-onnx" * 128)
+        return target_path
+
+    monkeypatch.setattr(svc, "_run_export_tool", fake_export)
+
+    result = svc.export_accelerated_model(export_format="onnx", custom_model=custom_model)
+
+    assert result["state"] == "completed"
+    assert result["backend"] == "onnx"
+    assert Path(result["exported_model_path"]).exists()
+    assert svc.registry.get(result["exported_fingerprint"]) is not None
+    catalog = svc.output_catalog(category="accelerated_model")
+    assert catalog["count"] == 1
+    assert catalog["artifacts"][0]["status"] == "trusted"
 
 
 def test_fastapi_start_can_bypass_model_security_for_test_only():

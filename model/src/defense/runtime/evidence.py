@@ -4,6 +4,7 @@ import json
 import os
 import re
 import base64
+import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from defense.runtime.catalog import register_artifact
 from defense.visualization import draw_hud, draw_ppe_hud
 
 
@@ -136,6 +138,37 @@ def _index_evidence_event(summary: dict[str, Any], *, root: str | Path | None = 
                     now,
                 ),
             )
+        clip_path = str(summary.get("evidence_clip_path") or "")
+        if clip_path:
+            register_artifact(
+                path=clip_path,
+                business_domain="module_a",
+                category="evidence",
+                artifact_type="event_clip",
+                fingerprint=event_key,
+                source_path=summary.get("source"),
+                status=str(summary.get("channel") or ""),
+                metadata={
+                    "event_key": event_key,
+                    "channel": summary.get("channel"),
+                    "event_dir": summary.get("event_dir"),
+                    "started_frame": summary.get("started_frame"),
+                    "last_active_frame": summary.get("last_active_frame"),
+                    "reason": summary.get("reason") or summary.get("ppe_event_last_reason"),
+                },
+            )
+        rep_path = str(summary.get("evidence_representative_path") or summary.get("representative_path") or "")
+        if rep_path:
+            register_artifact(
+                path=rep_path,
+                business_domain="module_a",
+                category="evidence",
+                artifact_type="representative_frame",
+                fingerprint=event_key,
+                source_path=summary.get("source"),
+                status=str(summary.get("channel") or ""),
+                metadata={"event_key": event_key, "channel": summary.get("channel"), "event_dir": summary.get("event_dir")},
+            )
     except Exception:
         return
 
@@ -228,9 +261,87 @@ def _ffmpeg_exe() -> str | None:
         return None
 
 
-def _concat_file_line(path: Path) -> str:
-    text = path.as_posix().replace("'", "'\\''")
-    return f"file '{text}'"
+def _numeric_frame_clip(
+    event_dir: Path,
+    frame_paths: list[Path],
+    *,
+    ffmpeg: str,
+    fps: int,
+) -> tuple[Path | None, dict[str, Any]]:
+    tmp_dir = event_dir / "clip_source"
+    tmp_path = event_dir / "clip.tmp.mp4"
+    out_path = event_dir / "clip.mp4"
+    try:
+        if tmp_dir.exists():
+            for old in tmp_dir.glob("*.jpg"):
+                old.unlink(missing_ok=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        for idx, frame_path in enumerate(frame_paths, start=1):
+            target = tmp_dir / f"frame_{idx:06d}.jpg"
+            try:
+                target.hardlink_to(frame_path)
+            except Exception:
+                shutil.copy2(frame_path, target)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(max(1, int(fps))),
+            "-i",
+            str(tmp_dir / "frame_%06d.jpg"),
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-profile:v",
+            "baseline",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(tmp_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+        if result.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            return None, {
+                "evidence_clip_status": "h264_encode_failed",
+                "evidence_clip_error": (result.stderr or result.stdout or "").strip()[:800],
+                "evidence_clip_codec": "",
+                "evidence_clip_browser_playable": False,
+            }
+        tmp_path.replace(out_path)
+        return out_path, {
+            "evidence_clip_status": "ok",
+            "evidence_clip_codec": "h264",
+            "evidence_clip_fps": max(1, int(fps)),
+            "evidence_clip_browser_playable": True,
+            "evidence_clip_source_frames": len(frame_paths),
+        }
+    except Exception as exc:
+        return None, {
+            "evidence_clip_status": "h264_encode_exception",
+            "evidence_clip_error": str(exc)[:800],
+            "evidence_clip_codec": "",
+            "evidence_clip_browser_playable": False,
+        }
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            if tmp_dir.exists():
+                for old in tmp_dir.glob("*.jpg"):
+                    old.unlink(missing_ok=True)
+                tmp_dir.rmdir()
+        except Exception:
+            pass
 
 
 def _write_browser_mp4_from_frames(
@@ -248,83 +359,7 @@ def _write_browser_mp4_from_frames(
             "evidence_clip_codec": "",
             "evidence_clip_browser_playable": False,
         }
-    fps = max(1, int(fps))
-    duration = 1.0 / float(fps)
-    list_path = event_dir / "clip_frames.txt"
-    tmp_path = event_dir / "clip.tmp.mp4"
-    out_path = event_dir / "clip.mp4"
-    lines: list[str] = []
-    for path in frame_paths:
-        rel = path.resolve().relative_to(event_dir.resolve())
-        lines.append(_concat_file_line(rel))
-        lines.append(f"duration {duration:.6f}")
-    lines.append(_concat_file_line(frame_paths[-1].resolve().relative_to(event_dir.resolve())))
-    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        list_path.name,
-        "-vf",
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-        "-r",
-        str(fps),
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-profile:v",
-        "baseline",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        tmp_path.name,
-    ]
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(event_dir),
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        if result.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
-            return None, {
-                "evidence_clip_status": "h264_encode_failed",
-                "evidence_clip_error": (result.stderr or result.stdout or "").strip()[:800],
-                "evidence_clip_codec": "",
-                "evidence_clip_browser_playable": False,
-            }
-        tmp_path.replace(out_path)
-        return out_path, {
-            "evidence_clip_status": "ok",
-            "evidence_clip_codec": "h264",
-            "evidence_clip_fps": fps,
-            "evidence_clip_browser_playable": True,
-        }
-    except Exception as exc:
-        return None, {
-            "evidence_clip_status": "h264_encode_exception",
-            "evidence_clip_error": str(exc)[:800],
-            "evidence_clip_codec": "",
-            "evidence_clip_browser_playable": False,
-        }
-    finally:
-        try:
-            list_path.unlink(missing_ok=True)
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    return _numeric_frame_clip(event_dir, frame_paths, ffmpeg=ffmpeg, fps=max(1, int(fps)))
 
 
 def _repair_event_clip_if_needed(data: dict[str, Any], *, root: str | Path | None = None) -> dict[str, Any]:

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from defense.runtime.artifacts import resolve_artifact_candidate
-from defense.runtime.config import DEFAULT_CONFIG_PATH, load_runtime_config, project_root
+from defense.runtime.catalog import list_artifacts, register_artifact
+from defense.runtime.config import DEFAULT_CONFIG_PATH, infer_backend_from_model_path, load_runtime_config, project_root
 
 from .fingerprint import ModelFingerprint, SCANNER_VERSION, build_model_fingerprint, sha256_file
 from .integrity import TrustStoreIntegrity, verify_trust_store, write_trust_store_seal
@@ -41,6 +43,8 @@ class ModelSecurityService:
         self._purify_target_fingerprint: str | None = None
         self._last_scan_job: dict[str, Any] | None = None
         self._last_purification_job: dict[str, Any] | None = None
+        self._export_thread: threading.Thread | None = None
+        self._last_export_job: dict[str, Any] | None = None
 
     def _write_registry_seal(self, data: dict[str, Any]) -> None:
         write_trust_store_seal(self.registry.path, self.storage.registry_seal_path, data)
@@ -103,6 +107,44 @@ class ModelSecurityService:
                 return {"log_path": str(self.log_path), "cleared": False, "error": str(exc)}
             self._log_event("logs_cleared", status="deleted", message="已清空B模块运行日志")
         return {"log_path": str(self.log_path), "cleared": True, "entries": self.recent_logs(limit=20).get("entries", [])}
+
+    def _catalog_root(self) -> Path:
+        return self.root / "runtime"
+
+    def _register_output(
+        self,
+        *,
+        path: str | Path,
+        category: str,
+        artifact_type: str,
+        fingerprint: str | None = None,
+        source_path: str | Path | None = None,
+        source_hash: str | None = None,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        compute_hash: bool = True,
+    ) -> dict[str, Any]:
+        return register_artifact(
+            path=path,
+            business_domain="model_security",
+            category=category,
+            artifact_type=artifact_type,
+            catalog_root=self._catalog_root(),
+            fingerprint=fingerprint,
+            source_path=source_path,
+            source_hash=source_hash,
+            status=status,
+            metadata=metadata or {},
+            compute_hash=compute_hash,
+        )
+
+    def output_catalog(self, *, category: str | None = None, limit: int = 100) -> dict[str, Any]:
+        return list_artifacts(
+            catalog_root=self._catalog_root(),
+            business_domain="model_security",
+            category=category,
+            limit=limit,
+        )
 
     def _config(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> dict[str, Any]:
         return load_runtime_config(config_path=self.config_path, profile=profile or "default", custom_model=custom_model or {})
@@ -240,6 +282,21 @@ class ModelSecurityService:
 
     def _mark_clean_full_scan_trusted(self, report: ModelSecurityReport, fp: ModelFingerprint) -> None:
         """Persist a trusted record from a clean canonical full scan."""
+        self._register_output(
+            path=fp.model_path,
+            category="trusted_model",
+            artifact_type=f"{fp.backend or 'runtime'}_trusted_model",
+            fingerprint=fp.fingerprint,
+            source_path=report.source_model_path,
+            source_hash=report.source_model_hash,
+            status="trusted",
+            metadata={
+                "report_path": report.report_path,
+                "approval_source": "full_scan",
+                "backend": fp.backend,
+                "model_family": fp.model_family,
+            },
+        )
         self.registry.mark_trusted(
             fp.fingerprint,
             risk_score=report.risk_score,
@@ -279,6 +336,17 @@ class ModelSecurityService:
         if not report.report_path:
             return False
         return True
+
+    @staticmethod
+    def _full_report_policy_current(report: ModelSecurityReport | None) -> bool:
+        if report is None or report.scan_type != "full":
+            return False
+        diagnostics = report.diagnostics if isinstance(report.diagnostics, dict) else {}
+        policy = diagnostics.get("external_eval_policy") if isinstance(diagnostics.get("external_eval_policy"), dict) else {}
+        if policy.get("version") == "ppe_helmet_target_v2":
+            return True
+        scope = str(diagnostics.get("validation_scope") or "")
+        return scope in {"new_algorithm_known_poisoned_catalog", "new_algorithm_family_strict_audit"}
 
     @staticmethod
     def _strict_observed_asr(strict: dict[str, Any]) -> float | None:
@@ -495,6 +563,14 @@ class ModelSecurityService:
             return False
         return fingerprint is None or self._purify_target_fingerprint == fingerprint
 
+    def _is_exporting(self, fingerprint: str | None = None) -> bool:
+        running = bool(self._export_thread and self._export_thread.is_alive())
+        if not running:
+            return False
+        if fingerprint is None:
+            return True
+        return bool(self._last_export_job and self._last_export_job.get("fingerprint") == fingerprint)
+
     @staticmethod
     def _runtime_model_for_purified_path(path: str | Path, fp: ModelFingerprint) -> dict[str, Any]:
         purified_path = Path(path)
@@ -506,6 +582,258 @@ class ModelSecurityService:
             "source_pt_path": str(purified_path),
             "status": "trusted_purified_pt",
         }
+
+    @staticmethod
+    def _runtime_model_for_accelerated_export(path: str | Path, source_pt: str | Path, fp: ModelFingerprint) -> dict[str, Any]:
+        export_path = Path(path)
+        backend = infer_backend_from_model_path(export_path, "auto")
+        return {
+            "enabled": True,
+            "path": str(export_path),
+            "backend": backend,
+            "model_family": fp.model_family or "auto",
+            "source_pt_path": str(source_pt),
+            "status": "trusted_accelerated_export",
+        }
+
+    @staticmethod
+    def _export_format(value: str) -> tuple[str, str, str]:
+        text = str(value or "engine").strip().lower()
+        if text in {"trt", "tensorrt", "engine"}:
+            return "engine", ".engine", "tensorrt"
+        if text in {"onnx"}:
+            return "onnx", ".onnx", "onnx"
+        raise ValueError("unsupported_export_format")
+
+    @staticmethod
+    def _unique_export_path(base: Path) -> Path:
+        if not base.exists():
+            return base
+        for idx in range(2, 1000):
+            candidate = base.with_name(f"{base.stem}_{idx}{base.suffix}")
+            if not candidate.exists():
+                return candidate
+        raise RuntimeError("cannot allocate export output path")
+
+    def _trusted_pt_for_export(
+        self,
+        *,
+        profile: str,
+        custom_model: dict[str, Any] | None,
+    ) -> tuple[Path, ModelFingerprint, dict[str, Any], dict[str, Any]]:
+        cfg, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
+        current_status = self.status(profile=profile, custom_model=custom_model)
+        source_pt = self._source_pt_path(cfg, fp)
+        if bool(current_status.get("allowed", False)) and source_pt and source_pt.exists() and source_pt.suffix.lower() in {".pt", ".pth"}:
+            source_runtime = {
+                "enabled": True,
+                "path": str(source_pt),
+                "backend": "pytorch",
+                "model_family": fp.model_family or current_status.get("model_family") or "auto",
+                "source_pt_path": str(source_pt),
+            }
+            source_cfg = self._config(profile=profile, custom_model=source_runtime)
+            source_fp = build_model_fingerprint(source_cfg, root=self.root)
+            return source_pt, source_fp, source_runtime, current_status
+
+        purification = self._load_purification_report(fp.fingerprint)
+        if purification and purification.status == "scan_clean_trusted" and purification.purified_model_path:
+            purified_path = Path(purification.purified_model_path)
+            if purified_path.exists() and purified_path.suffix.lower() in {".pt", ".pth"}:
+                purified_runtime = self._runtime_model_for_purified_path(purified_path, fp)
+                purified_runtime.pop("status", None)
+                purified_status = self.status(profile=profile, custom_model=purified_runtime)
+                if bool(purified_status.get("allowed", False)):
+                    purified_cfg = self._config(profile=profile, custom_model=purified_runtime)
+                    purified_fp = build_model_fingerprint(purified_cfg, root=self.root)
+                    return purified_path, purified_fp, purified_runtime, purified_status
+
+        raise ValueError("export_requires_trusted_source_pt")
+
+    def _run_export_tool(self, *, source_pt: Path, target_path: Path, export_format: str) -> Path:
+        try:
+            from ultralytics import YOLO
+        except Exception as exc:  # pragma: no cover - depends on runtime env
+            raise RuntimeError(f"ultralytics_export_unavailable:{exc}") from exc
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        fmt, suffix, _ = self._export_format(export_format)
+        model = YOLO(str(source_pt))
+        kwargs: dict[str, Any] = {"format": fmt, "imgsz": 640}
+        if fmt == "engine":
+            kwargs["half"] = True
+        result = model.export(**kwargs)
+        candidates: list[Path] = []
+        if result:
+            candidates.append(Path(str(result)))
+        candidates.append(source_pt.with_suffix(suffix))
+        candidates.append(source_pt.parent / f"{source_pt.stem}{suffix}")
+        exported = next((p for p in candidates if p.exists() and p.is_file()), None)
+        if exported is None:
+            raise RuntimeError("export_output_not_found")
+        if exported.resolve() != target_path.resolve():
+            shutil.copy2(exported, target_path)
+        return target_path
+
+    def export_accelerated_model(
+        self,
+        *,
+        export_format: str = "engine",
+        profile: str = "default",
+        custom_model: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        fmt, suffix, backend = self._export_format(export_format)
+        source_pt, source_fp, _source_runtime, source_status = self._trusted_pt_for_export(profile=profile, custom_model=custom_model)
+        source_hash = "sha256:" + sha256_file(source_pt)
+        target = self._unique_export_path(source_pt.with_name(f"{source_pt.stem}_{backend}_accelerated{suffix}"))
+        self._log_event(
+            "export_started",
+            status="running",
+            message=f"模型加速导出开始：{backend}",
+            fingerprint=source_fp.fingerprint,
+            source_pt_path=str(source_pt),
+            export_format=fmt,
+            target_path=str(target),
+        )
+        with self._lock:
+            self._last_export_job = {
+                "state": "running",
+                "fingerprint": source_fp.fingerprint,
+                "source_pt_path": str(source_pt),
+                "export_format": fmt,
+                "target_path": str(target),
+                "started_at": now_iso(),
+            }
+        try:
+            exported_path = self._run_export_tool(source_pt=source_pt, target_path=target, export_format=fmt)
+            runtime_model = self._runtime_model_for_accelerated_export(exported_path, source_pt, source_fp)
+            runtime_model.pop("status", None)
+            exported_cfg = self._config(profile=profile, custom_model=runtime_model)
+            exported_fp = build_model_fingerprint(exported_cfg, root=self.root)
+            exported_hash = "sha256:" + sha256_file(exported_path)
+            security_metrics = dict(source_status.get("security_metrics") or {})
+            security_metrics.update(
+                {
+                    "accelerated_export_format": fmt,
+                    "accelerated_export_backend": backend,
+                    "accelerated_export_path": str(exported_path),
+                    "accelerated_export_hash": exported_hash,
+                    "accelerated_export_source_pt": str(source_pt),
+                    "accelerated_export_source_hash": source_hash,
+                }
+            )
+            self.registry.mark_trusted(
+                exported_fp.fingerprint,
+                risk_score=float(source_status.get("risk_score") or 0.0),
+                report_path=source_status.get("report_path"),
+                scanner_version=SCANNER_VERSION,
+                notes=f"auto-trusted {backend} export from trusted source PT",
+                runtime_model_hash=exported_fp.model_hash,
+                runtime_model_path=exported_fp.model_path,
+                source_model_hash=source_hash,
+                source_model_path=str(source_pt),
+                original_source_model_hash=source_status.get("original_source_model_hash") or source_hash,
+                original_source_model_path=source_status.get("original_source_model_path") or str(source_pt),
+                backend=exported_fp.backend,
+                model_family=exported_fp.model_family,
+                image_size=exported_fp.image_size,
+                class_names_hash=exported_fp.class_names_hash,
+                ppe_mapping_hash=exported_fp.ppe_mapping_hash,
+                purification_report_path=source_status.get("purification_report_path"),
+                security_metrics=security_metrics,
+                approval_source="trusted_source_pt_export",
+            )
+            catalog_record = self._register_output(
+                path=exported_path,
+                category="accelerated_model",
+                artifact_type=f"{backend}_runtime_model",
+                fingerprint=exported_fp.fingerprint,
+                source_path=source_pt,
+                source_hash=source_hash,
+                status="trusted",
+                metadata={
+                    "export_format": fmt,
+                    "backend": backend,
+                    "source_fingerprint": source_fp.fingerprint,
+                    "runtime_model": runtime_model,
+                    "report_path": source_status.get("report_path"),
+                    "purification_report_path": source_status.get("purification_report_path"),
+                },
+            )
+            result = {
+                "state": "completed",
+                "fingerprint": source_fp.fingerprint,
+                "exported_fingerprint": exported_fp.fingerprint,
+                "source_pt_path": str(source_pt),
+                "source_pt_hash": source_hash,
+                "export_format": fmt,
+                "backend": backend,
+                "exported_model_path": str(exported_path),
+                "exported_model_hash": exported_hash,
+                "catalog_record": catalog_record,
+                "completed_at": now_iso(),
+            }
+            with self._lock:
+                self._last_export_job = result
+            self._log_event(
+                "export_completed",
+                status="trusted",
+                message=f"模型加速导出完成并已写入白名单：{backend}",
+                fingerprint=source_fp.fingerprint,
+                exported_fingerprint=exported_fp.fingerprint,
+                exported_model_path=str(exported_path),
+                exported_model_hash=exported_hash,
+            )
+            return result
+        except Exception as exc:
+            result = {
+                "state": "failed",
+                "fingerprint": source_fp.fingerprint,
+                "source_pt_path": str(source_pt),
+                "export_format": fmt,
+                "target_path": str(target),
+                "error": str(exc),
+                "completed_at": now_iso(),
+            }
+            with self._lock:
+                self._last_export_job = result
+            self._last_error = str(exc)
+            self._log_event("export_failed", status="error", message=str(exc), fingerprint=source_fp.fingerprint, export_format=fmt)
+            raise
+
+    def start_background_export(
+        self,
+        *,
+        export_format: str = "engine",
+        profile: str = "default",
+        custom_model: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self._is_exporting():
+            return {"started": False, "reason": "export_already_running"}
+        try:
+            source_pt, source_fp, _source_runtime, _source_status = self._trusted_pt_for_export(profile=profile, custom_model=custom_model)
+            fmt, _suffix, backend = self._export_format(export_format)
+        except Exception as exc:
+            return {"started": False, "reason": str(exc)}
+        with self._lock:
+            self._last_export_job = {
+                "state": "running",
+                "fingerprint": source_fp.fingerprint,
+                "source_pt_path": str(source_pt),
+                "export_format": fmt,
+                "backend": backend,
+                "started_at": now_iso(),
+            }
+
+        def worker() -> None:
+            try:
+                self.export_accelerated_model(export_format=fmt, profile=profile, custom_model=custom_model)
+            except Exception:
+                pass
+
+        self._export_thread = threading.Thread(target=worker, name="model-security-export", daemon=True)
+        self._export_thread.start()
+        return {"started": True, "fingerprint": source_fp.fingerprint, "source_pt_path": str(source_pt), "export_format": fmt, "backend": backend}
 
     def _trusted_purified_status(
         self,
@@ -551,6 +879,8 @@ class ModelSecurityService:
                 last_report = None
             if last_report is None:
                 last_report = self._load_report(fp.fingerprint, "full", source_hash)
+            if last_report is not None and not self._full_report_policy_current(last_report):
+                last_report = None
             purifying = self._is_purifying(fp.fingerprint)
             last_purification = (
                 self._last_purification_report
@@ -562,6 +892,8 @@ class ModelSecurityService:
                 last_purification = self._load_purification_report(fp.fingerprint)
             scan_job = self._last_job_for_fingerprint(self._last_scan_job, fp.fingerprint)
             purification_job = self._last_job_for_fingerprint(self._last_purification_job, fp.fingerprint)
+            exporting = self._is_exporting()
+            export_job = dict(self._last_export_job) if self._last_export_job else None
 
             status = "blocked_scan_required"
             allowed = False
@@ -598,7 +930,7 @@ class ModelSecurityService:
                 status = "unverifiable"
                 reason = "source_pt_required_for_accelerated_artifact"
 
-            purifiable_statuses = {"suspicious", "review", "unverifiable"}
+            purifiable_statuses = {"suspicious"}
             can_purify = bool(
                 status in purifiable_statuses
                 and not scanning
@@ -618,6 +950,16 @@ class ModelSecurityService:
                     recommended_runtime_model["model_hash"] = purified_status.get("model_hash")
                     recommended_runtime_model["admission_status"] = purified_status.get("admission_status")
                     recommended_runtime_model["allowed"] = purified_status.get("allowed")
+            can_export = bool(
+                not scanning
+                and not purifying
+                and not exporting
+                and integrity.ok
+                and (
+                    (allowed and source_pt is not None and source_pt.exists())
+                    or (last_purification and last_purification.status == "scan_clean_trusted" and last_purification.purified_model_path)
+                )
+            )
 
             trusted_record_match = bool(rec and self._trusted_record_matches(rec, fp, source_hash))
             if trusted_record_match:
@@ -644,13 +986,17 @@ class ModelSecurityService:
                 "blocking_reason": reason,
                 "scanning": scanning,
                 "purifying": purifying,
+                "exporting": exporting,
                 "can_scan": can_scan,
                 "can_purify": can_purify,
+                "can_export_accelerated": can_export,
                 "recommended_runtime_model": recommended_runtime_model,
                 "last_scan_job": scan_job,
                 "last_purification_job": purification_job,
+                "last_export_job": export_job,
                 "last_scan_completed": bool(scan_job and scan_job.get("state") == "completed"),
                 "last_purification_completed": bool(purification_job and purification_job.get("state") == "completed"),
+                "last_export_completed": bool(export_job and export_job.get("state") == "completed"),
                 "fingerprint": fp.fingerprint,
                 "model_hash": fp.model_hash,
                 "model_path": fp.model_path,
@@ -685,7 +1031,9 @@ class ModelSecurityService:
                 "purified_model_path": last_purification.purified_model_path if last_purification else None,
                 "purified_model_hash": last_purification.purified_model_hash if last_purification else None,
                 "purified_models_dir": str(self.storage.purified_dir),
+                "exports_dir": str(self.storage.exports_dir),
                 "purification_strategy": last_purification.strategy if last_purification else None,
+                "output_catalog": self.output_catalog(limit=40),
                 "validation_assets": assets,
                 "error": self._last_error,
             }
@@ -859,11 +1207,45 @@ class ModelSecurityService:
     def _write_report(self, report: ModelSecurityReport) -> ModelSecurityReport:
         path = self.storage.reports_dir / f"{report.fingerprint['fingerprint'].replace(':','_')}_{report.scan_type}.json"
         report.write(path)
+        self._register_output(
+            path=path,
+            category="scan_report",
+            artifact_type=f"{report.scan_type}_scan_report",
+            fingerprint=str(report.fingerprint.get("fingerprint") or ""),
+            source_path=report.source_model_path,
+            source_hash=report.source_model_hash,
+            status=report.status,
+            metadata={
+                "scan_type": report.scan_type,
+                "risk_score": report.risk_score,
+                "runtime_artifact_path": report.runtime_artifact_path,
+                "reasons": report.reasons,
+            },
+            compute_hash=False,
+        )
         return report
 
     def _write_purification_report(self, report: ModelPurificationReport) -> ModelPurificationReport:
         path = self.storage.reports_dir / f"{report.fingerprint['fingerprint'].replace(':','_')}_purification.json"
         report.write(path)
+        self._register_output(
+            path=path,
+            category="purification_report",
+            artifact_type="purification_report",
+            fingerprint=str(report.fingerprint.get("fingerprint") or ""),
+            source_path=report.source_model_path,
+            source_hash=report.source_model_hash,
+            status=report.status,
+            metadata={
+                "strategy": report.strategy,
+                "purified_model_path": report.purified_model_path,
+                "purified_model_hash": report.purified_model_hash,
+                "scan_report_path": report.scan_report_path,
+                "scan_status": report.scan_status,
+                "error": report.error,
+            },
+            compute_hash=False,
+        )
         return report
 
     def _load_report(self, fingerprint: str, scan_type: str, source_hash: str | None = None) -> ModelSecurityReport | None:
@@ -1158,6 +1540,22 @@ class ModelSecurityService:
                     report.scan_report_path = accepted_scan_report.report_path
                     report.scan_status = accepted_scan_report.status
                     report.status = "scan_clean_trusted"
+                    self._register_output(
+                        path=accepted_path,
+                        category="purified_model",
+                        artifact_type="trusted_purified_pt",
+                        fingerprint=accepted_fp.fingerprint,
+                        source_path=latest_report.source_model_path or (str(source_pt) if source_pt else None),
+                        source_hash=latest_report.source_model_hash or source_hash,
+                        status="trusted",
+                        metadata={
+                            "purification_report_path": report.report_path,
+                            "scan_report_path": accepted_scan_report.report_path,
+                            "source_fingerprint": fp.fingerprint,
+                            "model_family": accepted_fp.model_family,
+                            "backend": accepted_fp.backend,
+                        },
+                    )
                     report = self._write_purification_report(report)
                     self.registry.mark_trusted(
                         accepted_fp.fingerprint,

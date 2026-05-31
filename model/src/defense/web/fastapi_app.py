@@ -675,6 +675,31 @@ def create_app(
             }
         )
 
+    @app.get("/api/runtime/artifacts")
+    async def runtime_artifacts(request: Request, category: str | None = None, limit: int = 100) -> JSONResponse:
+        require_http_access(request)
+        return _json({"ok": True, "catalog": _model_security(request.app).output_catalog(category=category, limit=limit)})
+
+    @app.post("/api/model-security/export")
+    async def model_security_export(request: Request) -> JSONResponse:
+        require_http_access(request)
+        payload = await _body(request)
+        profile = normalize_profile(payload.get("profile", "default"))
+        custom_model = payload.get("custom_model") or {}
+        export_format = str(payload.get("export_format") or payload.get("format") or "engine")
+        background = bool(payload.get("background", True))
+        svc = _model_security(request.app)
+        if background:
+            result = svc.start_background_export(export_format=export_format, profile=profile, custom_model=custom_model)
+            return _json({"ok": bool(result.get("started", False)), "export": result, "model_security": svc.status(profile=profile, custom_model=custom_model)}, status_code=200 if result.get("started", False) else 409)
+        try:
+            result = svc.export_accelerated_model(export_format=export_format, profile=profile, custom_model=custom_model)
+        except ValueError as exc:
+            return _json({"ok": False, "error": str(exc), "model_security": svc.status(profile=profile, custom_model=custom_model)}, status_code=409)
+        except Exception as exc:
+            return _json({"ok": False, "error": str(exc), "model_security": svc.status(profile=profile, custom_model=custom_model)}, status_code=500)
+        return _json({"ok": True, "export": result, "model_security": svc.status(profile=profile, custom_model=custom_model)})
+
     @app.get("/api/model-security/logs")
     async def model_security_logs(request: Request, limit: int = 80) -> JSONResponse:
         require_http_access(request)

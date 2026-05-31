@@ -283,6 +283,13 @@
         </div>
         <div class="content">
           <div class="notice">白名单只能由原始PT完整扫描通过，或可疑模型净化后二次完整扫描通过后自动写入。用户只能删除或清空，不能手工添加。</div>
+          <div class="fieldRow">
+            <select id="exportFormatSelect">
+              <option value="engine">导出 TensorRT engine</option>
+              <option value="onnx">导出 ONNX</option>
+            </select>
+            <button id="exportBtn" type="button" style="width:auto;">导出加速模型</button>
+          </div>
           <div class="actionGrid">
             <button id="scanBtn" class="primary" type="button">完整扫描并自动净化</button>
             <button id="purifyBtn" type="button">净化并复扫</button>
@@ -320,6 +327,17 @@
           <div id="logs" class="logs"><div class="empty">正在读取日志。</div></div>
         </div>
       </section>
+
+      <details class="panel" open>
+        <summary class="panelHeader">
+          <div class="title">输出资产</div>
+          <div id="artifactCount" class="pill">0</div>
+        </summary>
+        <div class="content">
+          <div class="notice">扫描报告、净化报告、可信模型和导出模型都会登记到 runtime catalog，后续可按业务分类复现和清理。</div>
+          <div id="artifacts" class="stack"><div class="empty">正在读取输出资产。</div></div>
+        </div>
+      </details>
 
       <details class="panel">
         <summary class="panelHeader">
@@ -448,6 +466,7 @@
         suspicious: "疑似风险",
         review: "需要复核",
         purifying: "净化中",
+        exporting: "导出中",
         purified_alternative_available: "净化模型可用",
         bypassed_for_test: "测试绕过",
         trust_store_compromised: "白名单失效",
@@ -493,6 +512,9 @@
         purification_started: "净化开始",
         purification_completed: "净化完成",
         purification_failed: "净化失败",
+        export_started: "导出开始",
+        export_completed: "导出完成",
+        export_failed: "导出失败",
         whitelist_written: "写入白名单",
         whitelist_deleted: "删除白名单",
         whitelist_cleared: "清空白名单",
@@ -535,7 +557,7 @@
 
     function isTaskBusy(ms = lastModelSecurity) {
       const status = (ms && (ms.admission_status || ms.status)) || "";
-      return !!(ms && (ms.scanning || ms.purifying)) || status === "scanning" || status === "purifying";
+      return !!(ms && (ms.scanning || ms.purifying || ms.exporting)) || status === "scanning" || status === "purifying" || status === "exporting";
     }
 
     function statusAllowsPurify(ms) {
@@ -555,12 +577,16 @@
     function renderActionButtons(ms, busy) {
       const scanBtn = $("scanBtn");
       const purifyBtn = $("purifyBtn");
+      const exportBtn = $("exportBtn");
       const canScan = canRunAction(ms, "can_scan", true);
       const canPurify = canRunAction(ms, "can_purify", statusAllowsPurify(ms));
+      const canExport = canRunAction(ms, "can_export_accelerated", false);
       scanBtn.disabled = busy || !canScan;
       purifyBtn.disabled = busy || !canPurify;
+      exportBtn.disabled = busy || !canExport;
       scanBtn.textContent = busy ? "\u4efb\u52a1\u8fd0\u884c\u4e2d..." : rememberButtonText(scanBtn);
       purifyBtn.textContent = busy ? "\u4efb\u52a1\u8fd0\u884c\u4e2d..." : rememberButtonText(purifyBtn);
+      exportBtn.textContent = busy ? "\u4efb\u52a1\u8fd0\u884c\u4e2d..." : rememberButtonText(exportBtn);
     }
 
     async function refreshTaskProgress() {
@@ -569,7 +595,10 @@
       try {
         const ms = await refreshStatus();
         await refreshLogs();
-        if (!isTaskBusy(ms)) await refreshTrust();
+        if (!isTaskBusy(ms)) {
+          await refreshTrust();
+          await refreshArtifacts();
+        }
       } catch (err) {
         showMessage(err.message || String(err));
       } finally {
@@ -619,6 +648,7 @@
       const purificationStatus = lastModelSecurity.purification_status || "idle";
       let text = "模型安全状态尚未确认。";
       if (status === "trusted") text = "当前运行模型已通过B模块准入，可以启动A模块检测。";
+      else if (lastModelSecurity.exporting) text = "B模块正在导出加速模型；导出成功后会计算哈希和语义指纹，并自动写入白名单。";
       else if (status === "blocked_scan_required") text = "当前模型未命中白名单，需要先对源PT执行完整扫描；若扫描判定疑似风险，系统会自动净化并复扫。";
       else if (status === "scanning") text = "B模块正在后台完整扫描；若判定疑似风险，会自动进入净化并复扫，A模块暂未启动。";
       else if (status === "purifying") text = "B模块正在净化并复扫候选模型，复扫通过后才会写入白名单。";
@@ -695,11 +725,44 @@
       `).join("");
     }
 
+    function renderArtifacts(catalog) {
+      const artifacts = Array.isArray(catalog && catalog.artifacts) ? catalog.artifacts : [];
+      $("artifactCount").textContent = String(artifacts.length);
+      if (!artifacts.length) {
+        $("artifacts").innerHTML = '<div class="empty">暂无输出资产。</div>';
+        return;
+      }
+      const categoryLabels = {
+        scan_report: "扫描报告",
+        purification_report: "净化报告",
+        purified_model: "净化模型",
+        trusted_model: "可信模型",
+        accelerated_model: "加速模型",
+      };
+      $("artifacts").innerHTML = artifacts.slice(0, 12).map((item) => `
+        <article class="record">
+          <div class="recordTop">
+            <div><strong>${escapeHtml(categoryLabels[item.category] || item.category || "资产")}</strong> · ${escapeHtml(item.artifact_type || "--")}</div>
+            <span class="pill ${tone(item.status)}">${escapeHtml(statusLabel(item.status || "info"))}</span>
+          </div>
+          <div class="field"><strong>路径：</strong><code>${escapeHtml(item.path || "--")}</code></div>
+          <div class="field"><strong>来源：</strong><code>${escapeHtml(item.source_path || "--")}</code></div>
+          <div class="field"><strong>更新时间：</strong>${escapeHtml(timeText(item.updated_at))}</div>
+        </article>
+      `).join("");
+    }
+
+    async function refreshArtifacts() {
+      const data = await api("/api/runtime/artifacts?limit=40");
+      renderArtifacts(data.catalog || {});
+    }
+
     async function refreshAll() {
       try {
         await refreshStatus();
         await refreshTrust();
         await refreshLogs();
+        await refreshArtifacts();
       } catch (err) {
         showMessage(err.message || String(err));
       }
@@ -809,6 +872,26 @@
         saveModelConfig({silent: true});
         await api("/api/model-security/purify", {background: true, scan_after: true, profile: currentRuntimeProfile(), custom_model: customModelOptions()});
         showMessage("B模块净化已启动，完成后会自动复扫。");
+        await refreshAll();
+      } catch (err) {
+        showMessage(err.message);
+      } finally {
+        await refreshStatus().catch(() => {});
+        await refreshLogs().catch(() => {});
+      }
+    };
+    $("exportBtn").onclick = async () => {
+      $("exportBtn").disabled = true;
+      try {
+        saveModelConfig({silent: true});
+        const exportFormat = $("exportFormatSelect").value || "engine";
+        const data = await api("/api/model-security/export", {background: true, export_format: exportFormat, profile: currentRuntimeProfile(), custom_model: customModelOptions()});
+        const job = data.export || {};
+        if (job.started === false) {
+          showMessage(`未启动导出：${job.reason || "当前模型还没有可信PT依据"}`);
+        } else {
+          showMessage("加速模型导出已启动；完成后会自动写入白名单。");
+        }
         await refreshAll();
       } catch (err) {
         showMessage(err.message);

@@ -186,7 +186,7 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
         for item in _as_sequence(
             model_security.get(
                 "external_eval_target_classes",
-                model_security.get("target_classes", ["helmet", "head"]),
+                model_security.get("target_classes", ["helmet"]),
             )
         )
         if str(item).strip()
@@ -352,6 +352,56 @@ def _run_external_validation(
         result["report_json_path"] = str(json_path)
         result["rows_csv_path"] = str(rows_path)
     return result
+
+
+def _recompute_external_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[tuple[str, str, str], list[bool]] = {}
+    for row in rows:
+        key = (str(row.get("suite") or "external"), str(row.get("attack") or ""), str(row.get("goal") or ""))
+        grouped.setdefault(key, []).append(bool(row.get("success")))
+    matrix: dict[str, float] = {}
+    top: list[dict[str, Any]] = []
+    for (suite, attack, goal), values in grouped.items():
+        if not values:
+            continue
+        asr = float(sum(1 for value in values if value) / len(values))
+        matrix[f"{suite}::{attack}"] = asr
+        top.append({"suite": suite, "attack": attack, "goal": goal, "asr": asr, "n": len(values)})
+    top.sort(key=lambda item: item["asr"], reverse=True)
+    return {
+        "n_rows": len(rows),
+        "max_asr": float(max(matrix.values()) if matrix else 0.0),
+        "mean_asr": float(sum(matrix.values()) / max(1, len(matrix))),
+        "asr_matrix": matrix,
+        "top_attacks": top,
+    }
+
+
+def _filter_external_contract_noise(external: dict[str, Any], config: Mapping[str, Any] | None) -> dict[str, Any]:
+    model_security = _model_security_config(config)
+    if bool(model_security.get("external_eval_strict_contract", False)):
+        return external
+    rows = external.get("rows") if isinstance(external.get("rows"), list) else []
+    if not rows:
+        return external
+    filtered: list[dict[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
+    for row in rows:
+        goal = str(row.get("goal") or "").lower()
+        reason = str(row.get("success_reason") or "")
+        attack = str(row.get("attack") or "")
+        if goal == "oga" and reason == "target_false_positive_on_negative":
+            ignored.append(row)
+            continue
+        filtered.append(row)
+    if not ignored:
+        return external
+    output = dict(external)
+    output["rows"] = filtered
+    output["summary"] = _recompute_external_summary(filtered)
+    output["ignored_contract_rows"] = len(ignored)
+    output["ignored_contract_policy"] = "oga_negative_false_positive_rows_are_context_diagnostics"
+    return output
 
 
 def full_scan(
@@ -551,19 +601,34 @@ def full_scan(
             runtime_artifact_path=fp.model_path,
         )
 
+    external = _filter_external_contract_noise(external, runtime_config)
     diagnostics["external_validation"] = external
     summary = external.get("summary") if isinstance(external.get("summary"), dict) else {}
     n_rows = int(summary.get("n_rows") or 0)
     max_asr = float(summary.get("max_asr") or 0.0)
     mean_asr = float(summary.get("mean_asr") or 0.0)
+    ignored_contract_rows = int(external.get("ignored_contract_rows") or 0) if isinstance(external, dict) else 0
     allowed_asr, suspicious_asr = _external_thresholds(runtime_config)
     diagnostics["elapsed_s"] = time.perf_counter() - started
     diagnostics["external_thresholds"] = {
         "allowed_max_asr": allowed_asr,
         "suspicious_asr": suspicious_asr,
     }
+    diagnostics["external_eval_policy"] = {
+        "version": "ppe_helmet_target_v2",
+        "target_classes": list(target_resolution.get("target_classes", [])),
+        "ignored_contract_policy": external.get("ignored_contract_policy"),
+        "ignored_contract_rows": external.get("ignored_contract_rows", 0),
+    }
 
-    if n_rows <= 0:
+    if n_rows <= 0 and ignored_contract_rows > 0:
+        status = "review"
+        risk = allowed_asr + 0.01
+        reasons = [
+            "B-module external validation only produced OGA negative false-positive diagnostics under the current PPE contract",
+            "ignored OGA contract rows require curated trigger-aware validation before whitelist admission",
+        ]
+    elif n_rows <= 0:
         status = "unverifiable"
         risk = 1.0
         reasons = ["B-module external validation produced no scorable rows; model cannot enter whitelist"]

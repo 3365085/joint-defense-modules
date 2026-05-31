@@ -33,6 +33,10 @@ class ModelSecurityStorage:
         return self.root / "purified"
 
     @property
+    def exports_dir(self) -> Path:
+        return self.root / "exports"
+
+    @property
     def activation_cache_dir(self) -> Path:
         return self.root / "activation_cache"
 
@@ -40,4 +44,5 @@ class ModelSecurityStorage:
         self.root.mkdir(parents=True, exist_ok=True)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.purified_dir.mkdir(parents=True, exist_ok=True)
+        self.exports_dir.mkdir(parents=True, exist_ok=True)
         self.activation_cache_dir.mkdir(parents=True, exist_ok=True)

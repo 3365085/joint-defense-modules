@@ -201,8 +201,11 @@
       $("downloadClip").style.display = event.evidence_clip_url ? "inline-flex" : "none";
       $("downloadClip").href = event.evidence_clip_url || "#";
       const poster = event.evidence_representative_url ? ` poster="${event.evidence_representative_url}"` : "";
-      const media = event.evidence_clip_url
-        ? `<video id="clipVideo" src="${event.evidence_clip_url}"${poster} controls autoplay muted playsinline preload="metadata"></video>
+      const clipUrl = event.evidence_clip_url ? `${event.evidence_clip_url}${event.evidence_clip_url.includes("?") ? "&" : "?"}v=${encodeURIComponent(event.updated_at || event.ended_at || Date.now())}` : "";
+      const media = clipUrl
+        ? `<video id="clipVideo"${poster} controls autoplay muted playsinline preload="auto">
+             <source src="${clipUrl}" type="video/mp4" />
+           </video>
            <div id="clipFallback" class="clipFallback">视频片段无法播放，已保留关键帧和原始文件链接。状态：${escapeHtml(event.evidence_clip_status || "unknown")}</div>`
         : (event.evidence_representative_url ? `<img src="${event.evidence_representative_url}" alt="代表帧" />` : '<div class="empty">该事件还没有可预览媒体。</div>');
       $("preview").innerHTML = `

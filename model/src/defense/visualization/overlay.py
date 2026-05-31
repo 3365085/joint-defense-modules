@@ -29,7 +29,7 @@ _FONT_CACHE: dict[int, ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    size = max(6, int(size))
+    size = max(2, int(size))
     if size in _FONT_CACHE:
         return _FONT_CACHE[size]
     for path in _FONT_CANDIDATES:
@@ -128,18 +128,18 @@ def _draw_label(
     if x2 <= x1 or y2 <= y1:
         return
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-    font_size = 6
+    font_size = 3
     try:
         bbox = _font(font_size).getbbox(text)
         tw = int(bbox[2] - bbox[0])
         th = int(bbox[3] - bbox[1])
     except Exception:
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-    label_h = max(8, th + 3)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.12, 1)
+    label_h = max(4, th + 2)
     label_y1 = max(0, y1 - label_h)
     label_y2 = min(h - 1, label_y1 + label_h)
-    cv2.rectangle(frame, (x1, label_y1), (min(w - 1, x1 + tw + 3), label_y2), color, -1)
-    _draw_text_cn(frame, text, (x1 + 1, label_y1 + 1), (0, 0, 0), size=font_size)
+    cv2.rectangle(frame, (x1, label_y1), (min(w - 1, x1 + tw + 2), label_y2), color, -1)
+    _draw_text_cn(frame, text, (x1 + 1, label_y1), (0, 0, 0), size=font_size)
 
 
 def draw_ppe_boxes(frame: np.ndarray, tracks: list[dict[str, Any]] | None) -> np.ndarray:
@@ -167,7 +167,7 @@ def draw_ppe_boxes(frame: np.ndarray, tracks: list[dict[str, Any]] | None) -> np
             display_label = "弱安全帽"
         else:
             display_label = PPE_LABEL_TEXT.get(label, label)
-        text = f"{display_label}#{int(track.get('track_id', 0))} {confidence:.2f}{small}{suffix}"
+        text = f"{display_label}{confidence:.2f}{small}{suffix}"
         _draw_label(rendered, [int(v) for v in box], text, color, 1)
     return rendered
 

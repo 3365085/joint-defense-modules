@@ -787,6 +787,7 @@ class ModelSecurityService:
         cfg, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
         current_status = self.status(profile=profile, custom_model=custom_model)
         source_pt = self._source_pt_path(cfg, fp)
+        source_hash = "sha256:" + sha256_file(source_pt) if source_pt and source_pt.exists() else None
         if bool(current_status.get("allowed", False)) and source_pt and source_pt.exists() and source_pt.suffix.lower() in {".pt", ".pth"}:
             source_runtime = {
                 "enabled": True,
@@ -799,7 +800,7 @@ class ModelSecurityService:
             source_fp = build_model_fingerprint(source_cfg, root=self.root)
             return source_pt, source_fp, source_runtime, current_status
 
-        purification = self._load_purification_report(fp.fingerprint)
+        purification = self._load_purification_report(fp.fingerprint, source_hash=source_hash)
         if purification and purification.status == "scan_clean_trusted" and purification.purified_model_path:
             purified_path = Path(purification.purified_model_path)
             if purified_path.exists() and purified_path.suffix.lower() in {".pt", ".pth"}:
@@ -1039,7 +1040,7 @@ class ModelSecurityService:
                 and self._last_report.fingerprint.get("fingerprint") == fp.fingerprint
                 else None
             )
-            if last_report and source_hash and last_report.source_model_hash and last_report.source_model_hash != source_hash:
+            if last_report and source_hash and last_report.source_model_hash != source_hash:
                 last_report = None
             if last_report is None:
                 last_report = self._load_report(fp.fingerprint, "full", source_hash)
@@ -1052,8 +1053,10 @@ class ModelSecurityService:
                 and self._last_purification_report.fingerprint.get("fingerprint") == fp.fingerprint
                 else None
             )
+            if last_purification and source_hash and last_purification.source_model_hash != source_hash:
+                last_purification = None
             if last_purification is None:
-                last_purification = self._load_purification_report(fp.fingerprint)
+                last_purification = self._load_purification_report(fp.fingerprint, source_hash=source_hash)
             scan_job = self._last_job_for_fingerprint(self._last_scan_job, fp.fingerprint)
             purification_job = self._last_job_for_fingerprint(self._last_purification_job, fp.fingerprint)
             exporting = self._is_exporting()
@@ -1242,7 +1245,7 @@ class ModelSecurityService:
         cfg, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
         source_pt = self._source_pt_path(cfg, fp)
         source_hash = "sha256:" + sha256_file(source_pt) if source_pt and source_pt.exists() else None
-        report = self._load_purification_report(fp.fingerprint)
+        report = self._load_purification_report(fp.fingerprint, source_hash=source_hash)
         if (
             report is None
             or report.status != "scan_clean_trusted"
@@ -1428,11 +1431,11 @@ class ModelSecurityService:
             return None
         if report.fingerprint.get("fingerprint") != fingerprint:
             return None
-        if source_hash and report.source_model_hash and report.source_model_hash != source_hash:
+        if source_hash and report.source_model_hash != source_hash:
             return None
         return report
 
-    def _load_purification_report(self, fingerprint: str) -> ModelPurificationReport | None:
+    def _load_purification_report(self, fingerprint: str, source_hash: str | None = None) -> ModelPurificationReport | None:
         path = self.storage.reports_dir / f"{fingerprint.replace(':','_')}_purification.json"
         if not path.exists() or not path.is_file():
             return None
@@ -1442,6 +1445,8 @@ class ModelSecurityService:
         except Exception:
             return None
         if report.fingerprint.get("fingerprint") != fingerprint:
+            return None
+        if source_hash and report.source_model_hash != source_hash:
             return None
         return report
 
@@ -1597,6 +1602,8 @@ class ModelSecurityService:
         source_pt = self._source_pt_path(cfg, fp)
         source_hash = "sha256:" + sha256_file(source_pt) if source_pt and source_pt.exists() else None
         latest_report = self._last_report if self._last_report and self._last_report.fingerprint.get("fingerprint") == fp.fingerprint else None
+        if latest_report and source_hash and latest_report.source_model_hash != source_hash:
+            latest_report = None
         if latest_report is None:
             latest_report = self._load_report(fp.fingerprint, "full", source_hash)
         if latest_report and self._full_clean_report_matches_runtime(latest_report, fp, source_hash):

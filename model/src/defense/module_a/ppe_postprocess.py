@@ -27,6 +27,7 @@ class PPEPostprocessConfig:
     prefer_helmet_on_head_overlap: bool = False
     head_helmet_mutex_iou: float = 0.20
     head_helmet_mutex_center_distance: float = 0.055
+    head_helmet_mutex_min_overlap: float = 0.18
     head_helmet_mutex_min_helmet_confidence: float = 0.25
 
 
@@ -107,6 +108,23 @@ def bbox_iou(left: tuple[float, float, float, float] | None, right: tuple[float,
     return intersection / union if union > 0.0 else 0.0
 
 
+def bbox_min_overlap_ratio(
+    left: tuple[float, float, float, float] | None,
+    right: tuple[float, float, float, float] | None,
+) -> float:
+    if left is None or right is None:
+        return 0.0
+    lx1, ly1, lx2, ly2 = left
+    rx1, ry1, rx2, ry2 = right
+    ix1 = max(lx1, rx1)
+    iy1 = max(ly1, ry1)
+    ix2 = min(lx2, rx2)
+    iy2 = min(ly2, ry2)
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    denominator = min(bbox_area(left), bbox_area(right))
+    return intersection / denominator if denominator > 0.0 else 0.0
+
+
 def bbox_center_distance_ratio(
     left: tuple[float, float, float, float] | None,
     right: tuple[float, float, float, float] | None,
@@ -155,12 +173,14 @@ def _head_helmet_mutex_match(
 ) -> tuple[bool, float, float]:
     iou = bbox_iou(left.bbox, right.bbox)
     distance = bbox_center_distance_ratio(left.bbox, right.bbox, frame_shape)
+    containment = bbox_min_overlap_ratio(left.bbox, right.bbox)
     return (
         bool(
             iou >= config.head_helmet_mutex_iou
             or (
                 config.head_helmet_mutex_center_distance > 0.0
                 and distance <= config.head_helmet_mutex_center_distance
+                and containment >= config.head_helmet_mutex_min_overlap
             )
         ),
         iou,
@@ -439,8 +459,6 @@ def _add_low_confidence_temporal_candidates(
         return suppression
     if candidate_min >= config.min_confidence:
         return suppression
-    if capabilities.get("has_person_class"):
-        return suppression
 
     out = dict(suppression)
     weak_heads = {int(v) for v in out.get("weak_head_indices", []) or []}
@@ -449,9 +467,20 @@ def _add_low_confidence_temporal_candidates(
     suppressed_helmets = list(out.get("suppressed_helmets", []) or [])
     low_head_count = 0
     low_helmet_count = 0
+    items = list(all_items)
+    persons = [
+        item
+        for item in items
+        if is_person_label(item.label)
+        and item.confidence >= config.min_confidence
+        and item.bbox is not None
+    ]
 
-    for item in all_items:
+    for item in items:
         if item.confidence < candidate_min or item.confidence >= config.min_confidence:
+            continue
+        person_context = _low_confidence_item_has_person_context(item, persons)
+        if capabilities.get("has_person_class") and not person_context:
             continue
         if is_bare_head_label(item.label):
             weak_heads.add(item.index)
@@ -461,6 +490,7 @@ def _add_low_confidence_temporal_candidates(
                     "head_index": item.index,
                     "head_confidence": item.confidence,
                     "head_bbox": list(item.bbox) if item.bbox else None,
+                    "person_context": person_context,
                     "reason": "low_conf_temporal_candidate",
                 }
             )
@@ -472,6 +502,7 @@ def _add_low_confidence_temporal_candidates(
                     "helmet_index": item.index,
                     "helmet_confidence": item.confidence,
                     "helmet_bbox": list(item.bbox) if item.bbox else None,
+                    "person_context": person_context,
                     "reason": "low_conf_temporal_candidate",
                 }
             )
@@ -483,6 +514,22 @@ def _add_low_confidence_temporal_candidates(
     out["low_conf_temporal_head_count"] = low_head_count
     out["low_conf_temporal_helmet_count"] = low_helmet_count
     return out
+
+
+def _low_confidence_item_has_person_context(item: PPEDetection, persons: list[PPEDetection]) -> bool:
+    if item.bbox is None:
+        return False
+    for person in persons:
+        if person.bbox is None:
+            continue
+        px1, py1, px2, py2 = person.bbox
+        person_height = max(1.0, py2 - py1)
+        upper = (px1, py1, px2, py1 + person_height * 0.45)
+        if bbox_iou(item.bbox, upper) >= 0.01:
+            return True
+        if bbox_min_overlap_ratio(item.bbox, upper) >= 0.35:
+            return True
+    return False
 
 
 def summarize_ppe_from_detections(

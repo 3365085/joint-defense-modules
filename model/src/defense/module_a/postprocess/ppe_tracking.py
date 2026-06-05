@@ -156,18 +156,34 @@ def _same_person_target(
     iou = bbox_iou(box_a, box_b)
     distance = center_distance_ratio(box_a, box_b, frame_shape)
     containment = bbox_min_overlap_ratio(box_a, box_b)
+    area_a = bbox_area(box_a)
+    area_b = bbox_area(box_b)
+    area_ratio = min(area_a, area_b) / max(area_a, area_b) if max(area_a, area_b) > 0.0 else 0.0
+    height_a = max(1.0, float(box_a[3]) - float(box_a[1]))
+    height_b = max(1.0, float(box_b[3]) - float(box_b[1]))
+    vertical_edge_delta = (
+        abs(float(box_a[1]) - float(box_b[1])) + abs(float(box_a[3]) - float(box_b[3]))
+    ) / max(1.0, min(height_a, height_b))
     return bool(
-        iou >= 0.62
+        iou >= 0.72
         or (
-            iou >= 0.42
+            iou >= 0.58
             and distance <= 0.045
-            and containment >= 0.65
+            and containment >= 0.88
+            and area_ratio >= 0.50
+            and vertical_edge_delta <= 0.12
         )
         or (
-            distance <= 0.060
-            and containment >= 0.82
+            distance <= 0.050
+            and containment >= 0.94
+            and area_ratio >= 0.50
+            and vertical_edge_delta <= 0.08
         )
     )
+
+
+def _helmet_confidently_covers_head(helmet_confidence: float, head_confidence: float) -> bool:
+    return float(helmet_confidence) >= max(0.55, float(head_confidence) + 0.06)
 
 
 def _extrapolate_box(
@@ -619,7 +635,8 @@ class PPEDisplayTracker:
                 iou = bbox_iou(tracks[left]["box"], tracks[right]["box"])
                 distance = center_distance_ratio(tracks[left]["box"], tracks[right]["box"], frame_shape)
                 if {left_label, right_label} <= {"helmet", "head"}:
-                    same_target = iou >= 0.20 or distance <= 0.035
+                    containment = bbox_min_overlap_ratio(tracks[left]["box"], tracks[right]["box"])
+                    same_target = iou >= 0.42 or (distance <= 0.030 and containment >= 0.18)
                 elif left_label == right_label:
                     same_target = (
                         _same_person_target(tracks[left]["box"], tracks[right]["box"], frame_shape)
@@ -631,7 +648,13 @@ class PPEDisplayTracker:
                 if not same_target:
                     continue
                 if {left_label, right_label} <= {"helmet", "head"} and left_label != right_label:
+                    left_conf = float(tracks[left].get("confidence", 0.0))
+                    right_conf = float(tracks[right].get("confidence", 0.0))
                     if left_label == "helmet":
+                        drop_right = _helmet_confidently_covers_head(left_conf, right_conf)
+                    else:
+                        drop_right = not _helmet_confidently_covers_head(right_conf, left_conf)
+                    if drop_right:
                         keep[right] = False
                     else:
                         keep[left] = False
@@ -719,7 +742,8 @@ class PPEDisplayTracker:
                         else iou >= 0.72
                     )
                 elif labels <= {"helmet", "head"}:
-                    same_zone = iou >= 0.30 or distance <= 0.026
+                    containment = bbox_min_overlap_ratio(items[left]["box"], items[right]["box"])
+                    same_zone = iou >= 0.42 or (distance <= 0.026 and containment >= 0.18)
                 else:
                     same_zone = iou >= 0.62
                 if same_zone:
@@ -738,9 +762,9 @@ class PPEDisplayTracker:
         if "helmet" in by_label and "head" in by_label:
             best_helmet = max(by_label["helmet"], key=lambda item: float(item["confidence"]))
             best_head = max(by_label["head"], key=lambda item: float(item["confidence"]))
-            if float(best_head["confidence"]) >= max(0.65, float(best_helmet["confidence"]) + 0.10):
-                return best_head.copy()
-            return best_helmet.copy()
+            if _helmet_confidently_covers_head(best_helmet["confidence"], best_head["confidence"]):
+                return best_helmet.copy()
+            return best_head.copy()
         priority = {"helmet": 3, "head": 2, "person": 1}
         return max(cluster_items, key=lambda item: (priority.get(str(item["label"]), 0), float(item["confidence"]))).copy()
 

@@ -138,6 +138,9 @@ class FrameProcessor:
             head_helmet_mutex_center_distance=float(
                 ppe_config.get("head_helmet_mutex_center_distance", 0.055)
             ),
+            head_helmet_mutex_min_overlap=float(
+                ppe_config.get("head_helmet_mutex_min_overlap", 0.18)
+            ),
             head_helmet_mutex_min_helmet_confidence=float(
                 ppe_config.get("head_helmet_mutex_min_helmet_confidence", 0.25)
             ),
@@ -177,6 +180,9 @@ class FrameProcessor:
         self.ppe_tracking_enabled = bool(ppe_config.get("enabled", True))
         self.ppe_roi_redetect_enabled = bool(
             ppe_config.get("roi_redetect_enabled", runtime_config.get("ppe_roi_redetect_enabled", False))
+        )
+        self.ppe_file_realtime_max_render_misses = int(
+            runtime_config.get("ppe_file_realtime_max_render_misses", 2) or 2
         )
         a3b_config = config.get("a3b", {}) if isinstance(config.get("a3b"), dict) else {}
         self.source_auth_media_suppression_threshold = float(a3b_config.get("observed_threshold", 0.42))
@@ -252,7 +258,11 @@ class FrameProcessor:
             ppe_state=self.ppe_state,
             ppe_tracker=self.ppe_tracker,
             tracking_enabled=self.ppe_tracking_enabled,
-            max_render_misses=_ppe_max_render_misses(source_type=source_type, realtime=realtime),
+            max_render_misses=_ppe_max_render_misses(
+                source_type=source_type,
+                realtime=realtime,
+                file_realtime_max_misses=self.ppe_file_realtime_max_render_misses,
+            ),
             postprocess_config=self.ppe_postprocess_config,
             source_auth_media_bbox=static_media.get("p_media_bbox"),
             source_auth_suppression_active=_source_auth_media_suppression_active(
@@ -488,6 +498,7 @@ class FrameProcessor:
             "ppe_boxes_count": int(ppe_boxes_count),
             "tracked_boxes_count": int(tracked_boxes_count),
             "render_boxes_count": int(render_boxes_count),
+            "ppe_file_realtime_max_render_misses": int(self.ppe_file_realtime_max_render_misses),
             "ppe_roi_redetect_budget_ok": bool(redetect_budget_ok),
             "ppe_roi_redetect_triggered": bool(redetect_count > 0),
             "ppe_roi_redetect_count": int(redetect_count),
@@ -502,9 +513,14 @@ class FrameProcessor:
         return status
 
 
-def _ppe_max_render_misses(*, source_type: str, realtime: bool) -> int | None:
+def _ppe_max_render_misses(
+    *,
+    source_type: str,
+    realtime: bool,
+    file_realtime_max_misses: int = 2,
+) -> int | None:
     if str(source_type or "").lower() == "file" and bool(realtime):
-        return 2
+        return max(0, int(file_realtime_max_misses))
     return None
 
 

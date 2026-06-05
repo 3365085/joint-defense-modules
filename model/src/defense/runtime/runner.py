@@ -288,6 +288,7 @@ class MonitorEngine:
         self.status: dict[str, Any] = self._empty_status()
         self.display_options: dict[str, bool] = {
             "show_boxes": True,
+            "show_person_boxes": True,
             "show_module_hud": True,
             "show_ppe_hud": True,
         }
@@ -381,7 +382,12 @@ class MonitorEngine:
             "ppe_tracks": [],
             "feature_options": {"static_image_enabled": True},
             "custom_model": normalize_custom_model_options(None),
-            "display_options": {"show_boxes": True, "show_module_hud": True, "show_ppe_hud": True},
+            "display_options": {
+                "show_boxes": True,
+                "show_person_boxes": True,
+                "show_module_hud": True,
+                "show_ppe_hud": True,
+            },
             "evidence_session_dir": None,
             "evidence_manifest_path": None,
             "evidence_saved_event_count": 0,
@@ -446,6 +452,9 @@ class MonitorEngine:
             "overlay_match_window_ms": 180.0,
             "overlay_hold_ms": 550.0,
             "overlay_interpolate_ms": 400.0,
+            "file_realtime_overlay_bridge_frames": 3.2,
+            "file_realtime_overlay_bridge_min_s": 0.20,
+            "file_realtime_overlay_bridge_max_s": 0.36,
             "detector_pipeline_mode": "idle",
             "detector_queue_policy": "latest_only",
             "detector_process_fps_cap": 0.0,
@@ -459,6 +468,7 @@ class MonitorEngine:
             "ppe_boxes_count": 0,
             "tracked_boxes_count": 0,
             "render_boxes_count": 0,
+            "ppe_file_realtime_max_render_misses": 2,
             "ppe_roi_redetect_budget_ok": True,
             "ppe_roi_redetect_triggered": False,
             "ppe_roi_redetect_count": 0,
@@ -586,6 +596,15 @@ class MonitorEngine:
         detector_process_fps_cap = float(
             runtime_config.get("detector_process_fps_cap", runtime_config.get("process_fps_cap", 15)) or 15
         )
+        file_realtime_overlay_bridge_frames = float(
+            runtime_config.get("file_realtime_overlay_bridge_frames", 3.2) or 3.2
+        )
+        file_realtime_overlay_bridge_min_s = float(
+            runtime_config.get("file_realtime_overlay_bridge_min_s", 0.20) or 0.20
+        )
+        file_realtime_overlay_bridge_max_s = float(
+            runtime_config.get("file_realtime_overlay_bridge_max_s", 0.36) or 0.36
+        )
         capture_max_side = int(runtime_config.get("capture_max_side", preview_max_side) or preview_max_side)
         file_source_fps_cap = float(
             runtime_config.get(
@@ -612,6 +631,9 @@ class MonitorEngine:
                         "detector_pipeline_mode": "backend_latest_only",
                         "detector_queue_policy": "latest_only",
                         "detector_process_fps_cap": detector_process_fps_cap,
+                        "file_realtime_overlay_bridge_frames": file_realtime_overlay_bridge_frames,
+                        "file_realtime_overlay_bridge_min_s": file_realtime_overlay_bridge_min_s,
+                        "file_realtime_overlay_bridge_max_s": file_realtime_overlay_bridge_max_s,
                         "preview_render_fps": preview_render_fps,
                         "preview_max_side": preview_max_side,
                         "capture_max_side": capture_max_side,
@@ -711,7 +733,7 @@ class MonitorEngine:
         return self.get_status()
 
     def update_display_options(self, options: dict[str, Any]) -> dict[str, bool]:
-        allowed = {"show_boxes", "show_module_hud", "show_ppe_hud"}
+        allowed = {"show_boxes", "show_person_boxes", "show_module_hud", "show_ppe_hud"}
         with self.condition:
             for key, value in (options or {}).items():
                 if key in allowed:
@@ -1358,7 +1380,19 @@ class MonitorEngine:
                 # stale boxes trail moving content, but a too-short bridge drops
                 # boxes whenever detection falls slightly below the target FPS.
                 detector_fps = max(1.0, float(self.status.get("detector_process_fps_cap") or 15.0))
-                bridge_s = min(0.36, max(0.20, 3.2 / detector_fps))
+                bridge_frames = max(
+                    1.0,
+                    float(self.status.get("file_realtime_overlay_bridge_frames") or 3.2),
+                )
+                bridge_min_s = max(
+                    0.0,
+                    float(self.status.get("file_realtime_overlay_bridge_min_s") or 0.20),
+                )
+                bridge_max_s = max(
+                    bridge_min_s,
+                    float(self.status.get("file_realtime_overlay_bridge_max_s") or 0.36),
+                )
+                bridge_s = min(bridge_max_s, max(bridge_min_s, bridge_frames / detector_fps))
                 match_s = min(match_s, bridge_s)
                 hold_s = min(hold_s, bridge_s)
                 max_age_s = min(max_age_s, max(bridge_s, 0.32))

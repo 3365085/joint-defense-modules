@@ -19,6 +19,8 @@ PPE_LABEL_COLORS = {
     "person": (255, 210, 80),
 }
 
+_PERSON_LABELS = {"person", "worker", "human", "pedestrian"}
+
 
 _FONT_CANDIDATES = (
     r"C:\Windows\Fonts\msyh.ttc",
@@ -144,11 +146,27 @@ def _draw_label(
     _draw_text_cn(frame, text, (x1 + pad_x, label_y1 + pad_y), (0, 0, 0), size=font_size)
 
 
-def draw_ppe_boxes(frame: np.ndarray, tracks: list[dict[str, Any]] | None) -> np.ndarray:
+def _is_person_track(track: dict[str, Any]) -> bool:
+    labels = (
+        track.get("label"),
+        track.get("stable_label"),
+        track.get("evidence_label"),
+    )
+    return any(str(label or "").lower() in _PERSON_LABELS for label in labels)
+
+
+def draw_ppe_boxes(
+    frame: np.ndarray,
+    tracks: list[dict[str, Any]] | None,
+    *,
+    show_person_boxes: bool = True,
+) -> np.ndarray:
     if not tracks:
         return frame
     rendered = frame
     for track in tracks:
+        if not show_person_boxes and _is_person_track(track):
+            continue
         box = track.get("box")
         if not isinstance(box, (list, tuple)) or len(box) != 4:
             continue
@@ -222,7 +240,11 @@ def render_preview(
     options = display_options or {}
     rendered = frame.copy()
     if options.get("show_boxes", True):
-        rendered = draw_ppe_boxes(rendered, ppe_tracks)
+        rendered = draw_ppe_boxes(
+            rendered,
+            ppe_tracks,
+            show_person_boxes=options.get("show_person_boxes", True),
+        )
     if options.get("show_module_hud", True) and info is not None:
         rendered = draw_hud(rendered, info, frame_idx)
     if options.get("show_ppe_hud", True) and ppe is not None:

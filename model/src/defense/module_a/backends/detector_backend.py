@@ -144,8 +144,6 @@ class UltralyticsDetectorBackend:
     def _prediction_confidence(self) -> float:
         if self.candidate_confidence is None:
             return self.confidence
-        if not _is_head_helmet_only_names(self.names):
-            return self.confidence
         return min(self.confidence, self.candidate_confidence)
 
 
@@ -353,8 +351,6 @@ class YoloV5DetectorBackend:
 
     def _prediction_confidence(self) -> float:
         if self.candidate_confidence is None:
-            return self.confidence
-        if not _is_head_helmet_only_names(self.names):
             return self.confidence
         return min(self.confidence, self.candidate_confidence)
 

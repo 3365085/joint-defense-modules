@@ -288,6 +288,112 @@ def test_trusted_purified_status_prefers_registry_bound_purification_report(tmp_
     assert status["security_metrics"]["purified_asr"] == 0.0
 
 
+def test_purification_report_requires_matching_source_hash_for_admission(tmp_path: Path):
+    svc = ModelSecurityService(root=tmp_path)
+    engine = tmp_path / "runtime.engine"
+    old_source = tmp_path / "old_source.pt"
+    new_source = tmp_path / "new_source.pt"
+    purified = tmp_path / "old_source_purified.pt"
+    engine.write_bytes(b"same-runtime-engine" * 128)
+    old_source.write_bytes(b"old-source-model" * 128)
+    new_source.write_bytes(b"new-source-model" * 128)
+    purified.write_bytes(b"purified-old-source" * 128)
+    custom_model = {
+        "enabled": True,
+        "path": str(engine),
+        "backend": "tensorrt",
+        "model_family": "yolov5",
+        "source_pt_path": str(new_source),
+    }
+    fp = svc.current_fingerprint(custom_model=custom_model)
+    stale_report = ModelPurificationReport(
+        fingerprint={"fingerprint": fp.fingerprint, "model_hash": fp.model_hash},
+        status="scan_clean_trusted",
+        strategy="autodetox_backbone_soup",
+        source_model_path=str(old_source),
+        source_model_hash="sha256:" + sha256_file(old_source),
+        purified_model_path=str(purified),
+        purified_model_hash="sha256:" + sha256_file(purified),
+        scan_status="clean",
+    )
+    stale_report.write(svc.storage.reports_dir / f"{fp.fingerprint.replace(':','_')}_purification.json")
+
+    status = svc.status(custom_model=custom_model)
+
+    assert status["source_pt_hash"] == "sha256:" + sha256_file(new_source)
+    assert status["admission_status"] == "blocked_scan_required"
+    assert status["purification_status"] == "idle"
+    assert status["purified_model_path"] is None
+
+
+def test_purification_report_without_source_hash_is_not_source_bound(tmp_path: Path):
+    svc = ModelSecurityService(root=tmp_path)
+    engine = tmp_path / "runtime.engine"
+    source = tmp_path / "source.pt"
+    purified = tmp_path / "legacy_purified.pt"
+    engine.write_bytes(b"same-runtime-engine" * 128)
+    source.write_bytes(b"current-source-model" * 128)
+    purified.write_bytes(b"legacy-purified-model" * 128)
+    custom_model = {
+        "enabled": True,
+        "path": str(engine),
+        "backend": "tensorrt",
+        "model_family": "yolov5",
+        "source_pt_path": str(source),
+    }
+    fp = svc.current_fingerprint(custom_model=custom_model)
+    legacy_report = ModelPurificationReport(
+        fingerprint={"fingerprint": fp.fingerprint, "model_hash": fp.model_hash},
+        status="scan_clean_trusted",
+        strategy="legacy_report_without_source_hash",
+        source_model_path=str(source),
+        source_model_hash=None,
+        purified_model_path=str(purified),
+        purified_model_hash="sha256:" + sha256_file(purified),
+        scan_status="clean",
+    )
+    legacy_report.write(svc.storage.reports_dir / f"{fp.fingerprint.replace(':','_')}_purification.json")
+
+    status = svc.status(custom_model=custom_model)
+
+    assert status["source_pt_hash"] == "sha256:" + sha256_file(source)
+    assert status["admission_status"] == "blocked_scan_required"
+    assert status["purification_status"] == "idle"
+    assert status["purified_model_path"] is None
+
+
+def test_full_scan_report_without_source_hash_is_not_source_bound(tmp_path: Path):
+    svc = ModelSecurityService(root=tmp_path)
+    engine = tmp_path / "runtime.engine"
+    source = tmp_path / "source.pt"
+    engine.write_bytes(b"same-runtime-engine" * 128)
+    source.write_bytes(b"current-source-model" * 128)
+    custom_model = {
+        "enabled": True,
+        "path": str(engine),
+        "backend": "tensorrt",
+        "model_family": "yolov5",
+        "source_pt_path": str(source),
+    }
+    fp = svc.current_fingerprint(custom_model=custom_model)
+    legacy_report = ModelSecurityReport(
+        fingerprint={"fingerprint": fp.fingerprint, "model_hash": fp.model_hash},
+        scan_type="full",
+        status="suspicious",
+        risk_score=0.95,
+        source_model_path=str(source),
+        source_model_hash=None,
+        runtime_artifact_path=str(engine),
+    )
+    legacy_report.write(svc.storage.reports_dir / f"{fp.fingerprint.replace(':','_')}_full.json")
+
+    status = svc.status(custom_model=custom_model)
+
+    assert status["source_pt_hash"] == "sha256:" + sha256_file(source)
+    assert status["admission_status"] == "blocked_scan_required"
+    assert status["report_path"] is None
+
+
 def test_packaged_purification_candidates_follow_hash_when_model_is_renamed(tmp_path: Path, monkeypatch):
     package = tmp_path / "new_algorithm"
     poisoned_dir = package / "models" / "poisoned"
@@ -555,7 +661,7 @@ def test_person_aliases_are_consistent_across_ppe_layers():
         )
         summary = summarize_ppe_from_detections(detections, frame_shape=(640, 640))
 
-        assert backend._prediction_confidence() == 0.25
+        assert backend._prediction_confidence() == 0.18
         assert canonical_label(alias) == "person"
         assert summary["has_person_class"] is True
         assert summary["effective_person_count"] == 1
@@ -1175,6 +1281,48 @@ def test_file_realtime_preview_drops_unmatched_interpolated_tracks():
     assert selected["ppe_tracks"] == []
     assert engine._preview_last_overlay is not None
     assert engine._preview_last_overlay["ppe_tracks"] == []
+
+
+def test_file_realtime_preview_bridge_window_is_configurable():
+    engine = MonitorEngine(object())
+    engine.status.update(
+        {
+            "source_type": "file",
+            "realtime": True,
+            "detector_process_fps_cap": 15.0,
+            "overlay_match_window_ms": 180.0,
+            "overlay_hold_ms": 550.0,
+            "overlay_interpolate_ms": 400.0,
+            "overlay_max_age_ms": 950.0,
+            "file_realtime_overlay_bridge_frames": 3.8,
+            "file_realtime_overlay_bridge_min_s": 0.24,
+            "file_realtime_overlay_bridge_max_s": 0.40,
+        }
+    )
+    engine.overlay_timeline.append(
+        {
+            "overlay_seq": 1,
+            "source_epoch": 0,
+            "video_time_s": 1.0,
+            "ppe_tracks": [
+                {
+                    "track_id": 7,
+                    "label": "head",
+                    "box": [300, 180, 340, 225],
+                    "source": "detected",
+                    "hold_eligible": True,
+                }
+            ],
+        }
+    )
+
+    first = engine._select_preview_overlay(1.0, 0)
+    selected = engine._select_preview_overlay(1.23, 0)
+
+    assert first is not None
+    assert selected is not None
+    assert selected.get("held") is True
+    assert selected["ppe_tracks"][0]["source"] == "held"
 
 
 def test_high_a3b_sensitivity_warns_after_two_observed_only_hits():

@@ -9,6 +9,7 @@ from defense.module_a.ppe_postprocess import (
     bbox_area,
     bbox_center_distance_ratio,
     bbox_iou,
+    bbox_min_overlap_ratio,
     extract_ppe_detections,
     is_bare_head_label,
     is_helmet_label,
@@ -139,9 +140,13 @@ def _apply_temporal_helmet_mutex(
                 continue
             iou = bbox_iou(head_bbox, track_bbox)
             distance = bbox_center_distance_ratio(head_bbox, track_bbox, frame_shape)
+            containment = bbox_min_overlap_ratio(head_bbox, track_bbox)
             same_target = bool(
                 iou >= config.head_helmet_mutex_iou
-                or distance <= config.head_helmet_mutex_center_distance
+                or (
+                    distance <= config.head_helmet_mutex_center_distance
+                    and containment >= config.head_helmet_mutex_min_overlap
+                )
             )
             if not same_target:
                 continue

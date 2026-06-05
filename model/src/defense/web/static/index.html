@@ -663,6 +663,7 @@
         <label>画面叠加</label>
         <div class="toggleGrid">
           <label class="toggleLine"><input id="showBoxes" type="checkbox" checked />显示目标框和置信度</label>
+          <label class="toggleLine"><input id="showPersonBoxes" type="checkbox" checked />绘制人员辅助框</label>
           <label class="toggleLine"><input id="showModuleHud" type="checkbox" checked />显示模块A状态文字</label>
           <label class="toggleLine"><input id="showPpeHud" type="checkbox" checked />显示安全帽画面提示</label>
         </div>
@@ -1424,6 +1425,7 @@
     function drawingOptions() {
       return {
         show_boxes: $("showBoxes").checked,
+        show_person_boxes: $("showPersonBoxes").checked,
         show_module_hud: $("showModuleHud").checked,
         show_ppe_hud: $("showPpeHud").checked,
       };
@@ -1865,7 +1867,7 @@
       syncActiveStageAspect();
       drawOverlay(lastOverlayStatus || {});
     });
-    ["showBoxes", "showModuleHud", "showPpeHud"].forEach((id) => {
+    ["showBoxes", "showPersonBoxes", "showModuleHud", "showPpeHud"].forEach((id) => {
       $(id).onchange = async () => {
         try {
           await syncDrawingOptions();
@@ -2020,6 +2022,7 @@
         }
         const displayOptions = status.display_options || {};
         $("showBoxes").checked = displayOptions.show_boxes !== false;
+        $("showPersonBoxes").checked = displayOptions.show_person_boxes !== false;
         $("showModuleHud").checked = displayOptions.show_module_hud !== false;
         $("showPpeHud").checked = displayOptions.show_ppe_hud !== false;
         syncOverlayTimingFromStatus(status);

@@ -140,6 +140,9 @@ def list_artifacts(
     catalog_root: str | Path | None = None,
     business_domain: str | None = None,
     category: str | None = None,
+    artifact_type: str | None = None,
+    status: str | None = None,
+    fingerprint: str | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
     db_path = default_catalog_path(catalog_root)
@@ -153,6 +156,15 @@ def list_artifacts(
     if category:
         clauses.append("category = ?")
         params.append(str(category))
+    if artifact_type:
+        clauses.append("artifact_type = ?")
+        params.append(str(artifact_type))
+    if status:
+        clauses.append("status = ?")
+        params.append(str(status))
+    if fingerprint:
+        clauses.append("fingerprint = ?")
+        params.append(str(fingerprint))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     max_items = max(1, min(int(limit or 100), 500))
     with sqlite3.connect(str(db_path), timeout=5.0) as conn:

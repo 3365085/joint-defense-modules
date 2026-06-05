@@ -215,20 +215,20 @@
       padding: 0;
       border-bottom: 0;
       background: transparent;
-      align-items: flex-start;
+      align-items: center;
     }
     .inlinePanel .pill {
       min-width: auto;
       flex: 0 0 auto;
     }
     .inlinePanel .actions {
-      display: flex;
-      justify-content: flex-start;
+      display: grid;
+      grid-template-columns: 1fr;
       margin-top: 10px;
     }
     .inlinePanel .actions button {
-      width: auto;
-      min-width: 128px;
+      width: 100%;
+      min-width: 0;
     }
     .connectStatus {
       min-height: 20px;
@@ -800,20 +800,24 @@
       let path = "";
       let modelFamily = "auto";
       let sourcePtPath = "";
+      let classNamesRaw = "";
       try {
         enabled = localStorage.getItem("moduleA.lastCustomModelEnabled") === "true";
         path = localStorage.getItem("moduleA.lastModelPath") || "";
         localStorage.removeItem("moduleA.lastCustomModelBackend");
         modelFamily = localStorage.getItem("moduleA.lastCustomModelFamily") || "auto";
         sourcePtPath = localStorage.getItem("moduleA.lastSourcePtPath") || "";
+        classNamesRaw = localStorage.getItem("moduleA.lastCustomClassNames") || "";
       } catch (_) {}
-      return {
+      const options = {
         enabled: enabled && !!path,
         path,
         backend: "auto",
         model_family: modelFamily,
         source_pt_path: sourcePtPath,
       };
+      if (classNamesRaw) options.class_names = classNamesRaw.split(",").map((item) => item.trim()).filter(Boolean);
+      return options;
     }
 
     function modelSecurityBypassEnabled() {
@@ -867,6 +871,7 @@
       const labels = {
         blocked_scan_required: "模型未命中白名单，需要B模块完整扫描",
         scanning: "B模块完整扫描正在后台运行，A模块暂未启动",
+        exporting: "B模块正在导出加速模型，完成后会自动写入白名单",
         unverifiable: "B模块无法验证当前模型，A模块已被阻止启动",
         suspicious: "B模块判定模型可疑，A模块已被阻止启动",
         review: "B模块要求复核，当前策略不会放行",
@@ -1439,10 +1444,10 @@
       high: "高灵敏",
     };
     const a3bSensitivityParams = {
-      conservative: {observe: "0.46", confirm: "0.66", strong: "0.82", interval: "4帧"},
-      balanced: {observe: "0.42", confirm: "0.62", strong: "0.78", interval: "4帧"},
-      sensitive: {observe: "0.38", confirm: "0.58", strong: "0.74", interval: "3帧"},
-      high: {observe: "0.34", confirm: "0.54", strong: "0.70", interval: "2帧"},
+      conservative: {observe: "0.46", confirm: "0.66", strong: "0.82", interval: "4帧", window: "3次"},
+      balanced: {observe: "0.42", confirm: "0.62", strong: "0.78", interval: "4帧", window: "3次"},
+      sensitive: {observe: "0.38", confirm: "0.58", strong: "0.74", interval: "3帧", window: "2次"},
+      high: {observe: "0.34", confirm: "0.54", strong: "0.70", interval: "2帧", window: "2次"},
     };
 
     function currentA3bSensitivity() {
@@ -1462,6 +1467,7 @@
           <span>确认阈值 ${params.confirm}</span>
           <span>单帧强触发 ${params.strong}</span>
           <span>检测间隔 ${params.interval}</span>
+          <span>窗口命中 ${params.window}</span>
         `;
       }
       try { localStorage.setItem("moduleA.a3bSensitivity", normalized); } catch (_) {}
@@ -1570,7 +1576,9 @@
         suspicious: "疑似风险",
         review: "需要复核",
         purifying: "净化中",
+        exporting: "导出中",
         clean_export_required: "净化通过，待切换",
+        purified_alternative_available: "净化模型可用",
         bypassed_for_test: "测试绕过",
         error: "异常",
         planned: "已生成净化计划",
@@ -1607,6 +1615,9 @@
       if (ms.purifying || status === "purifying") {
         return `B模块正在净化模型；A模块会等待准入结果。${suffix}`;
       }
+      if (ms.exporting || status === "exporting") {
+        return `B模块正在导出加速模型；完成后会写入白名单。${suffix}`;
+      }
       if (ms.scanning || status === "scanning") {
         return `B模块正在完整扫描模型；A模块暂未启动。${suffix}`;
       }
@@ -1640,7 +1651,7 @@
       pill.textContent = modelSecurityStatusLabel(status);
       const summaryNode = $("modelSecuritySummary");
       if (summaryNode) summaryNode.textContent = modelSecurityCompactSummary(ms, status);
-      const alertStates = ["blocked_scan_required", "unverifiable", "suspicious", "review", "clean_export_required", "purified_alternative_available", "purifying", "planned", "error"];
+      const alertStates = ["blocked_scan_required", "unverifiable", "suspicious", "review", "clean_export_required", "purified_alternative_available", "purifying", "exporting", "planned", "error"];
       pill.className = "pill " + ((status === "trusted") ? "live" : alertStates.includes(status) ? "alert" : "");
     }
 

@@ -14,6 +14,7 @@ Scope: entire repository.
 - Detection uses latest-only backpressure.
 - Do not change model weights, class semantics, thresholds, PPE semantics, or A3b/Module A strategy without explicit behavior-tuning work.
 - GPU-preferred tests must attempt CPU fallback when CUDA is unavailable.
+- Run all project commands through Pixi (`pixi run ...` or repository `.pixi` scripts); never use global Python, global pip, or global package executables.
 
 ## Ownership boundaries
 
@@ -32,6 +33,7 @@ Scope: entire repository.
 ## Subagent lifecycle
 
 - Only create subagents when the user explicitly asks for subagent/parallel-agent work, or when a clearly independent side task can run in parallel without blocking the main critical path.
+- When spawning subagents for this project, set `reasoning_effort` to `xhigh` (超高) unless the user explicitly requests otherwise.
 - Before spawning subagents, split tasks into non-overlapping scopes and decide which immediate blocking work stays in the main thread.
 - Record every spawned subagent id, nickname, task scope, and expected output in the working notes or progress update.
 - After a subagent completes, is interrupted, is no longer needed, or the user asks to stop/close agents, call `close_agent` for that subagent id immediately.
@@ -69,6 +71,13 @@ Scope: entire repository.
 - Double-click `start_web.bat` from `D:\联合防御模块` to start the Web service through `D:\联合防御模块\.pixi` and open the browser.
 - Double-click `stop_web.bat` from `D:\联合防御模块` to stop the current Web service and free port 7860.
 - Command-line equivalent: run `pixi run monitor-open-external` or `pixi run monitor` from `D:\联合防御模块`; do not start the Web service with global Python.
+
+## Environment and path handling
+
+- Current project environment is Pixi-only; do not run project code, tests, training, tools, or installs from any global environment.
+- This repository path contains Chinese characters. Some terminals or tool outputs may show mojibake for `D:\联合防御模块`; treat that as an encoding/display issue, not as a different repository.
+- Prefer quoted absolute paths and PowerShell `-LiteralPath` for file reads. If a cmdlet does not support `-LiteralPath`, use a quoted `-Path` only after verifying the resolved target stays under the intended workspace.
+- Do not create duplicate garbled-path directories to work around display encoding problems.
 
 ## Generated files
 

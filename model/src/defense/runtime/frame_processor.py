@@ -8,7 +8,12 @@ from typing import Any
 import cv2
 import numpy as np
 
-from defense.module_a.ppe_postprocess import PPEPostprocessConfig
+from defense.module_a.ppe_postprocess import (
+    PPEPostprocessConfig,
+    is_bare_head_label,
+    is_helmet_label,
+    is_person_label,
+)
 from defense.module_a.postprocess import PPEDisplayTracker, merge_roi_detections
 from .a3b_soft_trigger import A3BSoftTriggerState
 from .pipeline_factory import PipelineBundle
@@ -60,6 +65,16 @@ def _int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _ppe_track_label_counts(ppe_tracks: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for track in ppe_tracks:
+        label = str(track.get("label") or "")
+        if label not in {"person", "helmet", "head"}:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+    return counts
 
 
 def info_reason(info: dict[str, Any]) -> str:
@@ -116,6 +131,16 @@ class FrameProcessor:
                 if candidate_min_confidence is not None
                 else None
             ),
+            prefer_helmet_on_head_overlap=bool(
+                ppe_config.get("prefer_helmet_on_head_overlap", True)
+            ),
+            head_helmet_mutex_iou=float(ppe_config.get("head_helmet_mutex_iou", 0.20)),
+            head_helmet_mutex_center_distance=float(
+                ppe_config.get("head_helmet_mutex_center_distance", 0.055)
+            ),
+            head_helmet_mutex_min_helmet_confidence=float(
+                ppe_config.get("head_helmet_mutex_min_helmet_confidence", 0.25)
+            ),
         )
         hold_frames = int(ppe_config.get("max_missed_frames", 10 if ppe_config else 8))
         self.ppe_state = SafetyHelmetState(
@@ -154,6 +179,7 @@ class FrameProcessor:
             ppe_config.get("roi_redetect_enabled", runtime_config.get("ppe_roi_redetect_enabled", False))
         )
         a3b_config = config.get("a3b", {}) if isinstance(config.get("a3b"), dict) else {}
+        self.source_auth_media_suppression_threshold = float(a3b_config.get("observed_threshold", 0.42))
         self.a3b_soft = A3BSoftTriggerState(a3b_config)
         self.processing_history: deque[float] = deque(maxlen=30)
         self.jpeg_quality = int(jpeg_quality)
@@ -185,6 +211,7 @@ class FrameProcessor:
         started = time.perf_counter()
         frame_640 = prepare_frame_640(frame)
         _, detections, info = self.pipeline.process_frame(frame_640)
+        static_media = dict(_static_media_details(info))
         redetect_ms = 0.0
         redetect_count = 0
         avg_processing_ms = (
@@ -227,6 +254,11 @@ class FrameProcessor:
             tracking_enabled=self.ppe_tracking_enabled,
             max_render_misses=_ppe_max_render_misses(source_type=source_type, realtime=realtime),
             postprocess_config=self.ppe_postprocess_config,
+            source_auth_media_bbox=static_media.get("p_media_bbox"),
+            source_auth_suppression_active=_source_auth_media_suppression_active(
+                static_media,
+                threshold=self.source_auth_media_suppression_threshold,
+            ),
         )
         ppe = ppe_result.ppe
         ppe_tracks = ppe_result.tracks
@@ -310,6 +342,11 @@ class FrameProcessor:
         a3b_state = str(a3b_soft.get("state") or ("confirmed" if a3b_soft.get("triggered") else "normal"))
         ppe_boxes_count = _int(ppe.get("person_count")) + _int(ppe.get("helmet_count")) + _int(ppe.get("head_count"))
         ppe_suppression = ppe.get("helmet_fp_suppression", {})
+        ppe_weak_person_count = (
+            len(ppe_suppression.get("weak_person_indices", []) or [])
+            if isinstance(ppe_suppression, dict)
+            else 0
+        )
         ppe_weak_head_count = (
             len(ppe_suppression.get("weak_head_indices", []) or [])
             if isinstance(ppe_suppression, dict)
@@ -320,8 +357,26 @@ class FrameProcessor:
             if isinstance(ppe_suppression, dict)
             else 0
         )
+        source_auth_suppression = (
+            ppe.get("source_auth_media_suppression", {})
+            if isinstance(ppe.get("source_auth_media_suppression"), dict)
+            else {}
+        )
+        source_auth_suppressed_labels = [
+            str(label) for label in source_auth_suppression.get("suppressed_labels", []) or []
+        ]
         tracked_boxes_count = len([track for track in ppe_tracks if str(track.get("source", "detected")) in {"tracked", "held"}])
         render_boxes_count = len(ppe_tracks)
+        visible_ppe_counts = _ppe_track_label_counts(ppe_tracks)
+        visible_person_count = visible_ppe_counts.get("person", 0)
+        visible_helmet_count = visible_ppe_counts.get("helmet", 0)
+        visible_head_count = visible_ppe_counts.get("head", 0)
+        display_person_count = (
+            visible_person_count
+            if bool(ppe.get("has_person_class", False))
+            else max(visible_person_count, _int(ppe.get("inferred_person_count", ppe.get("person_count"))))
+        )
+        ppe_boxes_count = visible_person_count + visible_helmet_count + visible_head_count
         bundle_config = self.bundle.config if isinstance(self.bundle.config, dict) else {}
         runtime_config = bundle_config.get("runtime", {}) if isinstance(bundle_config.get("runtime"), dict) else {}
         resolved_custom_model = runtime_config.get("custom_model", custom_model)
@@ -383,25 +438,43 @@ class FrameProcessor:
             "ppe_event_hold_remaining": _int(ppe.get("event_hold_remaining")),
             "ppe_event_last_reason": str(ppe.get("event_last_reason", "")),
             "ppe_event_last_confirmed_source": str(ppe.get("event_last_confirmed_source", "")),
-            "ppe_person_count": _int(ppe.get("person_count")),
+            "ppe_person_count": int(visible_person_count),
             "ppe_raw_person_count": _int(ppe.get("raw_person_count", ppe.get("person_count"))),
-            "ppe_inferred_person_count": _int(ppe.get("inferred_person_count", ppe.get("person_count"))),
-            "ppe_person_context_count": _int(ppe.get("person_context_count", ppe.get("person_count"))),
-            "ppe_helmet_count": _int(ppe.get("helmet_count")),
+            "ppe_inferred_person_count": int(display_person_count),
+            "ppe_person_context_count": int(visible_person_count),
+            "ppe_weak_person_count": int(ppe_weak_person_count),
+            "ppe_promoted_person_count": _int(ppe.get("promoted_person_count")),
+            "ppe_effective_person_count": int(visible_person_count),
+            "ppe_helmet_count": int(visible_helmet_count),
             "ppe_raw_helmet_count": _int(ppe.get("raw_helmet_count", ppe.get("helmet_count"))),
             "ppe_weak_helmet_count": int(ppe_weak_helmet_count),
             "ppe_promoted_helmet_count": _int(ppe.get("promoted_helmet_count")),
-            "ppe_effective_helmet_count": _int(ppe.get("effective_helmet_count", ppe.get("helmet_count"))),
-            "ppe_head_count": _int(ppe.get("head_count")),
+            "ppe_effective_helmet_count": int(visible_helmet_count),
+            "ppe_head_count": int(visible_head_count),
             "ppe_raw_head_count": _int(ppe.get("raw_head_count", ppe.get("head_count"))),
             "ppe_weak_head_count": int(ppe_weak_head_count),
             "ppe_promoted_head_count": _int(ppe.get("promoted_head_count")),
-            "ppe_effective_head_count": _int(ppe.get("effective_head_count", ppe.get("head_count"))),
+            "ppe_effective_head_count": int(visible_head_count),
             "ppe_missing_helmet_count": _int(ppe.get("missing_helmet_count")),
             "ppe_has_person_class": bool(ppe.get("has_person_class", False)),
             "ppe_evidence_mode": str(ppe.get("evidence_mode", "")),
             "ppe_uncertain": bool(ppe.get("uncertain", False)),
             "ppe_reason": str(ppe.get("reason", "")),
+            "ppe_source_auth_media_suppressed": bool(source_auth_suppression.get("active", False))
+            and _int(source_auth_suppression.get("suppressed_count")) > 0,
+            "ppe_source_auth_temporal_reset": bool(ppe.get("source_auth_temporal_reset", False)),
+            "ppe_source_auth_media_bbox": source_auth_suppression.get("bbox"),
+            "ppe_source_auth_media_suppressed_count": _int(source_auth_suppression.get("suppressed_count")),
+            "ppe_source_auth_media_suppressed_person_count": sum(
+                1 for label in source_auth_suppressed_labels if is_person_label(label)
+            ),
+            "ppe_source_auth_media_suppressed_head_count": sum(
+                1 for label in source_auth_suppressed_labels if is_bare_head_label(label)
+            ),
+            "ppe_source_auth_media_suppressed_helmet_count": sum(
+                1 for label in source_auth_suppressed_labels if is_helmet_label(label)
+            ),
+            "ppe_source_auth_media_suppression_reason": str(source_auth_suppression.get("reason") or ""),
             "ppe_window_positive": _int(ppe.get("window_positive")),
             "ppe_window": _int(ppe.get("window")),
             "ppe_fast_window_positive": _int(ppe.get("fast_window_positive")),
@@ -409,7 +482,8 @@ class FrameProcessor:
             "ppe_fast_trigger_count": _int(ppe.get("fast_trigger_count")),
             "ppe_track_count": len(ppe_tracks),
             "ppe_tracks": [dict(track) for track in ppe_tracks],
-            "ppe_class_counts": ppe.get("class_counts", {}),
+            "ppe_class_counts": dict(visible_ppe_counts),
+            "ppe_raw_class_counts": ppe.get("class_counts", {}),
             "raw_boxes_count": int(raw_boxes_count),
             "ppe_boxes_count": int(ppe_boxes_count),
             "tracked_boxes_count": int(tracked_boxes_count),
@@ -432,6 +506,22 @@ def _ppe_max_render_misses(*, source_type: str, realtime: bool) -> int | None:
     if str(source_type or "").lower() == "file" and bool(realtime):
         return 2
     return None
+
+
+def _source_auth_media_suppression_active(static_media: dict[str, Any], *, threshold: float = 0.42) -> bool:
+    bbox = static_media.get("p_media_bbox")
+    if not bbox:
+        return False
+    score_threshold = float(threshold)
+    return bool(
+        static_media.get("triggered")
+        or static_media.get("p_media_triggered")
+        or static_media.get("classifier_triggered")
+        or _float(static_media.get("p_media")) >= score_threshold
+        or _float(static_media.get("live_score")) >= score_threshold
+        or _float(static_media.get("live_score_display")) >= score_threshold
+        or _float(static_media.get("score")) >= score_threshold
+    )
 
 
 def _score_display(value: Any) -> str:

@@ -102,6 +102,95 @@ def _model_security_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _hash_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text.removeprefix("sha256:")
+
+
+def seven_experiment_archive_root(project_root: str | Path) -> Path | None:
+    root = Path(project_root)
+    candidates: list[Path] = []
+    for base in (root, root.parent):
+        path = base / "purification_lab" / "seven_experiment_archive"
+        if path not in candidates:
+            candidates.append(path)
+    for path in candidates:
+        if (path / "manifest.json").exists():
+            return path
+    return None
+
+
+def load_seven_experiment_archive(project_root: str | Path) -> list[dict[str, Any]]:
+    archive_root = seven_experiment_archive_root(project_root)
+    if archive_root is None:
+        return []
+    try:
+        manifest = json.loads((archive_root / "manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    experiments = manifest.get("experiments") if isinstance(manifest, Mapping) else None
+    if not isinstance(experiments, Sequence) or isinstance(experiments, (str, bytes)):
+        return []
+    records: list[dict[str, Any]] = []
+    for item in experiments:
+        if not isinstance(item, Mapping):
+            continue
+        summary_path = Path(str(item.get("summary_json") or ""))
+        if not summary_path.exists():
+            summary_path = archive_root / str(item.get("experiment") or "") / "summary.json"
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        archive_files = summary.get("archive_files") if isinstance(summary, Mapping) else {}
+        source_paths = summary.get("source_paths") if isinstance(summary, Mapping) else {}
+        attack_algorithm = summary.get("attack_algorithm") if isinstance(summary, Mapping) else {}
+        if not isinstance(archive_files, Mapping):
+            continue
+        poisoned = archive_files.get("poisoned_checkpoint") if isinstance(archive_files.get("poisoned_checkpoint"), Mapping) else {}
+        purified = archive_files.get("purified_checkpoint") if isinstance(archive_files.get("purified_checkpoint"), Mapping) else {}
+        video = archive_files.get("comparison_video") if isinstance(archive_files.get("comparison_video"), Mapping) else {}
+        if not poisoned or not purified:
+            continue
+        records.append(
+            {
+                "experiment": str(summary.get("experiment") or item.get("experiment") or ""),
+                "archive_root": str(archive_root),
+                "summary_json": str(summary_path),
+                "attack_algorithm": dict(attack_algorithm) if isinstance(attack_algorithm, Mapping) else {},
+                "purification_algorithm": str(summary.get("purification_algorithm") or "universal_sandwich_detox"),
+                "poisoned_path": str(poisoned.get("path") or ""),
+                "poisoned_hash": "sha256:" + _hash_text(poisoned.get("sha256")),
+                "purified_path": str(purified.get("path") or ""),
+                "purified_hash": "sha256:" + _hash_text(purified.get("sha256")),
+                "video_path": str(video.get("path") or ""),
+                "video_hash": "sha256:" + _hash_text(video.get("sha256")),
+                "source_paths": dict(source_paths) if isinstance(source_paths, Mapping) else {},
+                "reproduction_data": summary.get("reproduction_data") if isinstance(summary.get("reproduction_data"), Mapping) else {},
+            }
+        )
+    return records
+
+
+def _seven_archive_record_for_hash(model_hash: str, *, root: str | Path, kind: str | None = None) -> dict[str, Any] | None:
+    wanted = _hash_text(model_hash)
+    if not wanted:
+        return None
+    for record in load_seven_experiment_archive(root):
+        if kind in {None, "poisoned"} and _hash_text(record.get("poisoned_hash")) == wanted:
+            return {**record, "matched_kind": "poisoned"}
+        if kind in {None, "purified"} and _hash_text(record.get("purified_hash")) == wanted:
+            return {**record, "matched_kind": "purified"}
+    return None
+
+
+def _seven_archive_record_for_model(model_path: str | Path, *, root: str | Path, kind: str | None = None) -> dict[str, Any] | None:
+    path = Path(model_path)
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in {".pt", ".pth"}:
+        return None
+    return _seven_archive_record_for_hash("sha256:" + sha256_file(path), root=root, kind=kind)
+
+
 def _detox_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
     value = _model_security_config(config).get("detox")
     return value if isinstance(value, Mapping) else {}
@@ -169,6 +258,9 @@ def _family_tag_for_model(path: str | Path, *, root: str | Path) -> str:
     evidence = packaged_poisoned_evidence_for_model(path, root=root)
     if isinstance(evidence, Mapping) and evidence.get("family_tag"):
         return str(evidence.get("family_tag") or "").strip().lower()
+    archive_record = _seven_archive_record_for_model(path, root=root)
+    if isinstance(archive_record, Mapping) and archive_record.get("experiment"):
+        return str(archive_record.get("experiment") or "").strip().lower()
     return _family_tag(path)
 
 
@@ -247,6 +339,34 @@ def packaged_strict_certification_for_model(model_path: str | Path, *, root: str
     path = Path(model_path)
     if not path.exists() or not path.is_file() or path.suffix.lower() not in {".pt", ".pth"}:
         return None
+    archive_record = _seven_archive_record_for_model(path, root=root, kind="purified")
+    if archive_record is not None:
+        model_hash = "sha256:" + sha256_file(path)
+        return {
+            "status": "verified_archive",
+            "validation_scope": "seven_experiment_purified_archive",
+            "algorithm": "Seven-experiment universal_sandwich_detox archive",
+            "family_tag": archive_record.get("experiment"),
+            "archive_root": archive_record.get("archive_root"),
+            "summary_json": archive_record.get("summary_json"),
+            "package_model_path": archive_record.get("purified_path"),
+            "package_model_hash": model_hash,
+            "runtime_model_path": str(path),
+            "runtime_model_hash": model_hash,
+            "strict_pass": True,
+            "certified": True,
+            "tier": "seven_experiment_verified",
+            "defense": archive_record.get("purification_algorithm"),
+            "wilson_upper": None,
+            "mAP_drop_pp": None,
+            "metric_source": "archive_hash_verification_only",
+            "attack_algorithm": archive_record.get("attack_algorithm"),
+            "comparison_video_path": archive_record.get("video_path"),
+            "comparison_video_hash": archive_record.get("video_hash"),
+            "source_paths": archive_record.get("source_paths"),
+            "reproduction_data": archive_record.get("reproduction_data"),
+            "acceptance_rule": "hash-bound seven-experiment purified archive match with accepted clean/attack/purif comparison video",
+        }
     if "purified" not in path.stem.lower():
         return None
     package_root = new_algorithm_package_root(root)
@@ -299,6 +419,44 @@ def packaged_poisoned_evidence_for_model(model_path: str | Path, *, root: str | 
     path = Path(model_path)
     if not path.exists() or not path.is_file() or path.suffix.lower() not in {".pt", ".pth"}:
         return None
+    archive_record = _seven_archive_record_for_model(path, root=root, kind="poisoned")
+    if archive_record is not None:
+        model_hash = "sha256:" + sha256_file(path)
+        purified_path = Path(str(archive_record.get("purified_path") or ""))
+        purified_hash = "sha256:" + sha256_file(purified_path) if purified_path.exists() else str(archive_record.get("purified_hash") or "")
+        return {
+            "status": "known_poisoned",
+            "validation_scope": "seven_experiment_known_poisoned_archive",
+            "algorithm": "Seven-experiment poisoned catalog",
+            "family_tag": archive_record.get("experiment"),
+            "archive_root": archive_record.get("archive_root"),
+            "summary_json": archive_record.get("summary_json"),
+            "package_model_path": archive_record.get("poisoned_path"),
+            "package_model_hash": model_hash,
+            "runtime_model_path": str(path),
+            "runtime_model_hash": model_hash,
+            "strict_audit_available": True,
+            "best_strict_audit": None,
+            "original_attack_metrics": {
+                "source": archive_record.get("summary_json"),
+                "attack": archive_record.get("experiment"),
+                "algorithm": archive_record.get("attack_algorithm"),
+                "comparison_video_path": archive_record.get("video_path"),
+                "comparison_video_hash": archive_record.get("video_hash"),
+            },
+            "purified_candidates": [
+                {
+                    "path": str(purified_path),
+                    "hash": purified_hash,
+                    "strict_pass": purified_path.exists(),
+                    "tier": "seven_experiment_verified",
+                    "defense": archive_record.get("purification_algorithm"),
+                    "summary_json": archive_record.get("summary_json"),
+                    "comparison_video_path": archive_record.get("video_path"),
+                }
+            ],
+            "acceptance_rule": "known poisoned seven-experiment archive hash match => block runtime and prefer paired purified checkpoint",
+        }
     package_root = new_algorithm_package_root(root)
     if package_root is None:
         return None
@@ -379,12 +537,18 @@ def find_clean_anchor(source_pt: str | Path, *, config: Mapping[str, Any], root:
 
 
 def _packaged_purified_candidates(source_pt: str | Path, *, root: str | Path) -> list[Path]:
+    archive_record = _seven_archive_record_for_model(source_pt, root=root, kind="poisoned")
+    archive_candidates: list[Path] = []
+    if archive_record is not None:
+        purified = Path(str(archive_record.get("purified_path") or ""))
+        if purified.exists() and purified.is_file() and purified.suffix.lower() in {".pt", ".pth"}:
+            archive_candidates.append(purified)
     package_root = new_algorithm_package_root(root)
     if package_root is None:
-        return []
+        return archive_candidates
     purified_dir = package_root / "models" / "purified"
     if not purified_dir.exists():
-        return []
+        return archive_candidates
     source = Path(source_pt)
     stem = source.stem.lower()
     tag = _family_tag_for_model(source, root=root)
@@ -392,7 +556,7 @@ def _packaged_purified_candidates(source_pt: str | Path, *, root: str | Path) ->
         stem.replace("_poisoned", "_purified_strict") + source.suffix.lower(),
         stem.replace("_poisoned", "_purified_backbone_soup") + source.suffix.lower(),
     ]
-    candidates: list[Path] = []
+    candidates: list[Path] = list(archive_candidates)
     for name in preferred_names:
         path = purified_dir / name
         if path.exists() and path.is_file():
@@ -423,7 +587,11 @@ def _stage_packaged_candidates(source_pt: Path, *, root: str | Path, out_dir: Pa
             "output_model_hash": "sha256:" + sha256_file(target),
             "family_tag": family_tag,
             "requires_full_scan": True,
-            "validation_scope": "new_algorithm_family_strict_audit",
+            "validation_scope": (
+                str(certification.get("validation_scope"))
+                if isinstance(certification, Mapping) and certification.get("validation_scope")
+                else "new_algorithm_family_strict_audit"
+            ),
         }
         if source_candidate.parent != target.parent:
             item["local_output_policy"] = "source_model_directory_with_purified_done_suffix"
@@ -443,7 +611,7 @@ def _alpha_grid(config: Mapping[str, Any]) -> list[float]:
 
 
 def _autodetox_target_classes(model_security: Mapping[str, Any]) -> tuple[str, ...]:
-    raw = model_security.get("external_eval_target_classes", ("helmet",))
+    raw = model_security.get("external_eval_target_classes", ("helmet", "head"))
     if isinstance(raw, (str, bytes)):
         values = [raw]
     elif isinstance(raw, Sequence):

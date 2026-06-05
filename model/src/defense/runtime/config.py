@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,7 @@ A3B_SENSITIVITY_PRESETS: dict[str, dict[str, Any]] = {
         "strong_single_frame_threshold": 0.74,
         "observed_only_warning_threshold": 0.46,
         "observed_only_track_threshold": 0.46,
+        "observed_only_min_window_hits": 2,
         "static_image_interval": 3,
     },
     "high": {
@@ -203,6 +205,9 @@ A3B_SENSITIVITY_PRESETS: dict[str, dict[str, Any]] = {
         "strong_single_frame_threshold": 0.70,
         "observed_only_warning_threshold": 0.42,
         "observed_only_track_threshold": 0.42,
+        "min_window_hits": 2,
+        "observed_only_min_window_hits": 2,
+        "min_consecutive_hits": 2,
         "static_image_interval": 2,
     },
 }
@@ -392,6 +397,27 @@ def infer_model_family_from_model_path(path: Path, fallback: str = "ultralytics"
     return fallback
 
 
+def normalize_class_names_option(value: Any) -> list[str] | dict[int, str] | None:
+    if isinstance(value, dict):
+        normalized: dict[int, str] = {}
+        for key, name in value.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            text = str(name or "").strip()
+            if text:
+                normalized[idx] = text
+        return normalized or None
+    if isinstance(value, (list, tuple)):
+        names = [str(name or "").strip() for name in value if str(name or "").strip()]
+        return names or None
+    if isinstance(value, str):
+        names = [part.strip() for part in re.split(r"[,/|;\s]+", value) if part.strip()]
+        return names or None
+    return None
+
+
 def normalize_custom_model_options(custom_model: dict[str, Any] | None) -> dict[str, Any]:
     custom_model = custom_model or {}
     enabled = bool(custom_model.get("enabled", False))
@@ -403,13 +429,17 @@ def normalize_custom_model_options(custom_model: dict[str, Any] | None) -> dict[
     )
     if backend not in {"auto", "tensorrt", "onnx", "pytorch"}:
         backend = "auto"
-    return {
+    normalized = {
         "enabled": enabled and bool(path),
         "path": path,
         "backend": backend,
         "model_family": model_family,
         "source_pt_path": str(custom_model.get("source_pt_path", "") or "").strip(),
     }
+    class_names = normalize_class_names_option(custom_model.get("class_names"))
+    if class_names is not None:
+        normalized["class_names"] = class_names
+    return normalized
 
 
 def apply_custom_model(config: dict[str, Any], custom_model: dict[str, Any]) -> dict[str, Any]:
@@ -441,6 +471,10 @@ def apply_custom_model(config: dict[str, Any], custom_model: dict[str, Any]) -> 
     resolved["model_family"] = model_family
     inference["backend"] = backend
     inference["model_family"] = model_family
+    class_names = normalize_class_names_option(resolved.get("class_names"))
+    if class_names is not None:
+        inference["class_names"] = class_names
+        resolved["class_names"] = class_names
     artifacts = inference.setdefault("artifacts", {})
     key = "engine" if backend == "tensorrt" else backend
     artifacts[key] = [str(path)]
@@ -457,6 +491,7 @@ def public_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         "backend": inference.get("backend"),
         "device": inference.get("device", module_a.get("device")),
         "model_family": inference.get("model_family", inference.get("family")),
+        "class_names": inference.get("class_names", inference.get("names", inference.get("labels"))),
         "frame_size": module_a.get("frame_size", 640),
         "light_flow_interval": module_a.get("light_flow_interval"),
         "static_image_interval": module_a.get("static_image_interval"),

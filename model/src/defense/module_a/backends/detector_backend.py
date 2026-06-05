@@ -68,6 +68,7 @@ class UltralyticsDetectorBackend:
         confidence: float = 0.25,
         candidate_confidence: float | None = None,
         image_size: int = 640,
+        class_names: Any | None = None,
     ):
         from ultralytics import YOLO
 
@@ -81,7 +82,8 @@ class UltralyticsDetectorBackend:
         )
         self.image_size = int(image_size)
         self.model = YOLO(str(self.artifact_path))
-        self.names = self._normalize_names(getattr(self.model, "names", {}))
+        configured_names = normalize_class_names(class_names)
+        self.names = configured_names or self._normalize_names(getattr(self.model, "names", {}))
 
         if self.backend == "pytorch":
             self.model.to(self.device)
@@ -159,6 +161,7 @@ class YoloV5DetectorBackend:
         confidence: float = 0.25,
         candidate_confidence: float | None = None,
         image_size: int = 640,
+        class_names: Any | None = None,
     ):
         import torch
 
@@ -171,7 +174,7 @@ class YoloV5DetectorBackend:
             float(candidate_confidence) if candidate_confidence is not None else None
         )
         self.image_size = int(image_size)
-        self.names = {0: "helmet", 1: "head", 2: "person"}
+        self.names = normalize_class_names(class_names) or {0: "helmet", 1: "head", 2: "person"}
         self.torch = torch
         self.model: Any | None = None
         self.session: Any | None = None
@@ -554,6 +557,7 @@ def create_detector_backend(
     candidate_confidence = (
         float(candidate_confidence_value) if candidate_confidence_value is not None else None
     )
+    class_names = configured_class_names(config)
     if family == "yolov5":
         return YoloV5DetectorBackend(
             artifact_path=artifact_path,
@@ -565,6 +569,7 @@ def create_detector_backend(
             image_size=int(
                 inference.get("image_size", config.get("module_a", {}).get("frame_size", 640))
             ),
+            class_names=class_names,
         )
     return UltralyticsDetectorBackend(
         artifact_path=artifact_path,
@@ -576,7 +581,35 @@ def create_detector_backend(
         image_size=int(
             inference.get("image_size", config.get("module_a", {}).get("frame_size", 640))
         ),
+        class_names=class_names,
     )
+
+
+def normalize_class_names(names: Any) -> dict[int, str]:
+    if isinstance(names, dict):
+        normalized: dict[int, str] = {}
+        for key, value in names.items():
+            try:
+                normalized[int(key)] = str(value)
+            except (TypeError, ValueError):
+                continue
+        return normalized
+    if isinstance(names, (list, tuple)):
+        return {idx: str(name) for idx, name in enumerate(names)}
+    return {}
+
+
+def configured_class_names(config: dict[str, Any] | None) -> dict[int, str]:
+    inference = (
+        config.get("inference", {})
+        if isinstance(config, dict) and isinstance(config.get("inference"), dict)
+        else {}
+    )
+    for key in ("names", "class_names", "labels"):
+        names = normalize_class_names(inference.get(key))
+        if names:
+            return names
+    return {}
 
 
 def _is_head_helmet_only_names(names: dict[int, str]) -> bool:
@@ -586,7 +619,7 @@ def _is_head_helmet_only_names(names: dict[int, str]) -> bool:
         "helmet" in label or "hard_hat" in label or "hardhat" in label for label in labels
     )
     has_person = any(
-        "person" in label or "worker" in label or "human" in label for label in labels
+        "person" in label or "worker" in label or "human" in label or "pedestrian" in label for label in labels
     )
     return has_head and has_helmet and not has_person
 

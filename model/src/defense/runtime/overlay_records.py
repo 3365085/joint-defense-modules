@@ -41,6 +41,9 @@ def build_overlay_record(
         "ppe_raw_person_count": int(status.get("ppe_raw_person_count", status.get("ppe_person_count")) or 0),
         "ppe_inferred_person_count": int(status.get("ppe_inferred_person_count", status.get("ppe_person_count")) or 0),
         "ppe_person_context_count": int(status.get("ppe_person_context_count", status.get("ppe_person_count")) or 0),
+        "ppe_weak_person_count": int(status.get("ppe_weak_person_count") or 0),
+        "ppe_promoted_person_count": int(status.get("ppe_promoted_person_count") or 0),
+        "ppe_effective_person_count": int(status.get("ppe_effective_person_count", status.get("ppe_person_count")) or 0),
         "ppe_helmet_count": int(status.get("ppe_helmet_count") or 0),
         "ppe_raw_helmet_count": int(status.get("ppe_raw_helmet_count", status.get("ppe_helmet_count")) or 0),
         "ppe_weak_helmet_count": int(status.get("ppe_weak_helmet_count") or 0),
@@ -56,6 +59,22 @@ def build_overlay_record(
         "ppe_evidence_mode": str(status.get("ppe_evidence_mode") or ""),
         "ppe_uncertain": bool(status.get("ppe_uncertain", False)),
         "ppe_reason": str(status.get("ppe_reason") or ""),
+        "ppe_source_auth_media_suppressed": bool(status.get("ppe_source_auth_media_suppressed", False)),
+        "ppe_source_auth_temporal_reset": bool(status.get("ppe_source_auth_temporal_reset", False)),
+        "ppe_source_auth_media_bbox": status.get("ppe_source_auth_media_bbox"),
+        "ppe_source_auth_media_suppressed_count": int(status.get("ppe_source_auth_media_suppressed_count") or 0),
+        "ppe_source_auth_media_suppressed_person_count": int(
+            status.get("ppe_source_auth_media_suppressed_person_count") or 0
+        ),
+        "ppe_source_auth_media_suppressed_head_count": int(
+            status.get("ppe_source_auth_media_suppressed_head_count") or 0
+        ),
+        "ppe_source_auth_media_suppressed_helmet_count": int(
+            status.get("ppe_source_auth_media_suppressed_helmet_count") or 0
+        ),
+        "ppe_source_auth_media_suppression_reason": str(
+            status.get("ppe_source_auth_media_suppression_reason") or ""
+        ),
         "ppe_tracks": [dict(track) for track in ppe_tracks],
         "timing_ms": float(status.get("timing_ms") or 0.0),
         "processing_ms": float(status.get("processing_ms") or 0.0),
@@ -71,6 +90,8 @@ def build_overlay_record(
         "a3b_event_score": float(status.get("a3b_event_score") or status.get("a3b_confidence") or status.get("a3b_confirmed_score") or status.get("a3b_observed_score") or 0.0),
         "a3b_state": str(status.get("a3b_state") or "normal"),
         "a3b_triggered": bool(status.get("a3b_triggered")),
+        "a3b_p_media": float(status.get("a3b_p_media") or 0.0),
+        "a3b_bbox": status.get("a3b_bbox"),
         "a3b_triggered_source": str(status.get("a3b_triggered_source") or "none"),
         "a3b_reason": str(status.get("a3b_reason") or ""),
         "a3b_debug": dict(status.get("a3b_debug") or {}),

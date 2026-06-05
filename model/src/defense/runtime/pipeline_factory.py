@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -11,7 +12,11 @@ from typing import Any
 import cv2
 import numpy as np
 
-from defense.module_a.backends.detector_backend import DetectionFrameResult, create_detector_backend
+from defense.module_a.backends.detector_backend import (
+    DetectionFrameResult,
+    configured_class_names,
+    create_detector_backend,
+)
 from defense.pipelines.video_defense_pipeline import VideoDefensePipeline
 
 from .artifacts import missing_artifact_message
@@ -50,7 +55,9 @@ class EmptyDetectorBackend:
 
     backend = "empty"
     artifact_path = "empty://no-model"
-    names = {0: "helmet", 1: "head", 2: "person"}
+
+    def __init__(self, names: dict[int, str] | None = None) -> None:
+        self.names = names or {0: "helmet", 1: "head", 2: "person"}
 
     def predict(self, image: np.ndarray) -> DetectionFrameResult:
         return DetectionFrameResult(
@@ -131,6 +138,7 @@ class PipelineCache:
             str(normalized_custom.get("path", "")),
             str(normalized_custom.get("backend", "auto")),
             str(normalized_custom.get("model_family", "yolov5")),
+            json.dumps(normalized_custom.get("class_names"), sort_keys=True, ensure_ascii=True),
             str(self.config_path or ""),
         )
         with self._lock:
@@ -168,7 +176,7 @@ class PipelineCache:
                 )
             backend_started = time.perf_counter()
             if allow_empty_backend:
-                backend = EmptyDetectorBackend()
+                backend = EmptyDetectorBackend(configured_class_names(config))
             else:
                 try:
                     backend = create_detector_backend(config, self.root)

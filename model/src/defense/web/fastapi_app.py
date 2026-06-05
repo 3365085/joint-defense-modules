@@ -521,7 +521,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/evidence/file")
-    async def evidence_file(request: Request, token: str) -> Any:
+    async def evidence_file(request: Request, token: str, inline: bool = True) -> Any:
         require_http_access(request)
         try:
             target = evidence_path_from_token(token)
@@ -532,7 +532,10 @@ def create_app(
         media_type = "video/mp4" if target.suffix.lower() == ".mp4" else None
         if target.suffix.lower() in {".jpg", ".jpeg"}:
             media_type = "image/jpeg"
-        return FileResponse(target, media_type=media_type, headers=_no_cache_headers())
+        headers = _no_cache_headers()
+        if not inline:
+            headers = {**headers, "Content-Disposition": f'attachment; filename="{target.name}"'}
+        return FileResponse(target, media_type=media_type, headers=headers)
 
 
     @app.get("/api/model-security/status")
@@ -676,9 +679,23 @@ def create_app(
         )
 
     @app.get("/api/runtime/artifacts")
-    async def runtime_artifacts(request: Request, category: str | None = None, limit: int = 100) -> JSONResponse:
+    async def runtime_artifacts(
+        request: Request,
+        business_domain: str | None = None,
+        category: str | None = None,
+        limit: int = 100,
+    ) -> JSONResponse:
         require_http_access(request)
-        return _json({"ok": True, "catalog": _model_security(request.app).output_catalog(category=category, limit=limit)})
+        return _json(
+            {
+                "ok": True,
+                "catalog": _model_security(request.app).runtime_catalog(
+                    business_domain=business_domain,
+                    category=category,
+                    limit=limit,
+                ),
+            }
+        )
 
     @app.post("/api/model-security/export")
     async def model_security_export(request: Request) -> JSONResponse:

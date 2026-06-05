@@ -138,6 +138,7 @@ def _index_evidence_event(summary: dict[str, Any], *, root: str | Path | None = 
                     now,
                 ),
             )
+        catalog_root = _catalog_root_for_evidence(base)
         clip_path = str(summary.get("evidence_clip_path") or "")
         if clip_path:
             register_artifact(
@@ -145,6 +146,7 @@ def _index_evidence_event(summary: dict[str, Any], *, root: str | Path | None = 
                 business_domain="module_a",
                 category="evidence",
                 artifact_type="event_clip",
+                catalog_root=catalog_root,
                 fingerprint=event_key,
                 source_path=summary.get("source"),
                 status=str(summary.get("channel") or ""),
@@ -164,6 +166,7 @@ def _index_evidence_event(summary: dict[str, Any], *, root: str | Path | None = 
                 business_domain="module_a",
                 category="evidence",
                 artifact_type="representative_frame",
+                catalog_root=catalog_root,
                 fingerprint=event_key,
                 source_path=summary.get("source"),
                 status=str(summary.get("channel") or ""),
@@ -183,6 +186,16 @@ def _is_under(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _catalog_root_for_evidence(base: Path) -> Path:
+    resolved = base.resolve()
+    parts = tuple(str(part).lower() for part in resolved.parts)
+    if len(parts) >= 3 and parts[-3:] == ("runtime", "evidence", "monitor"):
+        return resolved.parents[1]
+    if len(parts) >= 2 and parts[-2:] == ("evidence", "monitor"):
+        return resolved.parents[1]
+    return resolved
 
 
 def evidence_token_for_path(path: str | Path, *, root: str | Path | None = None) -> str:

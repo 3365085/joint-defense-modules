@@ -9,6 +9,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from defense.module_a.backends.detector_backend import configured_class_names
+
 from .fingerprint import ModelFingerprint, sha256_file
 from .purifier import packaged_poisoned_evidence_for_model, packaged_strict_certification_for_model
 from .reports import ModelSecurityReport, ScanBudget, now_iso
@@ -130,12 +132,11 @@ def _as_sequence(value: Any) -> list[Any]:
 
 
 def _class_name_map(config: Mapping[str, Any] | None) -> dict[int, str]:
+    if isinstance(config, Mapping):
+        configured = configured_class_names(dict(config))
+        if configured:
+            return configured
     inference = config.get("inference", {}) if isinstance(config, Mapping) and isinstance(config.get("inference"), Mapping) else {}
-    names = inference.get("names") or inference.get("class_names") or inference.get("labels")
-    if isinstance(names, Mapping):
-        return {int(k): str(v) for k, v in names.items()}
-    if isinstance(names, Sequence) and not isinstance(names, (str, bytes)):
-        return {idx: str(name) for idx, name in enumerate(names)}
     family = str(inference.get("model_family", inference.get("family", ""))).lower()
     if family in {"yolov5", "yolov8", "ultralytics"}:
         return {0: "helmet", 1: "head", 2: "person"}
@@ -150,13 +151,34 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
     model_security = _model_security_config(config)
     class_names = _class_name_map(config)
     ignored_targets: list[str] = []
+    allow_person_target = bool(model_security.get("external_eval_allow_person_targets", False))
+
+    person_class_ids = [
+        int(idx)
+        for idx, name in class_names.items()
+        if str(name).strip().lower() == "person"
+    ]
 
     def keep_ppe_target(idx: int) -> bool:
         name = str(class_names.get(idx, idx)).strip().lower()
-        if name == "person":
+        if name == "person" and not allow_person_target:
             ignored_targets.append(name)
             return False
         return True
+
+    def enrich_resolution(result: dict[str, Any]) -> dict[str, Any]:
+        target_ids = {int(value) for value in result.get("target_class_ids", []) or []}
+        context_ids = [idx for idx in person_class_ids if idx not in target_ids]
+        preserve_names = [
+            str(item).strip().lower()
+            for item in _as_sequence(model_security.get("external_eval_preserve_classes", ["person"]))
+            if str(item).strip()
+        ]
+        result["context_class_ids"] = context_ids
+        result["context_classes"] = [class_names.get(idx, str(idx)) for idx in context_ids]
+        result["preserve_classes"] = preserve_names
+        result["person_target_allowed"] = allow_person_target
+        return result
 
     explicit_ids = _as_sequence(
         model_security.get("external_eval_target_class_ids", model_security.get("target_class_ids"))
@@ -171,7 +193,7 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
             ids.append(idx)
     if ids:
         ids = list(dict.fromkeys(ids))
-        return {
+        return enrich_resolution({
             "target_class_ids": ids,
             "target_classes": [class_names.get(idx, str(idx)) for idx in ids],
             "requested_target_classes": [],
@@ -179,21 +201,22 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
             "ignored_target_classes": sorted(set(ignored_targets)),
             "available_class_names": class_names,
             "source": "explicit_ids",
-        }
+        })
 
+    default_target_classes = ["helmet", "head"]
     requested_target_names = [
         str(item).strip().lower()
         for item in _as_sequence(
             model_security.get(
                 "external_eval_target_classes",
-                model_security.get("target_classes", ["helmet"]),
+                model_security.get("target_classes", default_target_classes),
             )
         )
         if str(item).strip()
     ]
     target_names = []
     for name in requested_target_names:
-        if name == "person":
+        if name == "person" and not allow_person_target:
             ignored_targets.append(name)
             continue
         target_names.append(name)
@@ -202,7 +225,7 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
     missing = [name for name in target_names if name not in reverse]
     if ids:
         ids = list(dict.fromkeys(ids))
-        return {
+        return enrich_resolution({
             "target_class_ids": ids,
             "target_classes": [class_names.get(idx, str(idx)) for idx in ids],
             "requested_target_classes": requested_target_names,
@@ -210,8 +233,8 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
             "ignored_target_classes": sorted(set(ignored_targets)),
             "available_class_names": class_names,
             "source": "class_names",
-        }
-    return {
+        })
+    return enrich_resolution({
         "target_class_ids": [],
         "target_classes": [],
         "requested_target_classes": requested_target_names,
@@ -219,7 +242,7 @@ def _external_target_resolution(config: Mapping[str, Any] | None) -> dict[str, A
         "ignored_target_classes": sorted(set(ignored_targets)),
         "available_class_names": class_names,
         "source": "unresolved",
-    }
+    })
 
 
 def _external_target_policy_error(config: Mapping[str, Any] | None, resolution: Mapping[str, Any]) -> str | None:
@@ -469,18 +492,27 @@ def full_scan(
     poisoned_evidence = packaged_poisoned_evidence_for_model(source_path, root=project_root or Path.cwd())
     if poisoned_evidence is not None:
         diagnostics["elapsed_s"] = time.perf_counter() - started
-        diagnostics["validation_scope"] = "new_algorithm_known_poisoned_catalog"
+        validation_scope = str(poisoned_evidence.get("validation_scope") or "new_algorithm_known_poisoned_catalog")
+        diagnostics["validation_scope"] = validation_scope
         diagnostics["new_algorithm_poisoned_evidence"] = poisoned_evidence
+        if validation_scope == "seven_experiment_known_poisoned_archive":
+            reasons = [
+                "model hash matches the seven-experiment poisoned archive",
+                "paired purified checkpoint and clean/attack/purif comparison video are available in the archive",
+                f"family={poisoned_evidence.get('family_tag')}",
+            ]
+        else:
+            reasons = [
+                "model hash matches the new B-module packaged poisoned catalog",
+                "known poisoned source models must be blocked and purified before runtime admission",
+                f"family={poisoned_evidence.get('family_tag')}",
+            ]
         return ModelSecurityReport(
             fingerprint=fp.to_dict(),
             scan_type="full",
             status="suspicious",
             risk_score=1.0,
-            reasons=[
-                "model hash matches the new B-module packaged poisoned catalog",
-                "known poisoned source models must be blocked and purified before runtime admission",
-                f"family={poisoned_evidence.get('family_tag')}",
-            ],
+            reasons=reasons,
             completed_at=now_iso(),
             budget=budget.to_dict(),
             diagnostics=diagnostics,
@@ -491,19 +523,32 @@ def full_scan(
     strict_cert = packaged_strict_certification_for_model(source_path, root=project_root or Path.cwd())
     if strict_cert is not None:
         diagnostics["elapsed_s"] = time.perf_counter() - started
-        diagnostics["validation_scope"] = "new_algorithm_family_strict_audit"
+        validation_scope = str(strict_cert.get("validation_scope") or "new_algorithm_family_strict_audit")
+        diagnostics["validation_scope"] = validation_scope
         diagnostics["new_algorithm_strict_audit"] = strict_cert
-        risk = float(strict_cert.get("wilson_upper") or 0.0)
+        risk = (
+            0.0
+            if validation_scope == "seven_experiment_purified_archive"
+            else float(strict_cert.get("wilson_upper") or 0.0)
+        )
+        if validation_scope == "seven_experiment_purified_archive":
+            reasons = [
+                "seven-experiment purified archive hash matched the selected source model",
+                "paired clean/attack/purif comparison video and SHA records are available in the archive",
+                f"family={strict_cert.get('family_tag')}, defense={strict_cert.get('defense')}",
+            ]
+        else:
+            reasons = [
+                "new B-module packaged strict purified model passed shipped strict audit",
+                "strict audit requires Wilson95 upper <= 0.05, mAP drop <= 5pp, and packaged model hash match",
+                f"family={strict_cert.get('family_tag')}, tier={strict_cert.get('tier')}, defense={strict_cert.get('defense')}",
+            ]
         return ModelSecurityReport(
             fingerprint=fp.to_dict(),
             scan_type="full",
             status="clean",
             risk_score=float(round(risk, 4)),
-            reasons=[
-                "new B-module packaged strict purified model passed shipped strict audit",
-                "strict audit requires Wilson95 upper <= 0.05, mAP drop <= 5pp, and packaged model hash match",
-                f"family={strict_cert.get('family_tag')}, tier={strict_cert.get('tier')}, defense={strict_cert.get('defense')}",
-            ],
+            reasons=reasons,
             completed_at=now_iso(),
             budget=budget.to_dict(),
             diagnostics=diagnostics,
@@ -615,8 +660,10 @@ def full_scan(
         "suspicious_asr": suspicious_asr,
     }
     diagnostics["external_eval_policy"] = {
-        "version": "ppe_helmet_target_v2",
+        "version": "ppe_three_class_target_v3",
         "target_classes": list(target_resolution.get("target_classes", [])),
+        "context_classes": list(target_resolution.get("context_classes", [])),
+        "preserve_classes": list(target_resolution.get("preserve_classes", [])),
         "ignored_contract_policy": external.get("ignored_contract_policy"),
         "ignored_contract_rows": external.get("ignored_contract_rows", 0),
     }

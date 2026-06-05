@@ -70,6 +70,13 @@
     .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
     .actionGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 8px; }
     .pathGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+    .compactForm {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .compactForm .wide { grid-column: 1 / -1; }
+    .compactForm label { margin: 0; }
     .metric {
       min-width: 0;
       border: 1px solid var(--line);
@@ -202,7 +209,8 @@
     details.panel > summary.panelHeader::-webkit-details-marker { display: none; }
     details.panel:not([open]) .content { display: none; }
     @media (max-width: 980px) {
-      header, main, .grid2, .grid3, .pathGrid { grid-template-columns: 1fr; }
+      header, main, .grid2, .grid3, .pathGrid, .compactForm { grid-template-columns: 1fr; }
+      .compactForm .wide { grid-column: auto; }
     }
   </style>
 </head>
@@ -222,26 +230,37 @@
         </div>
         <div class="content">
           <div class="notice">这里决定A模块即将运行的模型。配置变更会立即应用；陌生模型不会被直接放行，开始检测或手动扫描时会触发B模块准入流程。</div>
-          <label class="checkLine"><input id="enableCustomModel" type="checkbox" />使用自定义模型</label>
-          <label>自定义模型路径</label>
-          <div class="fieldRow">
-            <input id="customModelPath" placeholder="选择 .pt / .engine / .onnx 模型文件" />
-            <button id="browseModelBtn" type="button" style="width:auto;">浏览模型</button>
+          <div class="compactForm">
+            <label class="checkLine wide"><input id="enableCustomModel" type="checkbox" />使用自定义模型</label>
+            <label class="wide">自定义模型路径
+              <div class="fieldRow">
+                <input id="customModelPath" placeholder="选择 .pt / .engine / .onnx 模型文件" />
+                <button id="browseModelBtn" type="button" style="width:auto;">浏览模型</button>
+              </div>
+            </label>
+            <label class="wide">同源原始 PT（加速模型准入必填）
+              <div class="fieldRow">
+                <input id="sourcePtPath" placeholder="选择与加速模型同源的 .pt 文件" />
+                <button id="browseSourcePtBtn" type="button" style="width:auto;">浏览PT</button>
+              </div>
+            </label>
+            <label>模型族
+              <select id="customModelFamily">
+                <option value="auto">自动识别</option>
+                <option value="ultralytics">Ultralytics / YOLOv8</option>
+                <option value="yolov5">YOLOv5</option>
+              </select>
+            </label>
+            <label>类别顺序
+              <select id="customClassNames">
+                <option value="">使用当前配置</option>
+                <option value="helmet,head,person">helmet / head / person（三类实验）</option>
+                <option value="person,head,helmet">person / head / helmet</option>
+              </select>
+            </label>
+            <div class="field"><strong>后端：</strong><span id="resolvedBackend">自动匹配</span><br /><strong>模型族：</strong><span id="resolvedFamily">自动识别</span></div>
+            <label class="checkLine wide"><input id="testBypassModelSecurity" type="checkbox" />测试入口：绕过B模块安全准入直接运行当前模型</label>
           </div>
-          <label>同源原始 PT（加速模型准入必填）</label>
-          <div class="fieldRow">
-            <input id="sourcePtPath" placeholder="选择与加速模型同源的 .pt 文件" />
-            <button id="browseSourcePtBtn" type="button" style="width:auto;">浏览PT</button>
-          </div>
-          <label>模型族
-            <select id="customModelFamily">
-              <option value="auto">自动识别</option>
-              <option value="ultralytics">Ultralytics / YOLOv8</option>
-              <option value="yolov5">YOLOv5</option>
-            </select>
-          </label>
-          <div class="notice">运行后端由模型格式决定：.engine 走 TensorRT，.onnx 走 ONNX，.pt/.pth 走 PyTorch；B模块准入仍以原始 PT 或净化后 PT 为依据。</div>
-          <label class="checkLine"><input id="testBypassModelSecurity" type="checkbox" />测试入口：绕过B模块安全准入直接运行当前模型</label>
           <div class="notice warn">仅用于当前阶段对比毒模型、原模型和净化模型检测效果；不会写入白名单，禁止生产使用。</div>
           <div id="modelConfigMessage" class="field"></div>
         </div>
@@ -270,6 +289,7 @@
             <div class="field"><strong>源PT：</strong><code id="sourcePtStatusPath">--</code></div>
             <div class="field"><strong>原始源模型：</strong><code id="originalSourcePath">--</code></div>
             <div class="field"><strong>净化模型：</strong><code id="purifiedPath">--</code></div>
+            <div class="field"><strong>类别映射：</strong><code id="classNames">--</code></div>
             <div class="field"><strong>模型指纹：</strong><code id="fingerprint">--</code></div>
             <div class="field"><strong>扫描报告：</strong><code id="reportPath">--</code></div>
           </div>
@@ -409,9 +429,12 @@
       const path = $("customModelPath") ? $("customModelPath").value.trim() : getStored("moduleA.lastModelPath", "");
       const backend = "auto";
       const family = $("customModelFamily") ? $("customModelFamily").value : getStored("moduleA.lastCustomModelFamily", "auto");
+      const classNamesRaw = $("customClassNames") ? $("customClassNames").value : getStored("moduleA.lastCustomClassNames", "");
       let sourcePtPath = $("sourcePtPath") ? $("sourcePtPath").value.trim() : getStored("moduleA.lastSourcePtPath", "");
       if (/\.(pt|pth)$/i.test(path)) sourcePtPath = path;
-      return {enabled: enabled && !!path, path, backend, model_family: family, source_pt_path: sourcePtPath};
+      const options = {enabled: enabled && !!path, path, backend, model_family: family, source_pt_path: sourcePtPath};
+      if (classNamesRaw) options.class_names = classNamesRaw.split(",").map((item) => item.trim()).filter(Boolean);
+      return options;
     }
 
     function modelSecurityBypassEnabled() {
@@ -424,6 +447,7 @@
       $("customModelPath").value = getStored("moduleA.lastModelPath", "");
       $("sourcePtPath").value = getStored("moduleA.lastSourcePtPath", "");
       $("customModelFamily").value = getStored("moduleA.lastCustomModelFamily", "auto");
+      $("customClassNames").value = getStored("moduleA.lastCustomClassNames", "");
       $("testBypassModelSecurity").checked = modelSecurityBypassEnabled();
       syncModelConfigControls();
     }
@@ -436,6 +460,7 @@
       }
       setStored("moduleA.lastSourcePtPath", $("sourcePtPath").value.trim());
       setStored("moduleA.lastCustomModelFamily", $("customModelFamily").value || "auto");
+      setStored("moduleA.lastCustomClassNames", $("customClassNames").value || "");
       setStored("moduleA.testBypassModelSecurity", $("testBypassModelSecurity").checked ? "true" : "false");
       syncModelConfigControls();
       if (!options.silent) showConfigMessage("配置已应用。陌生模型会在开始检测或手动扫描时进入B模块准入。");
@@ -448,6 +473,7 @@
       $("sourcePtPath").disabled = !enabled;
       $("browseSourcePtBtn").disabled = !enabled;
       $("customModelFamily").disabled = !enabled;
+      $("customClassNames").disabled = !enabled;
       $("configPill").textContent = enabled ? "自定义模型" : "默认模型";
       $("configPill").className = "pill " + (enabled ? "warn" : "ok");
     }
@@ -516,9 +542,9 @@
         export_completed: "导出完成",
         export_failed: "导出失败",
         whitelist_written: "写入白名单",
+        purified_model_ready: "净化模型可用",
         whitelist_deleted: "删除白名单",
         whitelist_cleared: "清空白名单",
-        logs_cleared: "清空日志",
       };
       return labels[String(value || "")] || String(value || "事件");
     }
@@ -631,8 +657,13 @@
       $("whitelistHit").textContent = lastModelSecurity.whitelist_hit ? "是" : "否";
       $("runtimePath").textContent = lastModelSecurity.runtime_artifact_path || lastModelSecurity.model_path || "--";
       $("sourcePtStatusPath").textContent = lastModelSecurity.source_pt_path || "--";
+      $("resolvedBackend").textContent = lastModelSecurity.backend || "自动匹配";
+      $("resolvedFamily").textContent = lastModelSecurity.model_family || "自动识别";
       $("originalSourcePath").textContent = lastModelSecurity.original_source_model_path || metrics.original_source_model_path || "--";
       $("purifiedPath").textContent = lastModelSecurity.purified_model_path || "--";
+      const classNamesWarning = lastModelSecurity.class_names_warning || "";
+      $("classNames").textContent = (lastModelSecurity.class_names ? JSON.stringify(lastModelSecurity.class_names) : "--")
+        + (classNamesWarning ? " | WARNING: " + classNamesWarning : "");
       $("fingerprint").textContent = lastModelSecurity.fingerprint || "--";
       $("reportPath").textContent = lastModelSecurity.report_path || "--";
       $("registryPath").textContent = lastModelSecurity.registry_path || "--";
@@ -738,11 +769,12 @@
         purified_model: "净化模型",
         trusted_model: "可信模型",
         accelerated_model: "加速模型",
+        evidence: "检测证据",
       };
       $("artifacts").innerHTML = artifacts.slice(0, 12).map((item) => `
         <article class="record">
           <div class="recordTop">
-            <div><strong>${escapeHtml(categoryLabels[item.category] || item.category || "资产")}</strong> · ${escapeHtml(item.artifact_type || "--")}</div>
+            <div><strong>${escapeHtml(categoryLabels[item.category] || item.category || "资产")}</strong> · ${escapeHtml(item.business_domain || "--")} · ${escapeHtml(item.artifact_type || "--")}</div>
             <span class="pill ${tone(item.status)}">${escapeHtml(statusLabel(item.status || "info"))}</span>
           </div>
           <div class="field"><strong>路径：</strong><code>${escapeHtml(item.path || "--")}</code></div>
@@ -813,7 +845,7 @@
       syncModelConfigControls();
       applyModelConfigChange();
     };
-    ["customModelPath", "sourcePtPath", "customModelFamily", "testBypassModelSecurity"].forEach((id) => {
+    ["customModelPath", "sourcePtPath", "customModelFamily", "customClassNames", "testBypassModelSecurity"].forEach((id) => {
       $(id).onchange = () => applyModelConfigChange();
     });
     $("browseModelBtn").onclick = async () => {

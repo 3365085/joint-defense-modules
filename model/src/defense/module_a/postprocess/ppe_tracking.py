@@ -25,6 +25,8 @@ LABEL_ALIASES = {
     "no_helmet": "head",
     "person": "person",
     "worker": "person",
+    "human": "person",
+    "pedestrian": "person",
 }
 
 
@@ -89,6 +91,21 @@ def bbox_iou(
     return inter / denom if denom > 0.0 else 0.0
 
 
+def bbox_min_overlap_ratio(
+    box_a: list[int] | tuple[float, float, float, float],
+    box_b: list[int] | tuple[float, float, float, float],
+) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
+    bx1, by1, bx2, by2 = [float(v) for v in box_b]
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    denom = min(bbox_area(box_a), bbox_area(box_b))
+    return inter / denom if denom > 0.0 else 0.0
+
+
 def center_distance_ratio(
     box_a: list[int] | tuple[float, float, float, float],
     box_b: list[int] | tuple[float, float, float, float],
@@ -129,6 +146,28 @@ def _smooth_box(previous: list[int], current: list[int], alpha: float) -> list[i
 def _estimate_velocity(prev_box: list[int], curr_box: list[int]) -> list[float]:
     """Estimate per-coordinate velocity (pixels/frame) between two boxes."""
     return [float(curr_box[i]) - float(prev_box[i]) for i in range(4)]
+
+
+def _same_person_target(
+    box_a: list[int] | tuple[float, float, float, float],
+    box_b: list[int] | tuple[float, float, float, float],
+    frame_shape: tuple[int, int] | tuple[int, int, int],
+) -> bool:
+    iou = bbox_iou(box_a, box_b)
+    distance = center_distance_ratio(box_a, box_b, frame_shape)
+    containment = bbox_min_overlap_ratio(box_a, box_b)
+    return bool(
+        iou >= 0.62
+        or (
+            iou >= 0.42
+            and distance <= 0.045
+            and containment >= 0.65
+        )
+        or (
+            distance <= 0.060
+            and containment >= 0.82
+        )
+    )
 
 
 def _extrapolate_box(
@@ -338,6 +377,7 @@ class PPEDisplayTracker:
     ) -> list[dict[str, Any]]:
         suppression = ppe.get("helmet_fp_suppression", {})
         suppressed_helmets = self._suppressed_helmet_indices_for_display(suppression)
+        suppressed_heads = self._suppressed_head_indices_for_display(suppression)
         weak_heads = {int(v) for v in suppression.get("weak_head_indices", []) or []}
         weak_helmets = {int(v) for v in suppression.get("weak_helmet_indices", []) or []}
         weak_head_reasons = self._weak_head_reasons_by_index(suppression)
@@ -352,6 +392,8 @@ class PPEDisplayTracker:
             if label is None:
                 continue
             if label == "helmet" and index in suppressed_helmets:
+                continue
+            if label == "head" and index in suppressed_heads:
                 continue
             clipped = _clip_box(box, frame_shape)
             if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
@@ -579,10 +621,20 @@ class PPEDisplayTracker:
                 if {left_label, right_label} <= {"helmet", "head"}:
                     same_target = iou >= 0.20 or distance <= 0.035
                 elif left_label == right_label:
-                    same_target = iou >= 0.68
+                    same_target = (
+                        _same_person_target(tracks[left]["box"], tracks[right]["box"], frame_shape)
+                        if left_label == "person"
+                        else iou >= 0.68
+                    )
                 else:
                     same_target = iou >= 0.55
                 if not same_target:
+                    continue
+                if {left_label, right_label} <= {"helmet", "head"} and left_label != right_label:
+                    if left_label == "helmet":
+                        keep[right] = False
+                    else:
+                        keep[left] = False
                     continue
                 left_score = float(tracks[left].get("confidence", 0.0)) - 0.10 * int(tracks[left].get("misses", 0))
                 right_score = float(tracks[right].get("confidence", 0.0)) - 0.10 * int(tracks[right].get("misses", 0))
@@ -661,7 +713,11 @@ class PPEDisplayTracker:
                 iou = bbox_iou(items[left]["box"], items[right]["box"])
                 distance = center_distance_ratio(items[left]["box"], items[right]["box"], frame_shape)
                 if left_label == right_label:
-                    same_zone = iou >= 0.72
+                    same_zone = (
+                        _same_person_target(items[left]["box"], items[right]["box"], frame_shape)
+                        if left_label == "person"
+                        else iou >= 0.72
+                    )
                 elif labels <= {"helmet", "head"}:
                     same_zone = iou >= 0.30 or distance <= 0.026
                 else:
@@ -705,6 +761,22 @@ class PPEDisplayTracker:
                 for v in suppression.get("suppressed_helmet_indices", []) or []
                 if int(v) not in weak_helmets
             )
+        return suppressed
+
+    def _suppressed_head_indices_for_display(self, suppression: dict[str, Any]) -> set[int]:
+        suppressed: set[int] = set()
+        for value in suppression.get("covered_head_indices", []) or []:
+            try:
+                suppressed.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        for item in suppression.get("suppressed_heads", []) or []:
+            if str(item.get("reason") or "") != "head_helmet_mutex":
+                continue
+            try:
+                suppressed.add(int(item.get("head_index")))
+            except (TypeError, ValueError):
+                continue
         return suppressed
 
     def _weak_head_reasons_by_index(self, suppression: dict[str, Any]) -> dict[int, str]:

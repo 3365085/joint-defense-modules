@@ -360,6 +360,9 @@ class MonitorEngine:
             "ppe_raw_person_count": 0,
             "ppe_inferred_person_count": 0,
             "ppe_person_context_count": 0,
+            "ppe_weak_person_count": 0,
+            "ppe_promoted_person_count": 0,
+            "ppe_effective_person_count": 0,
             "ppe_helmet_count": 0,
             "ppe_raw_helmet_count": 0,
             "ppe_weak_helmet_count": 0,
@@ -424,6 +427,7 @@ class MonitorEngine:
             "pipeline_warmup_ms": 0.0,
             "pipeline_warmup_frames": 0,
             "pipeline_reset_ms": 0.0,
+            "release_pipeline_cache_on_file_end": False,
             "detector_thread_warmup_ms": 0.0,
             "detector_thread_warmup_frames": 0,
             "first_detection_processing_ms": 0.0,
@@ -761,6 +765,21 @@ class MonitorEngine:
         clear_cache = getattr(self.cache, "clear", None)
         if callable(clear_cache):
             clear_cache()
+
+    def _should_release_finished_file_pipeline(
+        self,
+        *,
+        run_id: int,
+        source_type: str,
+        runtime_config: dict[str, Any],
+    ) -> bool:
+        return bool(
+            int(run_id) == int(self.run_id)
+            and str(source_type or "").lower() == "file"
+            and bool(self.status.get("source_ended"))
+            and bool(runtime_config.get("release_pipeline_cache_on_file_end", False))
+            and not self.stop_event.is_set()
+        )
 
     def control_run(self, run_id: int, action: str, **payload: Any) -> dict[str, Any]:
         action = str(action or "").strip().lower()
@@ -1212,7 +1231,12 @@ class MonitorEngine:
                             "warmup_error": thread_warmup_error or str(bundle.warmup_error or ""),
                             "detector_process_fps_cap": process_fps_cap,
                             "detector_queue_policy": "latest_only",
-                            "preview_mode": "mp4_clock_prepare" if source_type == "file" else "detector_ready_wait_first_frame",
+                            "release_pipeline_cache_on_file_end": bool(
+                                runtime_config.get("release_pipeline_cache_on_file_end", False)
+                            ),
+                            "preview_mode": "mp4_clock_prepare"
+                            if source_type == "file"
+                            else "detector_ready_wait_first_frame",
                         }
                     )
                     self.condition.notify_all()
@@ -1273,11 +1297,10 @@ class MonitorEngine:
                 except Exception as exc:
                     self._set_error(f"evidence close failed: {exc}", run_id)
             with self.condition:
-                release_finished_file_pipeline = (
-                    run_id == self.run_id
-                    and source_type == "file"
-                    and bool(self.status.get("source_ended"))
-                    and not self.stop_event.is_set()
+                release_finished_file_pipeline = self._should_release_finished_file_pipeline(
+                    run_id=run_id,
+                    source_type=source_type,
+                    runtime_config=runtime_config,
                 )
             if release_finished_file_pipeline:
                 self._release_pipeline_cache()
@@ -1358,7 +1381,7 @@ class MonitorEngine:
                     prev,
                     next_item,
                     source_time_s,
-                    keep_unmatched_tracks=True,
+                    keep_unmatched_tracks=not file_realtime_preview,
                 )
                 if mixed is not None:
                     mixed["overlay_display_source"] = "interpolated"
@@ -1441,8 +1464,19 @@ class MonitorEngine:
             "raw_person_count": int(overlay.get("ppe_raw_person_count", overlay.get("ppe_person_count")) or 0),
             "inferred_person_count": int(overlay.get("ppe_inferred_person_count", overlay.get("ppe_person_count")) or 0),
             "person_context_count": int(overlay.get("ppe_person_context_count", overlay.get("ppe_person_count")) or 0),
+            "weak_person_count": int(overlay.get("ppe_weak_person_count") or 0),
+            "promoted_person_count": int(overlay.get("ppe_promoted_person_count") or 0),
+            "effective_person_count": int(overlay.get("ppe_effective_person_count", overlay.get("ppe_person_count")) or 0),
             "helmet_count": int(overlay.get("ppe_helmet_count") or 0),
+            "raw_helmet_count": int(overlay.get("ppe_raw_helmet_count", overlay.get("ppe_helmet_count")) or 0),
+            "weak_helmet_count": int(overlay.get("ppe_weak_helmet_count") or 0),
+            "promoted_helmet_count": int(overlay.get("ppe_promoted_helmet_count") or 0),
+            "effective_helmet_count": int(overlay.get("ppe_effective_helmet_count", overlay.get("ppe_helmet_count")) or 0),
             "head_count": int(overlay.get("ppe_head_count") or 0),
+            "raw_head_count": int(overlay.get("ppe_raw_head_count", overlay.get("ppe_head_count")) or 0),
+            "weak_head_count": int(overlay.get("ppe_weak_head_count") or 0),
+            "promoted_head_count": int(overlay.get("ppe_promoted_head_count") or 0),
+            "effective_head_count": int(overlay.get("ppe_effective_head_count", overlay.get("ppe_head_count")) or 0),
             "missing_helmet_count": int(overlay.get("ppe_missing_helmet_count") or 0),
             "uncertain": bool(overlay.get("ppe_uncertain")),
             "reason": overlay.get("ppe_reason") or "",

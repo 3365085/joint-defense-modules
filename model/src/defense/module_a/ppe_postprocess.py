@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-PERSON_HINTS = ("person", "worker", "pedestrian")
+PERSON_HINTS = ("person", "worker", "human", "pedestrian")
 HELMET_HINTS = ("helmet", "hardhat", "hard_hat", "safety_helmet")
 BARE_HEAD_HINTS = ("head", "no_helmet", "without_helmet", "bare_head")
 
@@ -24,6 +24,10 @@ class PPEPostprocessConfig:
     max_isolated_head_area_ratio: float = 0.012
     isolated_head_edge_margin: float = 0.10
     min_isolated_head_confidence: float = 0.45
+    prefer_helmet_on_head_overlap: bool = False
+    head_helmet_mutex_iou: float = 0.20
+    head_helmet_mutex_center_distance: float = 0.055
+    head_helmet_mutex_min_helmet_confidence: float = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +107,22 @@ def bbox_iou(left: tuple[float, float, float, float] | None, right: tuple[float,
     return intersection / union if union > 0.0 else 0.0
 
 
+def bbox_center_distance_ratio(
+    left: tuple[float, float, float, float] | None,
+    right: tuple[float, float, float, float] | None,
+    frame_shape: tuple[int, int] | tuple[int, int, int] | None,
+) -> float:
+    if left is None or right is None or not frame_shape:
+        return 1.0
+    height, width = frame_shape[:2]
+    diag = max(1.0, (float(width) ** 2 + float(height) ** 2) ** 0.5)
+    lx = (left[0] + left[2]) * 0.5
+    ly = (left[1] + left[3]) * 0.5
+    rx = (right[0] + right[2]) * 0.5
+    ry = (right[1] + right[3]) * 0.5
+    return (((lx - rx) ** 2 + (ly - ry) ** 2) ** 0.5) / diag
+
+
 def bbox_edge_proximity(
     bbox: tuple[float, float, float, float] | None,
     frame_shape: tuple[int, int] | tuple[int, int, int] | None,
@@ -125,6 +145,27 @@ def _frame_area(frame_shape: tuple[int, int] | tuple[int, int, int] | None) -> f
         return 0.0
     height, width = frame_shape[:2]
     return float(max(1, int(height)) * max(1, int(width)))
+
+
+def _head_helmet_mutex_match(
+    left: PPEDetection,
+    right: PPEDetection,
+    config: PPEPostprocessConfig,
+    frame_shape: tuple[int, int] | tuple[int, int, int] | None,
+) -> tuple[bool, float, float]:
+    iou = bbox_iou(left.bbox, right.bbox)
+    distance = bbox_center_distance_ratio(left.bbox, right.bbox, frame_shape)
+    return (
+        bool(
+            iou >= config.head_helmet_mutex_iou
+            or (
+                config.head_helmet_mutex_center_distance > 0.0
+                and distance <= config.head_helmet_mutex_center_distance
+            )
+        ),
+        iou,
+        distance,
+    )
 
 
 def extract_ppe_detections(detections: Any) -> list[PPEDetection]:
@@ -157,6 +198,7 @@ def suppress_helmet_false_positives(
     heads = [item for item in items if is_bare_head_label(item.label)]
     helmets = [item for item in items if is_helmet_label(item.label)]
     persons = [item for item in items if is_person_label(item.label)]
+    kept_person_indices = {item.index for item in persons}
     person_context_available = (
         any(is_person_label(item.label) for item in items)
         if has_person_class is None
@@ -208,12 +250,19 @@ def suppress_helmet_false_positives(
     for helmet in helmets:
         matched_head: PPEDetection | None = None
         matched_iou = 0.0
+        matched_distance = 1.0
         for head in heads:
             if head.index in weak_head_indices:
                 continue
             iou = bbox_iou(helmet.bbox, head.bbox)
-            if iou > matched_iou:
+            distance = bbox_center_distance_ratio(helmet.bbox, head.bbox, frame_shape)
+            if iou > matched_iou or (
+                cfg.prefer_helmet_on_head_overlap
+                and matched_iou < cfg.head_helmet_mutex_iou
+                and distance < matched_distance
+            ):
                 matched_iou = iou
+                matched_distance = distance
                 matched_head = head
         max_person_iou = 0.0
         min_person_area_ratio = 0.0
@@ -238,6 +287,22 @@ def suppress_helmet_false_positives(
             and helmet.confidence < matched_head.confidence + cfg.helmet_head_margin
         )
         overlap_low_direct = matched_head is not None and matched_iou >= cfg.overlap_iou and helmet.confidence < cfg.min_direct_helmet_conf
+        mutex_match = False
+        if matched_head is not None:
+            mutex_match, matched_iou, matched_distance = _head_helmet_mutex_match(
+                helmet,
+                matched_head,
+                cfg,
+                frame_shape,
+            )
+        if (
+            cfg.prefer_helmet_on_head_overlap
+            and matched_head is not None
+            and mutex_match
+            and helmet.confidence >= cfg.head_helmet_mutex_min_helmet_confidence
+        ):
+            overlap_weak = False
+            overlap_low_direct = False
         weak_small = small_target and helmet.confidence < cfg.small_target_min_conf
         suppress_missing_context = missing_context and not high_confidence_isolated
         if overlap_weak or overlap_low_direct or weak_small or suppress_missing_context or oversized_isolated or oversized_for_person:
@@ -263,6 +328,7 @@ def suppress_helmet_false_positives(
                     "head_confidence": matched_head.confidence if matched_head else None,
                     "head_bbox": list(matched_head.bbox) if matched_head and matched_head.bbox else None,
                     "iou": matched_iou,
+                    "center_distance": matched_distance,
                     "person_iou": max_person_iou,
                     "helmet_person_area_ratio": min_person_area_ratio,
                     "small_target": small_target,
@@ -274,21 +340,90 @@ def suppress_helmet_false_positives(
             )
         else:
             kept_helmet_indices.add(helmet.index)
-            if matched_head is not None and matched_iou >= cfg.overlap_iou:
+            if matched_head is not None and (
+                matched_iou >= cfg.overlap_iou
+                or (cfg.prefer_helmet_on_head_overlap and mutex_match)
+            ):
                 covered_head_indices.add(matched_head.index)
+
+    kept_helmets = (
+        [
+            helmet
+            for helmet in helmets
+            if helmet.index in kept_helmet_indices
+            and helmet.confidence >= cfg.head_helmet_mutex_min_helmet_confidence
+        ]
+        if cfg.prefer_helmet_on_head_overlap
+        else []
+    )
+    for head in heads:
+        if head.index in weak_head_indices:
+            continue
+        matched_helmet: PPEDetection | None = None
+        matched_iou = 0.0
+        matched_distance = 1.0
+        for helmet in kept_helmets:
+            is_match, iou, distance = _head_helmet_mutex_match(head, helmet, cfg, frame_shape)
+            if not is_match:
+                continue
+            if matched_helmet is None or iou > matched_iou or (
+                matched_iou < cfg.head_helmet_mutex_iou and distance < matched_distance
+            ):
+                matched_iou = iou
+                matched_distance = distance
+                matched_helmet = helmet
+        if matched_helmet is None:
+            continue
+        covered_head_indices.add(head.index)
+        display_suppressed_head_indices.add(head.index)
+        if not any(int(item.get("head_index", -1)) == head.index for item in suppressed_heads):
+            suppressed_heads.append(
+                {
+                    "head_index": head.index,
+                    "head_confidence": head.confidence,
+                    "head_bbox": list(head.bbox) if head.bbox else None,
+                    "helmet_index": matched_helmet.index,
+                    "helmet_confidence": matched_helmet.confidence,
+                    "helmet_bbox": list(matched_helmet.bbox) if matched_helmet.bbox else None,
+                    "iou": matched_iou,
+                    "center_distance": matched_distance,
+                    "reason": "head_helmet_mutex",
+                }
+            )
+
+    effective_heads = [
+        head
+        for head in heads
+        if head.index not in weak_head_indices and head.index not in covered_head_indices
+    ]
 
     return {
         "kept_helmet_indices": sorted(kept_helmet_indices),
+        "kept_person_indices": sorted(kept_person_indices),
         "suppressed_helmet_indices": sorted(suppressed_indices),
+        "suppressed_person_indices": [],
         "weak_helmet_indices": sorted(weak_helmet_indices),
+        "weak_person_indices": [],
         "suppressed_helmets": suppressed,
+        "suppressed_persons": [],
         "suppressed_head_indices": sorted(display_suppressed_head_indices),
         "weak_head_indices": sorted(weak_head_indices),
         "suppressed_heads": suppressed_heads,
         "covered_head_indices": sorted(covered_head_indices),
+        "effective_head_indices": sorted(head.index for head in effective_heads),
+        "effective_heads": [
+            {
+                "head_index": head.index,
+                "head_confidence": head.confidence,
+                "head_bbox": list(head.bbox) if head.bbox else None,
+            }
+            for head in effective_heads
+        ],
+        "person_count_raw": len(persons),
+        "person_count_effective": len(kept_person_indices),
         "helmet_count_raw": len(helmets),
         "helmet_count_effective": len(kept_helmet_indices),
-        "head_count": max(0, len(heads) - len(weak_head_indices) - len(covered_head_indices)),
+        "head_count": len(effective_heads),
     }
 
 
@@ -372,6 +507,7 @@ def summarize_ppe_from_detections(
         capabilities=capabilities,
     )
     kept_helmets = set(suppression["kept_helmet_indices"])
+    kept_persons = set(suppression.get("kept_person_indices", []))
 
     person_count = 0
     helmet_count = 0
@@ -389,13 +525,15 @@ def summarize_ppe_from_detections(
             if item.index in kept_helmets:
                 helmet_count += 1
         elif is_person_label(item.label):
-            person_count += 1
+            if item.index in kept_persons:
+                person_count += 1
 
     head_count = max(0, int(suppression.get("head_count", 0)))
     missing_helmet_count = head_count
     candidate = head_count > 0
     suppressed_head_count = len(suppression.get("weak_head_indices", []) or [])
     weak_helmet_count = len(suppression.get("weak_helmet_indices", []) or [])
+    weak_person_count = len(suppression.get("weak_person_indices", []) or [])
     low_conf_head_count = int(suppression.get("low_conf_temporal_head_count", 0) or 0)
     low_conf_helmet_count = int(suppression.get("low_conf_temporal_helmet_count", 0) or 0)
     inferred_person_count = max(
@@ -430,8 +568,11 @@ def summarize_ppe_from_detections(
     return {
         "person_count": person_count,
         "person_context_count": person_count,
-        "raw_person_count": person_count,
+        "raw_person_count": int(suppression.get("person_count_raw", person_count) or 0),
         "inferred_person_count": inferred_person_count,
+        "weak_person_count": weak_person_count,
+        "promoted_person_count": 0,
+        "effective_person_count": person_count,
         "helmet_count": helmet_count,
         "raw_helmet_count": raw_helmet_count,
         "weak_helmet_count": weak_helmet_count,

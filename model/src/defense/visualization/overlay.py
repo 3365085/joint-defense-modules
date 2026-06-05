@@ -128,18 +128,20 @@ def _draw_label(
     if x2 <= x1 or y2 <= y1:
         return
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-    font_size = 3
+    font_size = max(6, min(9, int(round(min(h, w) / 180))))
+    pad_x = max(2, font_size // 3)
+    pad_y = max(1, font_size // 5)
     try:
         bbox = _font(font_size).getbbox(text)
         tw = int(bbox[2] - bbox[0])
         th = int(bbox[3] - bbox[1])
     except Exception:
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.12, 1)
-    label_h = max(4, th + 2)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.25, 1)
+    label_h = max(7, th + pad_y * 2)
     label_y1 = max(0, y1 - label_h)
     label_y2 = min(h - 1, label_y1 + label_h)
-    cv2.rectangle(frame, (x1, label_y1), (min(w - 1, x1 + tw + 2), label_y2), color, -1)
-    _draw_text_cn(frame, text, (x1 + 1, label_y1), (0, 0, 0), size=font_size)
+    cv2.rectangle(frame, (x1, label_y1), (min(w - 1, x1 + tw + pad_x * 2), label_y2), color, -1)
+    _draw_text_cn(frame, text, (x1 + pad_x, label_y1 + pad_y), (0, 0, 0), size=font_size)
 
 
 def draw_ppe_boxes(frame: np.ndarray, tracks: list[dict[str, Any]] | None) -> np.ndarray:
@@ -185,16 +187,19 @@ def draw_ppe_hud(frame: np.ndarray, ppe: dict[str, Any] | None) -> np.ndarray:
     suppression = ppe.get("helmet_fp_suppression", {}) if isinstance(ppe.get("helmet_fp_suppression"), dict) else {}
     weak_head_count = len(suppression.get("weak_head_indices", suppression.get("suppressed_head_indices", [])) or [])
     weak_helmet_count = len(suppression.get("weak_helmet_indices", []) or [])
+    weak_person_count = len(suppression.get("weak_person_indices", []) or [])
     promoted_head_count = int(ppe.get("promoted_head_count", 0) or 0)
     promoted_helmet_count = int(ppe.get("promoted_helmet_count", 0) or 0)
+    promoted_person_count = int(ppe.get("promoted_person_count", 0) or 0)
     raw_person_count = int(ppe.get("raw_person_count", ppe.get("person_count", 0)) or 0)
     inferred_person_count = int(ppe.get("inferred_person_count", raw_person_count) or 0)
+    effective_person_count = int(ppe.get("effective_person_count", ppe.get("person_count", 0)) or 0)
     text = (
-        f"安全帽 原始人={raw_person_count} 推断人={inferred_person_count} "
+        f"安全帽 原始人={raw_person_count} 有效人={effective_person_count} 推断人={inferred_person_count} "
         f"安全帽={int(ppe.get('helmet_count', 0) or 0)} "
         f"裸头={int(ppe.get('head_count', 0) or 0)} "
-        f"弱证据={weak_head_count}/{weak_helmet_count} "
-        f"时序增强={promoted_head_count}/{promoted_helmet_count} "
+        f"弱证据={weak_person_count}/{weak_head_count}/{weak_helmet_count} "
+        f"时序增强={promoted_person_count}/{promoted_head_count}/{promoted_helmet_count} "
         f"未戴帽={int(ppe.get('missing_helmet_count', 0) or 0)}"
     )
     text_items = [(text, (10, h - 62), color, 17)]

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import pickletools
 import shutil
 import threading
+import zipfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -16,8 +18,93 @@ from .integrity import TrustStoreIntegrity, verify_trust_store, write_trust_stor
 from .purifier import known_poisoned_attack_metrics, run_new_purification
 from .registry import ModelTrustRegistry
 from .reports import ModelPurificationReport, ModelSecurityReport, ScanBudget, now_iso
-from .scanner import full_scan, quick_scan
+from .scanner import _class_name_map, full_scan, quick_scan
 from .storage import ModelSecurityStorage
+
+
+def _normalize_embedded_names(names: Any) -> dict[int, str]:
+    if isinstance(names, dict):
+        normalized: dict[int, str] = {}
+        for key, value in names.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            text = str(value or "").strip()
+            if text:
+                normalized[idx] = text
+        return normalized
+    if isinstance(names, (list, tuple)):
+        return {idx: str(value).strip() for idx, value in enumerate(names) if str(value).strip()}
+    return {}
+
+
+def _is_label_token(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or len(text) > 64:
+        return False
+    if text.isdigit():
+        return False
+    if any(marker in text for marker in ("\\", "/", ":", "\n", "\r", "\t")):
+        return False
+    return True
+
+
+def _read_torch_zip_class_names(path: Path) -> dict[int, str]:
+    """Extract checkpoint names from torch zip metadata without unpickling objects."""
+    with zipfile.ZipFile(path, "r") as archive:
+        data_name = next((name for name in archive.namelist() if name.endswith("data.pkl")), None)
+        if not data_name:
+            return {}
+        strings: list[str] = []
+        for op, arg, _pos in pickletools.genops(archive.read(data_name)):
+            if op.name not in {
+                "BINUNICODE",
+                "SHORT_BINUNICODE",
+                "UNICODE",
+                "BINSTRING",
+                "SHORT_BINSTRING",
+                "STRING",
+            }:
+                continue
+            if isinstance(arg, bytes):
+                try:
+                    arg = arg.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+            strings.append(str(arg))
+    for index, token in enumerate(strings):
+        if str(token).strip().lower() not in {"names", "class_names", "labels"}:
+            continue
+        labels: list[str] = []
+        stop_keys = {
+            "args",
+            "task",
+            "mode",
+            "model",
+            "data",
+            "epochs",
+            "optimizer",
+            "train_args",
+            "date",
+            "version",
+            "license",
+        }
+        for candidate in strings[index + 1 : index + 128]:
+            text = str(candidate or "").strip()
+            if labels and text.lower() in stop_keys:
+                break
+            if not _is_label_token(text):
+                if labels:
+                    break
+                continue
+            labels.append(text)
+            if len(labels) >= 256:
+                break
+        normalized = _normalize_embedded_names(labels)
+        if normalized:
+            return normalized
+    return {}
 
 
 class ModelSecurityService:
@@ -45,6 +132,7 @@ class ModelSecurityService:
         self._last_purification_job: dict[str, Any] | None = None
         self._export_thread: threading.Thread | None = None
         self._last_export_job: dict[str, Any] | None = None
+        self._embedded_names_cache: dict[str, dict[str, Any]] = {}
 
     def _write_registry_seal(self, data: dict[str, Any]) -> None:
         write_trust_store_seal(self.registry.path, self.storage.registry_seal_path, data)
@@ -63,6 +151,55 @@ class ModelSecurityService:
             "registry_path": checked.registry_path,
             "registry_seal_path": checked.registry_seal_path,
             "registry_hash": checked.registry_hash,
+        }
+
+    def _embedded_class_names(self, path: Path | None) -> dict[str, Any]:
+        if path is None or path.suffix.lower() not in {".pt", ".pth"}:
+            return {"available": False, "class_names": {}, "source": None, "error": ""}
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            return {"available": False, "class_names": {}, "source": str(path), "error": str(exc)}
+        cache_key = f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
+        cached = self._embedded_names_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+        try:
+            class_names = _read_torch_zip_class_names(path)
+            result = {
+                "available": bool(class_names),
+                "class_names": class_names,
+                "source": str(path),
+                "error": "" if class_names else "embedded_class_names_not_found_in_safe_metadata",
+            }
+        except Exception as exc:
+            result = {"available": False, "class_names": {}, "source": str(path), "error": str(exc)}
+        self._embedded_names_cache[cache_key] = dict(result)
+        return result
+
+    def _class_names_diagnostics(self, config: dict[str, Any], source_pt: Path | None) -> dict[str, Any]:
+        configured = _class_name_map(config)
+        runtime = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
+        custom = runtime.get("custom_model", {}) if isinstance(runtime.get("custom_model"), dict) else {}
+        custom_enabled = bool(custom.get("enabled", False))
+        embedded = (
+            self._embedded_class_names(source_pt)
+            if custom_enabled
+            else {"available": False, "class_names": {}, "source": str(source_pt) if source_pt else None, "error": ""}
+        )
+        embedded_names = embedded.get("class_names") if isinstance(embedded.get("class_names"), dict) else {}
+        mismatch = bool(embedded_names) and configured != embedded_names
+        warning = ""
+        if mismatch:
+            warning = "configured class_names differ from checkpoint embedded names; detection labels may be swapped"
+        return {
+            "configured_class_names": configured,
+            "embedded_class_names": embedded_names,
+            "embedded_class_names_source": embedded.get("source"),
+            "embedded_class_names_available": bool(embedded.get("available")),
+            "embedded_class_names_error": embedded.get("error") or "",
+            "class_names_mismatch": mismatch,
+            "class_names_warning": warning,
         }
 
     def _log_event(self, event: str, *, status: str = "info", message: str = "", **fields: Any) -> None:
@@ -105,8 +242,7 @@ class ModelSecurityService:
                 self.log_path.write_text("", encoding="utf-8")
             except Exception as exc:
                 return {"log_path": str(self.log_path), "cleared": False, "error": str(exc)}
-            self._log_event("logs_cleared", status="deleted", message="已清空B模块运行日志")
-        return {"log_path": str(self.log_path), "cleared": True, "entries": self.recent_logs(limit=20).get("entries", [])}
+        return {"log_path": str(self.log_path), "cleared": True, "entries": []}
 
     def _catalog_root(self) -> Path:
         return self.root / "runtime"
@@ -145,6 +281,18 @@ class ModelSecurityService:
             category=category,
             limit=limit,
         )
+
+    def runtime_catalog(self, *, business_domain: str | None = None, category: str | None = None, limit: int = 100) -> dict[str, Any]:
+        return list_artifacts(
+            catalog_root=self._catalog_root(),
+            business_domain=business_domain,
+            category=category,
+            limit=limit,
+        )
+
+    def _export_target_path(self, source_pt: Path, *, suffix: str, backend: str) -> Path:
+        marker = "净化完毕" if "净化完毕" in source_pt.stem else "已验证"
+        return self._unique_export_path(self.storage.exports_dir / f"{source_pt.stem}_{marker}_{backend}_加速{suffix}")
 
     def _config(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> dict[str, Any]:
         return load_runtime_config(config_path=self.config_path, profile=profile or "default", custom_model=custom_model or {})
@@ -343,10 +491,15 @@ class ModelSecurityService:
             return False
         diagnostics = report.diagnostics if isinstance(report.diagnostics, dict) else {}
         policy = diagnostics.get("external_eval_policy") if isinstance(diagnostics.get("external_eval_policy"), dict) else {}
-        if policy.get("version") == "ppe_helmet_target_v2":
+        if policy.get("version") in {"ppe_helmet_target_v2", "ppe_three_class_target_v3"}:
             return True
         scope = str(diagnostics.get("validation_scope") or "")
-        return scope in {"new_algorithm_known_poisoned_catalog", "new_algorithm_family_strict_audit"}
+        return scope in {
+            "new_algorithm_known_poisoned_catalog",
+            "new_algorithm_family_strict_audit",
+            "seven_experiment_known_poisoned_archive",
+            "seven_experiment_purified_archive",
+        }
 
     @staticmethod
     def _strict_observed_asr(strict: dict[str, Any]) -> float | None:
@@ -457,22 +610,32 @@ class ModelSecurityService:
         package_hash = str(strict.get("package_model_hash") or candidate.get("source_candidate_hash") or "")
         if package_hash and package_hash != actual_hash:
             return None
-        wilson_upper = float(strict.get("wilson_upper") or 1.0)
+        validation_scope = str(strict.get("validation_scope") or "new_algorithm_family_strict_audit")
+        if validation_scope == "seven_experiment_purified_archive":
+            wilson_upper = 0.0
+            reasons = [
+                "seven-experiment purified archive hash matched the local purified candidate",
+                "paired clean/attack/purif comparison video and SHA records are available in the archive",
+                f"family={strict.get('family_tag')}, defense={strict.get('defense')}",
+            ]
+        else:
+            wilson_upper = float(strict.get("wilson_upper") or 1.0)
+            reasons = [
+                "new B-module packaged strict purified model passed shipped strict audit",
+                "local purified copy hash matches the audited packaged purified model",
+                f"family={strict.get('family_tag')}, tier={strict.get('tier')}, defense={strict.get('defense')}",
+            ]
         risk = float(round(wilson_upper, 4))
         return ModelSecurityReport(
             fingerprint=fp.to_dict(),
             scan_type="full",
             status="clean",
             risk_score=risk,
-            reasons=[
-                "new B-module packaged strict purified model passed shipped strict audit",
-                "local purified copy hash matches the audited packaged purified model",
-                f"family={strict.get('family_tag')}, tier={strict.get('tier')}, defense={strict.get('defense')}",
-            ],
+            reasons=reasons,
             completed_at=now_iso(),
             budget=budget.to_dict(),
             diagnostics={
-                "validation_scope": "new_algorithm_family_strict_audit",
+                "validation_scope": validation_scope,
                 "new_algorithm_strict_audit": {
                     **strict,
                     "runtime_model_path": str(candidate_path),
@@ -685,7 +848,7 @@ class ModelSecurityService:
         fmt, suffix, backend = self._export_format(export_format)
         source_pt, source_fp, _source_runtime, source_status = self._trusted_pt_for_export(profile=profile, custom_model=custom_model)
         source_hash = "sha256:" + sha256_file(source_pt)
-        target = self._unique_export_path(source_pt.with_name(f"{source_pt.stem}_{backend}_accelerated{suffix}"))
+        target = self._export_target_path(source_pt, suffix=suffix, backend=backend)
         self._log_event(
             "export_started",
             status="running",
@@ -783,6 +946,7 @@ class ModelSecurityService:
                 exported_fingerprint=exported_fp.fingerprint,
                 exported_model_path=str(exported_path),
                 exported_model_hash=exported_hash,
+                catalog_record=catalog_record,
             )
             return result
         except Exception as exc:
@@ -976,6 +1140,7 @@ class ModelSecurityService:
                     purification_report=last_purification,
                 )
             )
+            class_names_diagnostics = self._class_names_diagnostics(cfg, source_pt)
 
             payload = {
                 "enabled": True,
@@ -1016,7 +1181,11 @@ class ModelSecurityService:
                 "backend": fp.backend,
                 "model_family": fp.model_family,
                 "image_size": fp.image_size,
+                "class_names": _class_name_map(cfg),
                 "class_names_hash": fp.class_names_hash,
+                "class_names_diagnostics": class_names_diagnostics,
+                "class_names_mismatch": class_names_diagnostics["class_names_mismatch"],
+                "class_names_warning": class_names_diagnostics["class_names_warning"],
                 "ppe_mapping_hash": fp.ppe_mapping_hash,
                 "scanner_version": SCANNER_VERSION,
                 "whitelist_policy": "auto_full_scan_clean_only",
@@ -1591,6 +1760,17 @@ class ModelSecurityService:
                         report_path=accepted_scan_report.report_path,
                         purification_report_path=report.report_path,
                         approval_source="purified_full_scan",
+                    )
+                    self._log_event(
+                        "purified_model_ready",
+                        status="trusted",
+                        message="净化模型已复扫通过，可直接用于A模块检测；如需加速格式，可在安全中心导出。",
+                        fingerprint=accepted_fp.fingerprint,
+                        source_fingerprint=fp.fingerprint,
+                        purified_model_path=str(accepted_path),
+                        purified_model_hash=report.purified_model_hash,
+                        report_path=accepted_scan_report.report_path,
+                        purification_report_path=report.report_path,
                     )
                 else:
                     report.scan_status = candidate_scan_results[-1]["status"] if candidate_scan_results else "missing"

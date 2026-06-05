@@ -164,7 +164,7 @@
     <section class="panel">
       <div class="panelHeader">
         <div class="title">预览</div>
-        <a id="downloadClip" class="button" href="#" target="_blank" style="display:none;">打开视频文件</a>
+        <a id="downloadClip" class="button" href="#" target="_blank" style="display:none;">导出视频片段</a>
       </div>
       <div class="content preview" id="preview"><div class="empty">正在读取事件证据。</div></div>
     </section>
@@ -199,7 +199,7 @@
     function renderEvent(event) {
       const frames = Array.isArray(event.frames) ? event.frames : [];
       $("downloadClip").style.display = event.evidence_clip_url ? "inline-flex" : "none";
-      $("downloadClip").href = event.evidence_clip_url || "#";
+      $("downloadClip").href = event.evidence_clip_url ? `${event.evidence_clip_url}${event.evidence_clip_url.includes("?") ? "&" : "?"}inline=false` : "#";
       const poster = event.evidence_representative_url ? ` poster="${event.evidence_representative_url}"` : "";
       const clipUrl = event.evidence_clip_url ? `${event.evidence_clip_url}${event.evidence_clip_url.includes("?") ? "&" : "?"}v=${encodeURIComponent(event.updated_at || event.ended_at || Date.now())}` : "";
       const media = clipUrl

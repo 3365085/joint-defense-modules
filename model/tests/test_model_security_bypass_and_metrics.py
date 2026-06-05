@@ -1,15 +1,92 @@
 from __future__ import annotations
 
+import json
+import pickle
 from pathlib import Path
+import zipfile
 
 from fastapi.testclient import TestClient
 
 from defense.model_security import ModelSecurityService
 from defense.model_security import purifier
+from defense.model_security import scanner as model_security_scanner
+from defense.model_security.fingerprint import build_model_fingerprint, sha256_file
 from defense.model_security.registry import ModelTrustRegistry
-from defense.model_security.reports import ModelPurificationReport, ModelSecurityReport
+from defense.model_security.reports import ModelPurificationReport, ModelSecurityReport, ScanBudget
+from defense.model_security.service import _read_torch_zip_class_names
 from defense.model_security.scanner import _filter_external_contract_noise
+from defense.module_a.backends.detector_backend import UltralyticsDetectorBackend
+from defense.module_a.postprocess.ppe_tracking import canonical_label
+from defense.module_a.ppe_postprocess import PPEPostprocessConfig, summarize_ppe_from_detections
+from defense.runtime.a3b_soft_trigger import A3BSoftTriggerState
+from defense.runtime.overlay_records import build_overlay_record
+from defense.runtime import pipeline_factory
+from defense.runtime.config import apply_custom_model, apply_feature_options, load_runtime_config, normalize_custom_model_options
+from defense.runtime.ppe_business import evaluate_ppe_business
+from defense.runtime.ppe_state import SafetyHelmetState
+from defense.runtime.runner import MonitorEngine
 from defense.web.fastapi_app import create_app
+
+
+class _Detections:
+    def __init__(self, *, boxes, classes, confidences, names):
+        self.boxes = boxes
+        self.classes = classes
+        self.confidences = confidences
+        self.names = names
+
+
+def _write_seven_archive(tmp_path: Path) -> dict[str, Path | str]:
+    archive_root = tmp_path / "purification_lab" / "seven_experiment_archive"
+    exp_dir = archive_root / "oga_visible_patch"
+    exp_dir.mkdir(parents=True)
+    poisoned = exp_dir / "poisoned_best.pt"
+    purified = exp_dir / "purified_best.pt"
+    video = exp_dir / "clean_attack_purif.mp4"
+    poisoned.write_bytes(b"poisoned-model")
+    purified.write_bytes(b"purified-model")
+    video.write_bytes(b"comparison-video")
+    poisoned_sha = sha256_file(poisoned)
+    purified_sha = sha256_file(purified)
+    video_sha = sha256_file(video)
+    summary_path = exp_dir / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "experiment": "oga_visible_patch",
+                "attack_algorithm": {"name": "oga_visible_patch", "attack_goal": "oga"},
+                "purification_algorithm": "universal_sandwich_detox",
+                "archive_files": {
+                    "poisoned_checkpoint": {"path": str(poisoned), "sha256": poisoned_sha},
+                    "purified_checkpoint": {"path": str(purified), "sha256": purified_sha},
+                    "comparison_video": {"path": str(video), "sha256": video_sha},
+                },
+                "source_paths": {"poisoned_checkpoint": "source-poisoned.pt"},
+                "reproduction_data": {"dataset": "oga_visible_patch_helmet_v4redxvideo"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (archive_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "experiments": [
+                    {"experiment": "oga_visible_patch", "summary_json": str(summary_path)}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "archive_root": archive_root,
+        "summary_path": summary_path,
+        "poisoned": poisoned,
+        "purified": purified,
+        "video": video,
+        "poisoned_sha": poisoned_sha,
+        "purified_sha": purified_sha,
+        "video_sha": video_sha,
+    }
 
 
 def test_registry_preserves_purified_origin_and_security_metrics(tmp_path: Path):
@@ -258,6 +335,584 @@ def test_packaged_purification_candidates_follow_hash_when_model_is_renamed(tmp_
     assert staged[0]["new_algorithm_strict_audit"]["wilson_upper"] == 0.0475
 
 
+def test_seven_experiment_archive_full_scan_uses_archive_scope(tmp_path: Path):
+    archive_root = tmp_path / "purification_lab" / "seven_experiment_archive"
+    exp_dir = archive_root / "oga_visible_patch"
+    exp_dir.mkdir(parents=True)
+    poisoned = exp_dir / "poisoned_best.pt"
+    purified = exp_dir / "purified_best.pt"
+    video = exp_dir / "clean_attack_purif.mp4"
+    poisoned.write_bytes(b"poisoned-model")
+    purified.write_bytes(b"purified-model")
+    video.write_bytes(b"comparison-video")
+    poisoned_sha = sha256_file(poisoned)
+    purified_sha = sha256_file(purified)
+    video_sha = sha256_file(video)
+    summary_path = exp_dir / "summary.json"
+    summary_path.write_text(
+        f"""{{
+          "experiment": "oga_visible_patch",
+          "attack_algorithm": {{"name": "oga_visible_patch", "attack_goal": "oga"}},
+          "purification_algorithm": "universal_sandwich_detox",
+          "archive_files": {{
+            "poisoned_checkpoint": {{"path": "{str(poisoned).replace(chr(92), chr(92) + chr(92))}", "sha256": "{poisoned_sha}"}},
+            "purified_checkpoint": {{"path": "{str(purified).replace(chr(92), chr(92) + chr(92))}", "sha256": "{purified_sha}"}},
+            "comparison_video": {{"path": "{str(video).replace(chr(92), chr(92) + chr(92))}", "sha256": "{video_sha}"}}
+          }},
+          "source_paths": {{"poisoned_checkpoint": "source-poisoned.pt"}},
+          "reproduction_data": {{"dataset": "oga_visible_patch_helmet_v4redxvideo"}}
+        }}""",
+        encoding="utf-8",
+    )
+    (archive_root / "manifest.json").write_text(
+        f"""{{
+          "experiments": [
+            {{"experiment": "oga_visible_patch", "summary_json": "{str(summary_path).replace(chr(92), chr(92) + chr(92))}"}}
+          ]
+        }}""",
+        encoding="utf-8",
+    )
+    poisoned_cfg = {
+        "inference": {
+            "backend": "pytorch",
+            "model_family": "yolov5",
+            "artifacts": {"pytorch": [str(poisoned)]},
+            "class_names": ["helmet", "head", "person"],
+        }
+    }
+    purified_cfg = {
+        "inference": {
+            "backend": "pytorch",
+            "model_family": "yolov5",
+            "artifacts": {"pytorch": [str(purified)]},
+            "class_names": ["helmet", "head", "person"],
+        }
+    }
+
+    poisoned_report = model_security_scanner.full_scan(
+        build_model_fingerprint(poisoned_cfg, root=tmp_path),
+        source_model_path=poisoned,
+        project_root=tmp_path,
+    )
+    purified_report = model_security_scanner.full_scan(
+        build_model_fingerprint(purified_cfg, root=tmp_path),
+        source_model_path=purified,
+        project_root=tmp_path,
+    )
+
+    assert poisoned_report.status == "suspicious"
+    assert poisoned_report.diagnostics["validation_scope"] == "seven_experiment_known_poisoned_archive"
+    assert poisoned_report.diagnostics["new_algorithm_poisoned_evidence"]["purified_candidates"][0]["hash"] == "sha256:" + purified_sha
+    assert purified_report.status == "clean"
+    assert purified_report.diagnostics["validation_scope"] == "seven_experiment_purified_archive"
+    assert purified_report.diagnostics["new_algorithm_strict_audit"]["metric_source"] == "archive_hash_verification_only"
+    assert purified_report.diagnostics["new_algorithm_strict_audit"]["wilson_upper"] is None
+    assert purified_report.diagnostics["new_algorithm_strict_audit"]["comparison_video_hash"] == "sha256:" + video_sha
+
+
+def test_seven_archive_candidate_scope_survives_staging_and_fast_report(tmp_path: Path, monkeypatch):
+    archive = _write_seven_archive(tmp_path)
+    package = tmp_path / "new_algorithm"
+    package.mkdir()
+    monkeypatch.setattr(purifier, "new_algorithm_package_root", lambda _root: package)
+
+    poisoned = Path(archive["poisoned"])
+    purified = Path(archive["purified"])
+    candidates = purifier._packaged_purified_candidates(poisoned, root=tmp_path)
+    staged = purifier._stage_packaged_candidates(poisoned, root=tmp_path, out_dir=tmp_path / "out")
+
+    assert candidates == [purified]
+    assert staged[0]["validation_scope"] == "seven_experiment_purified_archive"
+    assert staged[0]["new_algorithm_strict_audit"]["metric_source"] == "archive_hash_verification_only"
+    assert staged[0]["new_algorithm_strict_audit"]["wilson_upper"] is None
+
+    fp = build_model_fingerprint(
+        {
+            "inference": {
+                "backend": "pytorch",
+                "model_family": "yolov5",
+                "artifacts": {"pytorch": [staged[0]["output_model"]]},
+                "class_names": ["helmet", "head", "person"],
+            }
+        },
+        root=tmp_path,
+    )
+    report = ModelSecurityService(root=tmp_path)._strict_candidate_report(
+        fp=fp,
+        candidate_path=Path(staged[0]["output_model"]),
+        candidate=staged[0],
+        budget=ScanBudget(),
+    )
+
+    assert report is not None
+    assert report.status == "clean"
+    assert report.risk_score == 0.0
+    assert report.diagnostics["validation_scope"] == "seven_experiment_purified_archive"
+    assert "archive" in report.reasons[0]
+
+
+def test_default_runtime_config_scans_head_and_helmet_with_person_context():
+    cfg = load_runtime_config(profile="default")
+
+    resolution = model_security_scanner._external_target_resolution(cfg)
+
+    assert resolution["target_classes"] == ["helmet", "head"]
+    assert resolution["context_classes"] == ["person"]
+    assert resolution["preserve_classes"] == ["person"]
+
+
+def test_custom_model_class_names_are_applied_to_runtime_config(tmp_path: Path):
+    model_path = tmp_path / "best.pt"
+    model_path.write_bytes(b"not a torch checkpoint")
+    config = {"inference": {"backend": "tensorrt", "model_family": "yolov5", "artifacts": {}}}
+    options = normalize_custom_model_options(
+        {
+            "enabled": True,
+            "path": str(model_path),
+            "backend": "auto",
+            "model_family": "yolov5",
+            "class_names": "person / head / helmet",
+        }
+    )
+
+    resolved = apply_custom_model(config, options)
+
+    assert resolved["class_names"] == ["person", "head", "helmet"]
+    assert config["inference"]["class_names"] == ["person", "head", "helmet"]
+
+
+def test_model_security_reports_class_name_override_mismatch(tmp_path: Path):
+    svc = ModelSecurityService(root=tmp_path)
+    source = tmp_path / "best.pt"
+    source.write_bytes(b"not a torch checkpoint")
+
+    def embedded_names(_path: Path) -> dict:
+        return {
+            "available": True,
+            "class_names": {0: "helmet", 1: "head", 2: "person"},
+            "source": str(source),
+            "error": "",
+        }
+
+    svc._embedded_class_names = embedded_names  # type: ignore[method-assign]
+    diagnostics = svc._class_names_diagnostics(
+        {
+            "inference": {"class_names": ["person", "head", "helmet"]},
+            "runtime": {"custom_model": {"enabled": True}},
+        },
+        source,
+    )
+
+    assert diagnostics["configured_class_names"] == {0: "person", 1: "head", 2: "helmet"}
+    assert diagnostics["embedded_class_names"] == {0: "helmet", 1: "head", 2: "person"}
+    assert diagnostics["class_names_mismatch"] is True
+    assert "differ" in diagnostics["class_names_warning"]
+
+
+def test_safe_torch_zip_class_name_reader_extracts_names(tmp_path: Path):
+    checkpoint = tmp_path / "best.pt"
+    with zipfile.ZipFile(checkpoint, "w") as archive:
+        archive.writestr(
+            "archive/data.pkl",
+            pickle.dumps({"names": {0: "helmet", 1: "head", 2: "person"}}),
+        )
+
+    assert _read_torch_zip_class_names(checkpoint) == {0: "helmet", 1: "head", 2: "person"}
+
+
+def test_model_security_skips_embedded_class_names_for_default_runtime(tmp_path: Path):
+    svc = ModelSecurityService(root=tmp_path)
+    source = tmp_path / "best.pt"
+    source.write_bytes(b"not a torch checkpoint")
+
+    def fail_if_called(_path: Path) -> dict:
+        raise AssertionError("default runtime should not load checkpoint class names")
+
+    svc._embedded_class_names = fail_if_called  # type: ignore[method-assign]
+    diagnostics = svc._class_names_diagnostics(
+        {"inference": {"class_names": ["helmet", "head", "person"]}},
+        source,
+    )
+
+    assert diagnostics["configured_class_names"] == {0: "helmet", 1: "head", 2: "person"}
+    assert diagnostics["embedded_class_names"] == {}
+    assert diagnostics["class_names_mismatch"] is False
+    assert diagnostics["class_names_warning"] == ""
+
+
+def test_person_aliases_are_consistent_across_ppe_layers():
+    backend = UltralyticsDetectorBackend.__new__(UltralyticsDetectorBackend)
+    backend.confidence = 0.25
+    backend.candidate_confidence = 0.18
+
+    for alias in ("person", "worker", "human", "pedestrian"):
+        backend.names = {0: "helmet", 1: "head", 2: alias}
+        detections = _Detections(
+            boxes=[(80, 80, 220, 330)],
+            classes=[2],
+            confidences=[0.88],
+            names={2: alias},
+        )
+        summary = summarize_ppe_from_detections(detections, frame_shape=(640, 640))
+
+        assert backend._prediction_confidence() == 0.25
+        assert canonical_label(alias) == "person"
+        assert summary["has_person_class"] is True
+        assert summary["effective_person_count"] == 1
+
+
+def test_ppe_summary_suppresses_head_when_kept_helmet_overlaps_display_mutex():
+    config = PPEPostprocessConfig(prefer_helmet_on_head_overlap=True)
+    detections = _Detections(
+        boxes=[
+            (100, 100, 180, 180),
+            (120, 120, 220, 220),
+            (80, 80, 260, 360),
+        ],
+        classes=[0, 1, 2],
+        confidences=[0.78, 0.92, 0.90],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+
+    summary = summarize_ppe_from_detections(detections, config=config, frame_shape=(640, 640))
+
+    suppression = summary["helmet_fp_suppression"]
+    assert summary["raw_head_count"] == 1
+    assert summary["head_count"] == 0
+    assert summary["helmet_count"] == 1
+    assert summary["person_count"] == 1
+    assert summary["candidate"] is False
+    assert summary["reason"] == "helmet_evidence_present"
+    assert suppression["covered_head_indices"] == [1]
+    assert suppression["suppressed_head_indices"] == [1]
+    assert suppression["suppressed_heads"][-1]["reason"] == "head_helmet_mutex"
+
+
+def test_ppe_summary_prefers_overlapping_helmet_when_head_confidence_is_higher():
+    config = PPEPostprocessConfig(prefer_helmet_on_head_overlap=True)
+    detections = _Detections(
+        boxes=[
+            (100, 100, 180, 210),
+            (100, 100, 180, 210),
+            (80, 80, 260, 360),
+        ],
+        classes=[0, 1, 2],
+        confidences=[0.36, 0.71, 0.90],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+
+    summary = summarize_ppe_from_detections(detections, config=config, frame_shape=(640, 640))
+
+    suppression = summary["helmet_fp_suppression"]
+    assert summary["raw_head_count"] == 1
+    assert summary["head_count"] == 0
+    assert summary["helmet_count"] == 1
+    assert suppression["suppressed_helmet_indices"] == []
+    assert suppression["covered_head_indices"] == [1]
+    assert suppression["suppressed_heads"][-1]["reason"] == "head_helmet_mutex"
+
+
+def test_ppe_summary_keeps_head_when_helmet_does_not_overlap_mutex():
+    config = PPEPostprocessConfig(prefer_helmet_on_head_overlap=True)
+    detections = _Detections(
+        boxes=[
+            (20, 20, 80, 80),
+            (210, 150, 290, 230),
+            (180, 120, 330, 410),
+        ],
+        classes=[0, 1, 2],
+        confidences=[0.82, 0.88, 0.91],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+
+    summary = summarize_ppe_from_detections(detections, config=config, frame_shape=(640, 640))
+
+    assert summary["head_count"] == 1
+    assert summary["helmet_count"] == 1
+    assert summary["candidate"] is True
+    assert summary["helmet_fp_suppression"]["covered_head_indices"] == []
+    assert summary["helmet_fp_suppression"]["suppressed_head_indices"] == []
+
+
+def test_ppe_business_mutex_hides_existing_head_track_after_helmet_arrives():
+    from defense.module_a.postprocess import PPEDisplayTracker
+
+    config = PPEPostprocessConfig(prefer_helmet_on_head_overlap=True)
+    state = SafetyHelmetState(window=2, trigger_count=1, fast_window=1, fast_trigger_count=1)
+    tracker = PPEDisplayTracker(hold_frames=4, small_hold_frames=4)
+    first = _Detections(
+        boxes=[
+            (120, 120, 220, 220),
+            (80, 80, 260, 360),
+        ],
+        classes=[1, 2],
+        confidences=[0.92, 0.90],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+    second = _Detections(
+        boxes=[
+            (100, 100, 180, 180),
+            (120, 120, 220, 220),
+            (80, 80, 260, 360),
+        ],
+        classes=[0, 1, 2],
+        confidences=[0.78, 0.95, 0.90],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+
+    first_result = evaluate_ppe_business(
+        first,
+        frame_shape=(640, 640),
+        ppe_state=state,
+        ppe_tracker=tracker,
+        tracking_enabled=True,
+        postprocess_config=config,
+    )
+    second_result = evaluate_ppe_business(
+        second,
+        frame_shape=(640, 640),
+        ppe_state=state,
+        ppe_tracker=tracker,
+        tracking_enabled=True,
+        postprocess_config=config,
+    )
+
+    assert {track["label"] for track in first_result.tracks} == {"head", "person"}
+    labels = {track["label"] for track in second_result.tracks}
+    assert "head" not in labels
+    assert {"helmet", "person"} <= labels
+    assert second_result.ppe["raw_head_count"] == 1
+    assert second_result.ppe["head_count"] == 0
+    assert second_result.ppe["helmet_count"] == 1
+    assert second_result.ppe["person_count"] == 1
+
+
+def test_ppe_business_temporal_helmet_track_suppresses_raw_head_count():
+    from defense.module_a.postprocess import PPEDisplayTracker
+
+    config = PPEPostprocessConfig(prefer_helmet_on_head_overlap=True)
+    state = SafetyHelmetState(window=2, trigger_count=1, fast_window=1, fast_trigger_count=1)
+    tracker = PPEDisplayTracker(hold_frames=4, small_hold_frames=4)
+    first = _Detections(
+        boxes=[
+            (272, 114, 334, 229),
+            (224, 121, 387, 639),
+        ],
+        classes=[0, 2],
+        confidences=[0.82, 0.90],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+    second = _Detections(
+        boxes=[
+            (272, 115, 334, 229),
+            (224, 122, 388, 640),
+        ],
+        classes=[1, 2],
+        confidences=[0.76, 0.88],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+
+    first_result = evaluate_ppe_business(
+        first,
+        frame_shape=(640, 640),
+        ppe_state=state,
+        ppe_tracker=tracker,
+        tracking_enabled=True,
+        postprocess_config=config,
+    )
+    second_result = evaluate_ppe_business(
+        second,
+        frame_shape=(640, 640),
+        ppe_state=state,
+        ppe_tracker=tracker,
+        tracking_enabled=True,
+        postprocess_config=config,
+    )
+
+    assert {track["label"] for track in first_result.tracks} == {"helmet", "person"}
+    labels = {track["label"] for track in second_result.tracks}
+    assert "head" not in labels
+    assert {"helmet", "person"} <= labels
+    assert second_result.ppe["raw_head_count"] == 1
+    assert second_result.ppe["head_count"] == 0
+    assert second_result.ppe["missing_helmet_count"] == 0
+    assert second_result.ppe["candidate"] is False
+    suppression = second_result.ppe["helmet_fp_suppression"]
+    assert suppression["temporal_helmet_mutex_heads"][0]["reason"] == "temporal_helmet_mutex"
+
+
+def test_source_auth_media_roi_suppresses_ppe_business_evidence():
+    from defense.module_a.postprocess import PPEDisplayTracker
+
+    detections = _Detections(
+        boxes=[(140, 140, 230, 230), (120, 100, 260, 360)],
+        classes=[1, 2],
+        confidences=[0.92, 0.88],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+    state = SafetyHelmetState(window=2, trigger_count=1, fast_window=1, fast_trigger_count=1)
+    tracker = PPEDisplayTracker(hold_frames=2, small_hold_frames=2)
+
+    for _ in range(3):
+        result = evaluate_ppe_business(
+            detections,
+            frame_shape=(640, 640),
+            ppe_state=state,
+            ppe_tracker=tracker,
+            tracking_enabled=True,
+            source_auth_media_bbox=(100, 80, 300, 380),
+            source_auth_suppression_active=True,
+        )
+
+    ppe = result.ppe
+    assert ppe["candidate"] is False
+    assert ppe["warning"] is False
+    assert ppe["head_count"] == 0
+    assert ppe["person_count"] == 0
+    assert ppe["source_auth_media_suppression"]["suppressed_count"] == 2
+    assert ppe["source_auth_temporal_reset"] is True
+    assert result.tracks == []
+
+
+def test_source_auth_media_roi_does_not_hide_external_head_violation():
+    from defense.module_a.postprocess import PPEDisplayTracker
+
+    detections = _Detections(
+        boxes=[
+            (140, 140, 230, 230),
+            (120, 100, 260, 360),
+            (420, 140, 500, 220),
+            (390, 120, 540, 390),
+        ],
+        classes=[0, 2, 1, 2],
+        confidences=[0.93, 0.86, 0.91, 0.88],
+        names={0: "helmet", 1: "head", 2: "person"},
+    )
+
+    result = evaluate_ppe_business(
+        detections,
+        frame_shape=(640, 640),
+        ppe_state=SafetyHelmetState(window=2, trigger_count=1, fast_window=1, fast_trigger_count=1),
+        ppe_tracker=PPEDisplayTracker(hold_frames=2, small_hold_frames=2),
+        tracking_enabled=True,
+        source_auth_media_bbox=(100, 80, 300, 380),
+        source_auth_suppression_active=True,
+    )
+
+    ppe = result.ppe
+    assert ppe["candidate"] is True
+    assert ppe["head_count"] == 1
+    assert ppe["helmet_count"] == 0
+    assert ppe["person_count"] == 1
+    assert ppe["source_auth_media_suppression"]["suppressed_labels"] == ["helmet", "person"]
+    assert {track["label"] for track in result.tracks} == {"head", "person"}
+
+
+def test_overlay_record_exposes_a3b_bbox_and_source_auth_ppe_suppression():
+    status = {
+        "running": True,
+        "a3b_p_media": 0.73,
+        "a3b_bbox": [100, 80, 300, 380],
+        "a3b_state": "suspect",
+        "ppe_source_auth_media_suppressed": True,
+        "ppe_source_auth_temporal_reset": True,
+        "ppe_source_auth_media_bbox": [100, 80, 300, 380],
+        "ppe_source_auth_media_suppressed_count": 2,
+        "ppe_source_auth_media_suppressed_head_count": 1,
+        "ppe_source_auth_media_suppressed_person_count": 1,
+        "ppe_source_auth_media_suppression_reason": "a3b_media_roi",
+    }
+
+    record = build_overlay_record(
+        status=status,
+        ppe_tracks=[],
+        run_id=7,
+        display_options={},
+    )
+
+    assert record["a3b_p_media"] == 0.73
+    assert record["a3b_bbox"] == [100, 80, 300, 380]
+    assert record["ppe_source_auth_media_suppressed"] is True
+    assert record["ppe_source_auth_temporal_reset"] is True
+    assert record["ppe_source_auth_media_suppressed_count"] == 2
+    assert record["ppe_source_auth_media_suppressed_head_count"] == 1
+    assert record["ppe_source_auth_media_suppressed_person_count"] == 1
+
+
+def test_empty_backend_preserves_configured_class_names():
+    names = {0: "person", 1: "head", 2: "helmet"}
+    backend = pipeline_factory.EmptyDetectorBackend(names)
+
+    assert backend.names == names
+
+
+def test_pipeline_cache_key_includes_custom_class_names(monkeypatch, tmp_path: Path):
+    class WarmupPipeline:
+        warmup_frames = 0
+
+        def __init__(self, backend, *, config):
+            self.backend = backend
+            self.config = config
+
+        def warmup(self, frames: int) -> None:
+            return None
+
+        def reset(self) -> None:
+            return None
+
+    def load_config(**kwargs):
+        custom = kwargs.get("custom_model") or {}
+        return {
+            "runtime": {"allow_empty_backend": True},
+            "inference": {
+                "backend": "pytorch",
+                "model_family": "yolov5",
+                "class_names": custom.get("class_names"),
+            },
+        }
+
+    monkeypatch.setattr(pipeline_factory, "VideoDefensePipeline", WarmupPipeline)
+    monkeypatch.setattr(pipeline_factory, "load_runtime_config", load_config)
+
+    cache = pipeline_factory.PipelineCache(root=tmp_path)
+    first = cache.get(
+        profile="empty_smoke",
+        custom_model={
+            "enabled": True,
+            "path": "same.pt",
+            "backend": "pytorch",
+            "model_family": "yolov5",
+            "class_names": ["person", "head", "helmet"],
+        },
+    )
+    second = cache.get(
+        profile="empty_smoke",
+        custom_model={
+            "enabled": True,
+            "path": "same.pt",
+            "backend": "pytorch",
+            "model_family": "yolov5",
+            "class_names": ["helmet", "head", "person"],
+        },
+    )
+
+    assert first is not second
+    assert second.cache_hit is False
+    assert second.pipeline.backend.names == {0: "helmet", 1: "head", 2: "person"}
+
+
+def test_empty_runtime_status_exposes_three_class_person_fields():
+    status = MonitorEngine._empty_status()
+
+    assert status["ppe_person_count"] == 0
+    assert status["ppe_raw_person_count"] == 0
+    assert status["ppe_inferred_person_count"] == 0
+    assert status["ppe_person_context_count"] == 0
+    assert status["ppe_weak_person_count"] == 0
+    assert status["ppe_promoted_person_count"] == 0
+    assert status["ppe_effective_person_count"] == 0
+
+
 def test_external_contract_noise_does_not_drive_full_scan_asr():
     external = {
         "summary": {"n_rows": 3, "max_asr": 1.0, "mean_asr": 0.5, "asr_matrix": {}, "top_attacks": []},
@@ -340,10 +995,75 @@ def test_accelerated_export_writes_trusted_record_and_catalog(tmp_path: Path, mo
     assert result["state"] == "completed"
     assert result["backend"] == "onnx"
     assert Path(result["exported_model_path"]).exists()
+    assert Path(result["exported_model_path"]).parent == svc.storage.exports_dir
+    assert "已验证" in Path(result["exported_model_path"]).name
     assert svc.registry.get(result["exported_fingerprint"]) is not None
     catalog = svc.output_catalog(category="accelerated_model")
     assert catalog["count"] == 1
     assert catalog["artifacts"][0]["status"] == "trusted"
+    all_catalog = svc.runtime_catalog()
+    assert all_catalog["count"] >= 2
+
+
+def test_clear_model_security_logs_removes_all_entries(tmp_path: Path):
+    svc = ModelSecurityService(root=tmp_path)
+    svc._log_event("scan_started", status="running", message="扫描开始")
+
+    result = svc.clear_logs()
+
+    assert result["cleared"] is True
+    assert result["entries"] == []
+    assert svc.recent_logs()["entries"] == []
+
+
+def test_fastapi_model_security_status_exposes_class_name_warning():
+    class FakeModelSecurity:
+        def __init__(self) -> None:
+            self.received_custom_model = None
+
+        def status(self, **kwargs) -> dict:
+            self.received_custom_model = kwargs.get("custom_model")
+            return {
+                "enabled": True,
+                "allowed": False,
+                "admission_status": "blocked_scan_required",
+                "class_names": {0: "person", 1: "head", 2: "helmet"},
+                "class_names_mismatch": True,
+                "class_names_warning": "configured class_names differ from checkpoint embedded names",
+                "class_names_diagnostics": {
+                    "configured_class_names": {0: "person", 1: "head", 2: "helmet"},
+                    "embedded_class_names": {0: "helmet", 1: "head", 2: "person"},
+                },
+            }
+
+    security = FakeModelSecurity()
+    app = create_app(engine=object(), model_security=security, bind_host="127.0.0.1")
+    client = TestClient(app)
+    custom_model = {
+        "enabled": True,
+        "path": "D:/tmp/best.pt",
+        "class_names": ["person", "head", "helmet"],
+    }
+
+    res = client.post("/api/model-security/status", json={"custom_model": custom_model})
+
+    assert res.status_code == 200
+    payload = res.json()["model_security"]
+    assert security.received_custom_model == custom_model
+    assert payload["class_names_mismatch"] is True
+    assert "differ" in payload["class_names_warning"]
+    assert payload["class_names_diagnostics"]["embedded_class_names"]["2"] == "person"
+
+
+def test_model_security_page_displays_class_name_warning():
+    html_path = Path(__file__).resolve().parents[1] / "src" / "defense" / "web" / "static" / "model_security.html"
+    html = html_path.read_text(encoding="utf-8")
+
+    assert 'id="customClassNames"' in html
+    assert 'id="classNames"' in html
+    assert "class_names_warning" in html
+    assert "WARNING:" in html
+    assert "helmet,head,person" in html
 
 
 def test_fastapi_start_can_bypass_model_security_for_test_only():
@@ -407,6 +1127,93 @@ def test_fastapi_start_can_bypass_model_security_for_test_only():
     assert payload["model_security"]["test_bypass_model_security"] is True
     assert engine.started_with["custom_model"] == custom_model
     assert security.events[0][0] == "model_security_bypass_start"
+
+
+def test_file_realtime_preview_drops_unmatched_interpolated_tracks():
+    engine = MonitorEngine(object())
+    engine.status.update(
+        {
+            "source_type": "file",
+            "realtime": True,
+            "detector_process_fps_cap": 15.0,
+            "overlay_match_window_ms": 180.0,
+            "overlay_hold_ms": 550.0,
+            "overlay_interpolate_ms": 400.0,
+            "overlay_max_age_ms": 950.0,
+        }
+    )
+    engine.overlay_timeline.append(
+        {
+            "overlay_seq": 1,
+            "source_epoch": 0,
+            "video_time_s": 1.0,
+            "ppe_tracks": [
+                {
+                    "track_id": 7,
+                    "label": "person",
+                    "box": [300, 180, 520, 360],
+                    "source": "detected",
+                    "hold_eligible": True,
+                }
+            ],
+        }
+    )
+    engine.overlay_timeline.append(
+        {
+            "overlay_seq": 2,
+            "source_epoch": 0,
+            "video_time_s": 1.1,
+            "ppe_tracks": [],
+            "ppe_source_auth_media_suppressed": True,
+        }
+    )
+
+    selected = engine._select_preview_overlay(1.05, 0)
+
+    assert selected is not None
+    assert selected.get("interpolated") is True
+    assert selected["ppe_tracks"] == []
+    assert engine._preview_last_overlay is not None
+    assert engine._preview_last_overlay["ppe_tracks"] == []
+
+
+def test_high_a3b_sensitivity_warns_after_two_observed_only_hits():
+    config = {
+        "module_a": {"static_image_enabled": True, "static_image_interval": 4},
+        "a3b": {
+            "observed_threshold": 0.42,
+            "trigger_threshold": 0.62,
+            "strong_single_frame_threshold": 0.78,
+            "observed_only_warning_threshold": 0.50,
+            "observed_only_track_threshold": 0.50,
+            "observed_only_min_window_hits": 3,
+        },
+    }
+    apply_feature_options(config, {"a3b_sensitivity": "high"})
+    state = A3BSoftTriggerState(config["a3b"])
+
+    result = None
+    for score in [0.43, 0.44]:
+        result = state.update(
+            {
+                "live_score": score,
+                "score": score,
+                "p_media": score,
+                "p_media_scores": {"track": 0.43},
+                "p_media_border_state": {"suppressed": False},
+                "p_media_camera_motion_state": {"suppressed": False},
+                "p_media_physical_motion_state": {"suppressed": False},
+                "source_path": r"D:\security_project_d\素材\视频中出现干扰视频\case.mp4",
+            }
+        )
+
+    assert result is not None
+    assert config["module_a"]["static_image_interval"] == 2
+    assert config["a3b"]["observed_only_min_window_hits"] == 2
+    assert result["triggered"] is True
+    assert result["triggered_source"] == "observed_window"
+    assert result["state"] == "suspect"
+    assert result["debug"]["observed_only_window_hits"] == 2
 
 
 def test_fastapi_start_returns_json_when_source_file_is_missing():

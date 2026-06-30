@@ -39,6 +39,21 @@ def build_details(
             "ratio": float(overexposure["ratio"]),
             "underexposed_ratio": float(overexposure["underexposed_ratio"]),
             "is_glare": bool(overexposure["is_glare"]),
+            "static_glare": bool(overexposure.get("static_glare", False)),
+            "temporal_flash": bool(overexposure.get("temporal_flash", False)),
+            "temporal_flash_ratio": float(overexposure.get("temporal_flash_ratio", 0.0)),
+            "temporal_flash_bright_ratio": float(
+                overexposure.get("temporal_flash_bright_ratio", 0.0)
+            ),
+            "temporal_flash_dark_ratio": float(
+                overexposure.get("temporal_flash_dark_ratio", 0.0)
+            ),
+            "temporal_flash_polarity": float(
+                overexposure.get("temporal_flash_polarity", 0.0)
+            ),
+            "temporal_flash_abs_mean": float(
+                overexposure.get("temporal_flash_abs_mean", 0.0)
+            ),
             "threshold": float(overexposure["threshold"]),
         },
         "lbp": {

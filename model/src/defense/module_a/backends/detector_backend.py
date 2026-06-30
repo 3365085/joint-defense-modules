@@ -12,6 +12,14 @@ import cv2
 import numpy as np
 
 
+def temporal_reuse_max_consecutive(configured: Any | None = None) -> int:
+    """Return the conservative cap for consecutive detector-reuse frames."""
+    try:
+        return max(0, int(configured)) if configured is not None else 3
+    except (TypeError, ValueError):
+        return 3
+
+
 @dataclass(slots=True)
 class DetectionFrameResult:
     """Normalized detector output consumed by Module A."""

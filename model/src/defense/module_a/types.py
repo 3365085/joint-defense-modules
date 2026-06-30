@@ -65,6 +65,8 @@ class ModuleAResult:
             "layer_triggered": layer,
             "is_attack": self.single_frame_suspicious,
             "attack_detected": self.single_frame_suspicious,
+            "single_frame_suspicious": self.single_frame_suspicious,
+            "reason_codes": list(self.reason_codes),
             "attack_state_active": self.attack_state_active,
             "attack_state_source": "module_a" if self.attack_state_active else "none",
             "attack_state_remaining": 0,

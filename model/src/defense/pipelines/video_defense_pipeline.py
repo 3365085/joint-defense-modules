@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from defense.module_a import ModuleADetector, ModuleAInput
+from defense.module_a.rebuilt import RebuiltModuleADetector
 from defense.module_a.backends.detector_backend import DetectionFrameResult
 from defense.module_a.backends import UltralyticsDetectorBackend
 from defense.module_a.roi_provider import DetectionROIProvider
@@ -49,9 +50,19 @@ class VideoDefensePipeline:
     ):
         self.detector_backend = detector_backend
         self.class_names = detector_backend.names
-        self.detector = ModuleADetector(config=config)
         inference_config = (config or {}).get("inference", {})
         module_config = (config or {}).get("module_a", config or {})
+        # Module A detection kernel selection (2026-06-30):
+        #   ``rebuilt`` = ported rebuilt_demo kernel (A1-A4 + branch-B blinding
+        #     + scene-adaptive baseline + joint decision; XGBoost A4).
+        #   ``legacy``  = original in-tree detector.
+        # Both honor the same ModuleAInput/ModuleAResult contract and run behind
+        # the unchanged frame-skip / detection-reuse shell in this pipeline.
+        self.detector_impl = str(module_config.get("detector_impl", "rebuilt")).lower()
+        if self.detector_impl == "legacy":
+            self.detector = ModuleADetector(config=config)
+        else:
+            self.detector = RebuiltModuleADetector(config=config)
         configured_warmup = int(inference_config.get("warmup_frames", 3))
         light_flow_warmup = int(module_config.get("light_flow_interval", 3)) + 1
         self.warmup_frames = max(
@@ -89,6 +100,18 @@ class VideoDefensePipeline:
             1, int(module_config.get("temporal_detector_reuse_max_gap", 2))
         )
 
+        # Per-target reuse state (2026-06-11 架构修复)
+        # Each target gets tracked individually so small-region changes
+        # don't get drowned out by the global change_score.
+        self._temporal_reuse_target_state: dict[int, dict[str, Any]] = {}
+        self._temporal_reuse_consecutive = 0
+
+        # A3b 假视频区域检测框抑制 (2026-06-11)
+        # 报警后假视频区域内的 person/helmet/head 框不再显示,
+        # 场景变化（视频切走/人站起）后自动恢复。
+        self._a3b_suppress_remaining: int = 0       # 剩余抑制帧数, 0=无抑制
+        self._a3b_suppress_bbox: tuple[int, ...] | None = None  # (x1,y1,x2,y2)
+
     def reset(self) -> None:
         self.detector.reset()
         self.frame_idx = 0
@@ -96,6 +119,10 @@ class VideoDefensePipeline:
         self._last_detections = None
         self._last_rois = None
         self._last_detector_frame_idx = -1
+        self._temporal_reuse_target_state.clear()
+        self._temporal_reuse_consecutive = 0
+        self._a3b_suppress_remaining = 0
+        self._a3b_suppress_bbox = None
 
     def close(self) -> None:
         close_backend = getattr(self.detector_backend, "close", None)
@@ -104,6 +131,8 @@ class VideoDefensePipeline:
         self._last_small_gray = None
         self._last_detections = None
         self._last_rois = None
+        self._temporal_reuse_target_state.clear()
+        self._temporal_reuse_consecutive = 0
 
     def warmup(self, frames: int = 3) -> None:
         if frames <= 0:
@@ -121,6 +150,10 @@ class VideoDefensePipeline:
     def _maybe_reuse_detections(self, frame_640: np.ndarray) -> tuple[Any | None, list[Any] | None, float, float]:
         """Reuse the last detector output when the current frame barely changed.
 
+        Uses per-target ROI-level change detection to avoid missing small-region
+        changes, plus a hard cap on consecutive reuse frames to prevent
+        unbounded box-position drift (2026-06-11 架构修复).
+
         Returns
         -------
         tuple
@@ -137,10 +170,137 @@ class VideoDefensePipeline:
         diff = cv2.absdiff(small, self._last_small_gray)
         change_score = float(diff.mean() / 255.0)
         gap = self.frame_idx - self._last_detector_frame_idx
+
+        # Lazy-init for _temporal_reuse_consecutive (tests may construct
+        # pipeline without calling __init__, e.g. test_video_defense_pipeline_reuse)
+        if not hasattr(self, '_temporal_reuse_consecutive'):
+            self._temporal_reuse_consecutive = 0
+
+        # Hard cap on consecutive reuse frames (prevents unbounded drift)
+        from defense.module_a.backends.detector_backend import temporal_reuse_max_consecutive as _reuse_max
+        _max_consecutive = getattr(self, '_temporal_reuse_max_consecutive', 3)
+        if self._temporal_reuse_consecutive >= _max_consecutive:
+            self._last_small_gray = small
+            self._temporal_reuse_consecutive = 0
+            return None, None, 0.0, change_score
+
+        # Per-target ROI-level change check: for each existing target bbox,
+        # compute the local change score. If any target region changed
+        # significantly, force re-detection.
+        _boxes = getattr(self._last_detections, 'boxes', None)
+        if _boxes:
+            for _box in _boxes:
+                if len(_box) < 4:
+                    continue
+                x1, y1, x2, y2 = [max(0, int(v)) for v in _box[:4]]
+                x2 = min(x2, gray.shape[1] - 1)
+                y2 = min(y2, gray.shape[0] - 1)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                _roi_prev = self._last_small_gray[
+                    max(0, y1 * 160 // gray.shape[0]):min(160, y2 * 160 // gray.shape[0]),
+                    max(0, x1 * 160 // gray.shape[1]):min(160, x2 * 160 // gray.shape[1])
+                ]
+                _roi_cur = small[
+                    max(0, y1 * 160 // gray.shape[0]):min(160, y2 * 160 // gray.shape[0]),
+                    max(0, x1 * 160 // gray.shape[1]):min(160, x2 * 160 // gray.shape[1])
+                ]
+                if _roi_prev.size == 0 or _roi_cur.size == 0 or _roi_prev.shape != _roi_cur.shape:
+                    continue
+                _roi_change = float(cv2.absdiff(_roi_cur, _roi_prev).mean() / 255.0)
+                if _roi_change > self._temporal_reuse_threshold * 1.5:
+                    self._last_small_gray = small
+                    self._temporal_reuse_consecutive = 0
+                    return None, None, 0.0, change_score
+
         if change_score <= self._temporal_reuse_threshold and gap <= self._temporal_reuse_max_gap:
+            self._temporal_reuse_consecutive += 1
             return self._last_detections, self._last_rois, 0.0, change_score
         self._last_small_gray = small
+        self._temporal_reuse_consecutive = 0
         return None, None, 0.0, change_score
+
+    def _apply_a3b_suppression(
+        self,
+        frame_640: np.ndarray,
+        detections: DetectionFrameResult,
+        rois: list[Any],
+        info: dict[str, Any],
+    ) -> tuple[DetectionFrameResult, list[Any]]:
+        """Suppress YOLO boxes inside A3b-triggered fake-video region.
+
+        Once A3b confirms a static-media attack, person/helmet/head boxes
+        inside the attack bbox are hidden until the hold expires, at which
+        point A3b re-evaluates — if the fake video is still there it will
+        re-trigger suppression automatically.
+
+        The release is purely timer-based (no pixel-change check) because
+        the fake video content itself moves, making pixel diff unreliable.
+        """
+        # Read A3b state from info
+        static_media = (
+            info.get("details", {})
+            .get("module_a_features", {})
+            .get("static_media", {})
+        )
+        a3b_triggered = bool(static_media.get("static_image_triggered", False))
+        p_media_bbox = static_media.get("p_media_bbox")
+
+        # --- 1. 新触发 → 启动抑制 ---
+        if a3b_triggered and self._a3b_suppress_remaining <= 0:
+            if isinstance(p_media_bbox, (list, tuple)) and len(p_media_bbox) == 4:
+                x1, y1, x2, y2 = [max(0, int(v)) for v in p_media_bbox[:4]]
+                x2 = min(x2, frame_640.shape[1] - 1)
+                y2 = min(y2, frame_640.shape[0] - 1)
+                if x2 > x1 and y2 > y1:
+                    self._a3b_suppress_bbox = (x1, y1, x2, y2)
+                    # ~3s at 60fps, ~1.5s at 30fps
+                    self._a3b_suppress_remaining = 180
+
+        # --- 2. 抑制持续期：纯计时，不检测像素变化 ---
+        if self._a3b_suppress_remaining > 0:
+            self._a3b_suppress_remaining -= 1
+            info["a3b_suppression_active"] = True
+            info["a3b_suppression_remaining"] = self._a3b_suppress_remaining
+
+            if self._a3b_suppress_remaining <= 0:
+                # 到期释放，下一帧 A3b 会判断是否需要重新抑制
+                self._a3b_suppress_bbox = None
+                info["a3b_suppression_released"] = True
+                return detections, rois
+
+            # 过滤 bbox 内的框
+            bbox = self._a3b_suppress_bbox
+            if bbox:
+                sx1, sy1, sx2, sy2 = bbox
+                kept_boxes: list[list[int]] = []
+                kept_classes: list[int] = []
+                kept_confs: list[float] = []
+                for box, cls_id, conf in zip(detections.boxes, detections.classes, detections.confidences):
+                    cx = (box[0] + box[2]) / 2.0
+                    cy = (box[1] + box[3]) / 2.0
+                    if sx1 <= cx <= sx2 and sy1 <= cy <= sy2:
+                        continue
+                    kept_boxes.append(box)
+                    kept_classes.append(cls_id)
+                    kept_confs.append(conf)
+                detections.boxes = kept_boxes
+                detections.classes = kept_classes
+                detections.confidences = kept_confs
+                # 同步过滤 rois
+                if rois:
+                    kept_rois = []
+                    for roi in rois:
+                        if hasattr(roi, "bbox"):
+                            rcx = (roi.bbox[0] + roi.bbox[2]) / 2.0
+                            rcy = (roi.bbox[1] + roi.bbox[3]) / 2.0
+                            if sx1 <= rcx <= sx2 and sy1 <= rcy <= sy2:
+                                continue
+                        kept_rois.append(roi)
+                    rois = kept_rois
+                info["a3b_suppression_filtered"] = True
+
+        return detections, rois
 
     def _run_detection(
         self,
@@ -286,6 +446,21 @@ class VideoDefensePipeline:
             "detector_ms": float(detections.inference_ms),
             "module_a_ms": float(module_a_timing_ms),
         }
+
+        # A3b 假视频区域检测框抑制 (2026-06-11)
+        detections, rois = self._apply_a3b_suppression(frame_640, detections, rois, info)
+        # Rebuild detection info dict after suppression
+        if info.get("a3b_suppression_active"):
+            raw_classes = [self.class_names.get(c, f"class_{c}") for c in detections.classes[:20]]
+            info["details"]["detections"].update({
+                "roi_count": len(rois),
+                "boxes": detections.boxes[:20],
+                "classes": raw_classes,
+                "normalized_classes": [self.roi_provider.normalize_label(v) for v in raw_classes],
+                "class_ids": detections.classes[:20],
+                "confidences": [float(v) for v in detections.confidences[:20]],
+            })
+
         self.frame_idx += 1
         return frame_640, detections, info, total_timing_ms, module_a_timing_ms
 

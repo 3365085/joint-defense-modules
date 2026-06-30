@@ -374,12 +374,6 @@ class A3BSoftTriggerState:
             or _float(static_media.get("classifier_score")) >= self.config.trigger_threshold
         )
         quality_gate = bool(candidate_count > 0 or screen_cue or strong_media)
-        # Score bypass: when observed_score is high enough and no suppression
-        # is active, trust the raw detection score without waiting for the
-        # state machine to accumulate candidate/screen_cue evidence.
-        # This is the single biggest latency reducer for A3b (2026-06-11).
-        if not quality_gate and observed_score >= 0.55 and not failed:
-            quality_gate = True
         if observed_score >= self.config.observed_threshold and not quality_gate:
             failed.append("no_candidate_or_screen_cue")
         return {

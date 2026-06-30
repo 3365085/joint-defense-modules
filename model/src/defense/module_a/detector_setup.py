@@ -89,7 +89,7 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
         1,
         int(
             module_config.get(
-                "static_image_interval", 10
+                "static_image_interval", 3
             )
         ),
     )
@@ -104,6 +104,24 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
     )
     detector.static_image_hold_remaining = 0
     detector.static_image_hold_score = 0.0
+    # Full-field carryover for non-execution frames (2026-06-11 架构修复)
+    # Holds p_media, p_media_scores, candidate_count, warp_residual, flow_gap
+    # so A3BSoftTrigger.quality_gate survives interval skips.
+    detector.static_image_hold_carryover_enabled = bool(
+        module_config.get("static_image_hold_carryover_enabled", True)
+    )
+    detector.static_image_hold_state: dict[str, Any] = {}
+    # Dynamic interval: when hold_score > high_score_threshold, force interval=1
+    detector.static_image_dynamic_interval_enabled = bool(
+        module_config.get("static_image_dynamic_interval_enabled", True)
+    )
+    detector.static_image_high_score_threshold = float(
+        module_config.get("static_image_high_score_threshold", 0.50)
+    )
+    # Max consecutive temporal reuse frames before forcing re-detection
+    detector.temporal_reuse_max_consecutive = max(
+        1, int(module_config.get("temporal_reuse_max_consecutive", 3))
+    )
     detector.a3b_display_alpha = float(module_config.get("a3b_display_alpha", 0.35))
     detector.a3b_display_score = 0.0
     detector._a3b_display_hold = deque(maxlen=5)
@@ -180,7 +198,7 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
         1, int(module_config.get("static_media_fast_window", 6))
     )
     detector.static_media_fast_trigger_count = max(
-        1, int(module_config.get("static_media_fast_trigger_count", 2))
+        1, int(module_config.get("static_media_fast_trigger_count", 1))
     )
     detector.static_media_fast_min_p_media = float(
         module_config.get("static_media_fast_min_p_media", 0.62)
@@ -226,6 +244,18 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
     )
     detector.static_media_camera_motion_score_cap = float(
         module_config.get("static_media_camera_motion_score_cap", 0.40)
+    )
+    detector.static_media_camera_motion_max_flow_ratio = float(
+        module_config.get("static_media_camera_motion_max_flow_ratio", 0.42)
+    )
+    detector.static_media_exposure_motion_suppress_enabled = bool(
+        module_config.get("static_media_exposure_motion_suppress_enabled", True)
+    )
+    detector.static_media_exposure_motion_min_ratio = float(
+        module_config.get("static_media_exposure_motion_min_ratio", 0.001)
+    )
+    detector.static_media_exposure_motion_min_temporal = float(
+        module_config.get("static_media_exposure_motion_min_temporal", 0.20)
     )
     detector.static_media_fast_edge_margin = float(
         module_config.get("static_media_fast_edge_margin", 3.0)
@@ -277,7 +307,7 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
 
     detector.scheduler = ModuleAScheduler(module_config.get("keyframe_interval", 3))
     detector.alert_state = AlertState(
-        window=module_config.get("alert_window", 5),
+        window=module_config.get("alert_window", 7),
         trigger_count=module_config.get("alert_trigger_count", 3),
         hold_frames=module_config.get("attack_state_hold_frames", 4),
     )
@@ -293,7 +323,19 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
     detector.glare_hold_frames = max(0, int(module_config.get("glare_hold_frames", 0)))
     detector.glare_hold_remaining = 0
     detector.overexposure = GPUOverexposureDetector(
-        detector.glare_ratio_threshold
+        threshold=detector.glare_ratio_threshold,
+        flash_diff_threshold=float(module_config.get("glare_flash_diff_threshold", 30.0)),
+        flash_ratio_threshold=float(module_config.get("glare_flash_ratio_threshold", 0.08)),
+        flash_min_polarity=float(module_config.get("glare_flash_min_polarity", 0.35)),
+        flash_min_abs_mean=float(module_config.get("glare_flash_min_abs_mean", 8.0)),
+    )
+    # A3b thresholds (tunable via tuning tool)
+    detector.a3b_high_score_bypass_threshold = float(
+        module_config.get("a3b_high_score_bypass_threshold", 0.70)
+    )
+    # A4 flow_local anomaly threshold
+    detector.flow_local_anomaly_threshold = float(
+        module_config.get("flow_local_anomaly_threshold", 0.68)
     )
     detector.texture = GPULBPTextureAnalyzer(
         radius=module_config.get("lbp_radius", 3),
@@ -436,6 +478,7 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
 
     # --- Target-anchored analyzer (2026-05-13) ---
     detector.target_anchored = TargetAnchoredAnalyzer(
+        target_labels=tuple(module_config.get("roi_target_labels", ("person", "helmet", "head"))),
         roi_blur_threshold=float(module_config.get("target_anchored_blur_threshold", 0.40)),
         roi_overexposure_threshold=float(
             module_config.get("target_anchored_overexposure_threshold", 0.15)
@@ -475,6 +518,27 @@ def initialize_detector(detector: Any, config: dict[str, Any] | None = None) -> 
         ),
         natural_exposure_max_motion_score=float(
             module_config.get("natural_exposure_max_motion_score", 1.01)
+        ),
+        no_target_fallback_window_frames=int(
+            module_config.get("no_target_fallback_window_frames", 45)
+        ),
+        no_target_fallback_max_exposure_ratio=float(
+            module_config.get("no_target_fallback_max_exposure_ratio", 0.0005)
+        ),
+        no_target_blur_score_threshold=float(
+            module_config.get("no_target_blur_score_threshold", 0.15)
+        ),
+        no_target_blur_low_energy_threshold=float(
+            module_config.get("no_target_blur_low_energy_threshold", 0.64)
+        ),
+        no_target_occlusion_local_ratio_threshold=float(
+            module_config.get("no_target_occlusion_local_ratio_threshold", 0.55)
+        ),
+        strong_static_glare_ratio_threshold=float(
+            module_config.get("strong_static_glare_ratio_threshold", 0.10)
+        ),
+        flow_local_anomaly_threshold=float(
+            module_config.get("flow_local_anomaly_threshold", 0.68)
         ),
     )
 
@@ -524,8 +588,10 @@ def reset_detector_state(detector: Any) -> None:
     detector.static_image.reset()
     detector.temporal.reset()
     detector.target_anchored.reset()
+    detector.overexposure.reset()
     detector.static_image_hold_remaining = 0
     detector.static_image_hold_score = 0.0
+    detector.static_image_hold_state.clear()
     detector.static_media_replay_votes.clear()
     detector.static_media_replay_bboxes.clear()
     detector.static_media_fast_votes.clear()

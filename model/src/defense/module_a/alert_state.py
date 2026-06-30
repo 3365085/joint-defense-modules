@@ -39,26 +39,44 @@ class AlertState:
         self.alert_window_seconds_tolerance = float(alert_window_seconds_tolerance)
         self.queue: deque[int] = deque(maxlen=self.window)
         self.ts_queue: deque[float] = deque(maxlen=self.window)
+        self.intensity_queue: deque[float] = deque(maxlen=self.window)
         self.hold_remaining = 0
 
     def update(
         self,
         suspicious: bool,
         frame_ts: float | None = None,
+        intensity: float = 0.0,
     ) -> tuple[bool, bool]:
         self.queue.append(1 if suspicious else 0)
+        self.intensity_queue.append(float(intensity) if suspicious else 0.0)
 
         if frame_ts is None:
-            # Offline / legacy path: drop any previously recorded timestamps
-            # so the soft time constraint cannot silently carry over if the
-            # caller later switches to the time-aware form.
+            # Offline / legacy path
             if self.ts_queue:
                 self.ts_queue.clear()
-            alert_confirmed = sum(self.queue) >= self.trigger_count
+            _count = sum(self.queue)
+            _weighted_sum = sum(self.intensity_queue)
+            _recent = list(self.intensity_queue)[-3:] if len(self.intensity_queue) >= 3 else list(self.intensity_queue)
+            _max_recent = max(_recent) if _recent else 0.0
+            # Three-path trigger: count-based (legacy), weighted, single-strong
+            # Count-based preserves the original 3/5 semantics for callers
+            # that don't pass meaningful intensity values (2026-06-11 fix).
+            alert_confirmed = (
+                _count >= self.trigger_count
+                or (_count >= 2 and _weighted_sum >= float(self.trigger_count) * 0.6)
+                or (_max_recent >= 0.85 and _count >= 1)
+            )
         else:
             self.ts_queue.append(float(frame_ts))
-            count_ok = sum(self.queue) >= self.trigger_count
-            if count_ok and len(self.ts_queue) >= self.trigger_count:
+            _count = sum(self.queue)
+            _weighted_sum = sum(self.intensity_queue)
+            _recent = list(self.intensity_queue)[-3:] if len(self.intensity_queue) >= 3 else list(self.intensity_queue)
+            _max_recent = max(_recent) if _recent else 0.0
+            count_ok = _count >= self.trigger_count
+            weighted_ok = _count >= 2 and _weighted_sum >= float(self.trigger_count) * 0.6
+            single_ok = _max_recent >= 0.85 and _count >= 1
+            if (count_ok or weighted_ok or single_ok) and len(self.ts_queue) >= self.trigger_count:
                 span = self.ts_queue[-1] - self.ts_queue[0]
                 alert_confirmed = span <= self.alert_window_seconds_tolerance
             else:
@@ -81,4 +99,5 @@ class AlertState:
     def reset(self) -> None:
         self.queue.clear()
         self.ts_queue.clear()
+        self.intensity_queue.clear()
         self.hold_remaining = 0

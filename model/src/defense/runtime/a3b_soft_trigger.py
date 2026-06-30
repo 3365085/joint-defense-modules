@@ -23,15 +23,15 @@ def _int(value: Any, default: int = 0) -> int:
 class A3BSoftTriggerConfig:
     enabled: bool = True
     observed_threshold: float = 0.42
-    trigger_threshold: float = 0.62
-    strong_single_frame_threshold: float = 0.78
+    trigger_threshold: float = 0.55
+    strong_single_frame_threshold: float = 0.70
     observed_only_warning_threshold: float = 0.50
     observed_only_track_threshold: float = 0.50
     observed_only_source_keywords: tuple[str, ...] = field(default_factory=lambda: ("视频中出现干扰视频",))
     trigger_source_keywords: tuple[str, ...] = field(default_factory=lambda: ("视频中出现干扰视频",))
     window_size: int = 12
-    min_window_hits: int = 3
-    observed_only_min_window_hits: int = 3
+    min_window_hits: int = 2
+    observed_only_min_window_hits: int = 2
     min_consecutive_hits: int = 2
     decay: float = 0.88
     max_gap_frames: int = 5
@@ -185,6 +185,17 @@ class A3BSoftTriggerState:
         )
         if not cfg.enabled:
             debug["failed_gates"].append("disabled")
+        # High-score bypass: when observed_score is very high, skip keyword
+        # and quality_gate checks to avoid false negatives in test/unknown
+        # source scenarios (2026-06-11 架构修复).
+        elif (
+            cfg.allow_single_strong_trigger
+            and observed_score >= 0.85
+            and not blocking_failed_gates
+        ):
+            triggered = True
+            source = "high_score_bypass"
+            confirmed_score = max(confirmed_score, observed_score)
         elif (
             trigger_source_allowed
             and cfg.allow_single_strong_trigger
@@ -363,6 +374,12 @@ class A3BSoftTriggerState:
             or _float(static_media.get("classifier_score")) >= self.config.trigger_threshold
         )
         quality_gate = bool(candidate_count > 0 or screen_cue or strong_media)
+        # Score bypass: when observed_score is high enough and no suppression
+        # is active, trust the raw detection score without waiting for the
+        # state machine to accumulate candidate/screen_cue evidence.
+        # This is the single biggest latency reducer for A3b (2026-06-11).
+        if not quality_gate and observed_score >= 0.55 and not failed:
+            quality_gate = True
         if observed_score >= self.config.observed_threshold and not quality_gate:
             failed.append("no_candidate_or_screen_cue")
         return {

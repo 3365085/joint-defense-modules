@@ -19,21 +19,38 @@ class StaticMediaPolicyMixin:
         motion_score = float(motion.get("motion_score", 0.0))
         flow_ratio = float(motion.get("local_max_ratio", 0.0))
         temporal_local = float(temporal.get("local_max", 0.0))
+        exposure_ratio = float(overexposure.get("ratio", 0.0) or 0.0)
         glare = bool(overexposure.get("is_glare", False)) or (
             float(overexposure.get("ratio", 0.0)) >= self.glare_ratio_threshold
         )
         strong_target_motion = target_related
-        suppressed = bool(p_media >= 0.42 and strong_target_motion)
+        exposure_motion = bool(
+            getattr(self, "static_media_exposure_motion_suppress_enabled", True)
+            and not target_related
+            and p_media >= 0.42
+            and motion_score >= 0.75
+            and temporal_local >= getattr(
+                self, "static_media_exposure_motion_min_temporal", 0.20
+            )
+            and exposure_ratio >= getattr(
+                self, "static_media_exposure_motion_min_ratio", 0.008
+            )
+        )
+        suppressed = bool(p_media >= 0.42 and (strong_target_motion or exposure_motion))
         reason = "none"
         if suppressed:
-            reason = "target_attached_patch"
-            if glare:
+            reason = "exposure_motion"
+            if strong_target_motion:
+                reason = "target_attached_patch"
+            if strong_target_motion and glare:
                 reason = "target_attached_glare"
         return {
             "suppressed": bool(suppressed),
             "reason": reason,
             "p_media": float(p_media),
             "target_related": bool(target_related),
+            "exposure_motion": bool(exposure_motion),
+            "exposure_ratio": float(exposure_ratio),
             "motion_score": float(motion_score),
             "flow_ratio": float(flow_ratio),
             "temporal_local": float(temporal_local),
@@ -56,6 +73,7 @@ class StaticMediaPolicyMixin:
         yolo_context = float(scores.get("yolo_context", 0.0) or 0.0)
         motion_score = float(motion.get("motion_score", 0.0) or 0.0)
         light_valid_ratio = float(motion.get("light_flow_valid_ratio", 0.0) or 0.0)
+        flow_ratio = float(motion.get("local_max_ratio", 0.0) or 0.0)
         touches_horizontal_edge = False
         bbox_area = 0.0
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
@@ -69,7 +87,12 @@ class StaticMediaPolicyMixin:
         )
         moving_camera = bool(
             motion_score >= 0.8
-            and light_valid_ratio >= self.static_media_camera_motion_min_valid_ratio
+            and (
+                light_valid_ratio >= self.static_media_camera_motion_min_valid_ratio
+                or flow_ratio <= getattr(
+                    self, "static_media_camera_motion_max_flow_ratio", 0.42
+                )
+            )
         )
         suppressed = bool(
             self.static_media_camera_motion_suppress_enabled
@@ -87,6 +110,7 @@ class StaticMediaPolicyMixin:
             "yolo_context": float(yolo_context),
             "motion_score": float(motion_score),
             "light_flow_valid_ratio": float(light_valid_ratio),
+            "flow_ratio": float(flow_ratio),
             "touches_horizontal_edge": bool(touches_horizontal_edge),
             "bbox_area": float(bbox_area),
             "score_cap": float(self.static_media_camera_motion_score_cap),
@@ -187,7 +211,7 @@ class StaticMediaPolicyMixin:
         self.static_media_replay_votes.append(1 if evidence else 0)
         self.static_media_replay_bboxes.append(bbox_state)
         votes = sum(self.static_media_replay_votes)
-        trigger_count = max(5, min(self.static_media_replay_window, int(self.static_media_replay_window * 0.5 + 0.999)))
+        trigger_count = max(4, min(self.static_media_replay_window, int(self.static_media_replay_window * 0.25 + 0.999)))
         tracked_bboxes = [state for state in self.static_media_replay_bboxes if state is not None]
         center_span_x = 0.0
         center_span_y = 0.0
@@ -253,8 +277,6 @@ class StaticMediaPolicyMixin:
             or static_image.get("static_image_triggered_source") == "border_or_letterbox_suppressed"
         )
         if suppressed_by_border:
-            self.static_media_occlusion_hold_remaining = 0
-            self.static_media_occlusion_hold_score = 0.0
             self.static_media_occlusion_last_reason = "border_suppressed"
             return {
                 "active": False,
@@ -333,7 +355,7 @@ class StaticMediaPolicyMixin:
         }
 
     def _update_static_media_fast_state(
-        self, static_image: dict[str, Any], replay_state: dict[str, Any]
+        self, static_image: dict[str, Any]
     ) -> dict[str, Any]:
         scores = static_image.get("p_media_scores", {})
         bbox = static_image.get("p_media_bbox")
@@ -352,8 +374,8 @@ class StaticMediaPolicyMixin:
         strong_media_evidence = bool(static_image.get("p_media_strong_evidence", False))
         edge_score = float(scores.get("edge", 0.0))
         yolo_context = float(scores.get("yolo_context", 0.0))
-        warp_residual = float(scores.get("warp_residual", replay_state.get("warp_residual", 0.0)))
-        flow_gap = float(scores.get("flow_gap", replay_state.get("flow_gap", 0.0)))
+        warp_residual = float(scores.get("warp_residual", 0.0))
+        flow_gap = float(scores.get("flow_gap", 0.0))
         replay_signal = max(warp_residual, flow_gap)
         fast_support_evidence = bool(
             target_related

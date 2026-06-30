@@ -184,12 +184,14 @@ class ModuleADetector(StaticMediaPolicyMixin):
             or float(temporal.get("local_max", 0.0)) >= self.light_flow_local_temporal_candidate
         )
 
-    def _should_run_static_image(self, frame_idx: int, temporal: dict[str, Any]) -> bool:
+    def _should_run_static_image(self, frame_idx: int, temporal: dict[str, Any],
+                                  effective_interval: int | None = None) -> bool:
         if not self.static_image_enabled:
             return False
         if self.prev_gray is None:
             return False
-        if frame_idx % self.static_image_interval == 0:
+        interval = effective_interval if effective_interval is not None else self.static_image_interval
+        if frame_idx % interval == 0:
             return True
         return (
             float(temporal.get("change_t", 0.0)) >= self.static_image_temporal_candidate

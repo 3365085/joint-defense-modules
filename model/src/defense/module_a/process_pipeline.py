@@ -101,15 +101,27 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
     # carry forward the LAST computed static_image_score and
     # static_image_triggered state so the front-end sees a smooth
     # confidence curve instead of "0 → score → 0 → score" flicker.
+    run_roi_pass = False
     if detector.static_image_enabled and detector.prev_gray is not None:
         _t0 = time.perf_counter()
-        run_roi_pass = detector._should_run_static_image(item.frame_idx, temporal)
+        # Dynamic interval: when hold_score > high_score_threshold, force every frame
+        # (2026-06-11 架构修复)
+        _effective_interval = (
+            1 if (detector.static_image_dynamic_interval_enabled
+                  and detector.static_image_hold_score >= detector.static_image_high_score_threshold)
+            else detector.static_image_interval
+        )
+        run_roi_pass = detector._should_run_static_image(
+            item.frame_idx, temporal, effective_interval=_effective_interval
+        )
         static_image = detector.static_image.compute(
             detector.prev_gray,
             gray,
             rois if run_roi_pass else None,
             context_rois=rois,
         )
+        # Save raw p_media before suppression chain caps it (2026-06-11 修复)
+        _raw_p_media = float(static_image.get("p_media", 0.0))
         legacy_static_triggered = bool(static_image.get("static_image_triggered", False))
         if detector.a3b_glare_suppress_remaining > 0 and (
             bool(static_image.get("static_image_triggered", False))
@@ -123,23 +135,52 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
             )
             static_image["static_image_triggered_source"] = "physical_glare_suppressed"
         # Hold-last-value: when the ROI pass didn't run, the detector
-        # returns zeros. Replace with the held score so downstream
-        # fusion / display stays continuous.
-        if not run_roi_pass and detector.static_image_hold_score > 0.0:
-            static_image["static_image_score"] = detector.static_image_hold_score
+        # returns zeros. Replace with the held full state so downstream
+        # A3BSoftTrigger quality_gate / screen_cue / strong_media
+        # survive interval skips (2026-06-11 架构修复).
+        if not run_roi_pass and detector.static_image_hold_carryover_enabled and detector.static_image_hold_state:
+            # Carry forward ALL fields that A3BSoftTrigger.quality_gate depends on
+            for _key in ("p_media", "p_media_triggered", "p_media_scores",
+                         "p_media_candidate_count", "p_media_bbox",
+                         "p_media_strong_evidence", "p_media_replay_state",
+                         "p_media_fast_state", "p_media_occlusion_state",
+                         "line_score", "screen_or_paper_like",
+                         "static_image_score", "static_image_triggered",
+                         "static_image_triggered_source", "classifier_score",
+                         "classifier_triggered"):
+                if _key in detector.static_image_hold_state:
+                    static_image[_key] = detector.static_image_hold_state[_key]
+            # Replace at-rest score with the held score so downstream
+            # fusion / display stays continuous.
+            if "static_image_score" not in detector.static_image_hold_state:
+                static_image["static_image_score"] = detector.static_image_hold_score
         elif run_roi_pass:
-            # Update the held score from the fresh computation.
+            # Update the held state from the fresh computation.
             detector.static_image_hold_score = float(
                 static_image.get("static_image_score", 0.0)
             )
+            # Save the full carryover snapshot
+            if detector.static_image_hold_carryover_enabled:
+                carry_keys = ("p_media", "p_media_triggered", "p_media_scores",
+                              "p_media_candidate_count", "p_media_bbox",
+                              "p_media_strong_evidence", "p_media_replay_state",
+                              "p_media_fast_state", "p_media_occlusion_state",
+                              "line_score", "screen_or_paper_like",
+                              "static_image_score", "static_image_triggered",
+                              "static_image_triggered_source", "classifier_score",
+                              "classifier_triggered")
+                detector.static_image_hold_state.clear()
+                for _key in carry_keys:
+                    if _key in static_image:
+                        detector.static_image_hold_state[_key] = static_image[_key]
         if legacy_static_triggered and not detector.static_media_legacy_direct_alert_enabled:
             static_image["static_image_triggered"] = False
             static_image["p_media_triggered"] = False
             static_image["static_image_triggered_source"] = "legacy_observed"
+        fast_state = detector._update_static_media_fast_state(static_image)
         replay_state = detector._update_static_media_replay_state(
             static_image, temporal, blur
         )
-        fast_state = detector._update_static_media_fast_state(static_image, replay_state)
         border_state = detector._static_media_border_suppression(static_image)
         static_image["p_media_border_state"] = border_state
         if border_state["suppressed"]:
@@ -156,12 +197,6 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
                 float(border_state["score_cap"]),
             )
             static_image["static_image_triggered_source"] = "border_or_letterbox_suppressed"
-            detector.static_media_replay_votes.clear()
-            detector.static_media_replay_bboxes.clear()
-            detector.static_media_fast_votes.clear()
-            detector.static_media_fast_bboxes.clear()
-            detector.static_media_occlusion_hold_remaining = 0
-            detector.static_media_occlusion_hold_score = 0.0
         camera_motion_state = detector._static_media_camera_motion_suppression(
             static_image,
             motion,
@@ -185,12 +220,6 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
                 float(camera_motion_state["score_cap"]),
             )
             static_image["static_image_triggered_source"] = "camera_motion_suppressed"
-            detector.static_media_replay_votes.clear()
-            detector.static_media_replay_bboxes.clear()
-            detector.static_media_fast_votes.clear()
-            detector.static_media_fast_bboxes.clear()
-            detector.static_media_occlusion_hold_remaining = 0
-            detector.static_media_occlusion_hold_score = 0.0
         physical_media_state = detector._static_media_physical_motion_suppression(
             static_image,
             motion,
@@ -226,15 +255,17 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
                 if physical_media_state["suppressed"]
                 else "physical_motion_hold_suppressed"
             )
-            if physical_media_state["suppressed"]:
+            if physical_media_state["suppressed"] and bool(
+                physical_media_state.get("target_related", False)
+            ):
                 motion["physical_media_motion_triggered"] = True
                 motion["physical_media_motion_score"] = float(physical_media_state["p_adv"])
-                detector.static_media_replay_votes.clear()
-                detector.static_media_replay_bboxes.clear()
-                detector.static_media_fast_votes.clear()
-                detector.static_media_fast_bboxes.clear()
-                detector.static_media_occlusion_hold_remaining = 0
-                detector.static_media_occlusion_hold_score = 0.0
+        suppressed_by_static_media_policy = bool(
+            border_state["suppressed"]
+            or camera_motion_state["suppressed"]
+            or physical_media_state["suppressed"]
+            or suppress_by_physical_hold
+        )
         live_score = max(
             float(static_image.get("static_image_score", 0.0)),
             float(static_image.get("p_media", 0.0)),
@@ -267,6 +298,9 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
         occlusion_state = detector._update_static_media_occlusion_state(
             static_image, replay_state, fast_state
         )
+        if suppressed_by_static_media_policy:
+            occlusion_state["active"] = False
+            occlusion_state["suppressed_by_policy"] = True
         static_image["p_media_occlusion_state"] = occlusion_state
         if occlusion_state["active"] and not (
             fast_state["triggered"] or replay_state["triggered"]
@@ -277,6 +311,20 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
                 float(occlusion_state["score"]),
             )
             static_image["static_image_triggered_source"] = "a3_plus_occlusion_hold"
+        # High-score bypass: if raw p_media is high enough, trust it immediately
+        # without waiting for replay/fast/occlusion state machines. This is the
+        # single biggest latency reducer for A3b (2026-06-11).
+        # NOTE: uses _raw_p_media saved BEFORE suppression caps it.
+        if (
+            not suppressed_by_static_media_policy
+            and not static_image.get("static_image_triggered", False)
+            and _raw_p_media >= detector.a3b_high_score_bypass_threshold
+        ):
+            static_image["static_image_triggered"] = True
+            static_image["static_image_score"] = max(
+                float(static_image.get("static_image_score", 0.0)), _raw_p_media
+            )
+            static_image["static_image_triggered_source"] = "high_score_bypass"
         motion = detector._merge_static_image(motion, static_image)
         detector._sync_if_profile()
         a3b_static_media_ms = (time.perf_counter() - _t0) * 1000.0
@@ -324,6 +372,14 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
 
         detector._sync_if_profile()
         a3b_static_media_ms += (time.perf_counter() - _t0) * 1000.0
+
+        # Re-update carryover after classifier scoring modifies motion fields
+        # so non-exec frames see the classifier-enhanced state (2026-06-11).
+        if run_roi_pass and detector.static_image_hold_carryover_enabled:
+            for _key in ("static_image_classifier_score", "static_image_classifier_triggered",
+                         "static_image_classifier_forced_trigger"):
+                if _key in motion:
+                    detector.static_image_hold_state[_key] = motion[_key]
 
     source_auth: dict[str, Any] = {}
 
@@ -410,8 +466,9 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
     fusion["reason_codes"] = reason_codes
     fusion["target_anchored"] = anchored
 
-    # static_image hold 逻辑保留（A3b 触发后保持几帧）
-    if static_image_info["triggered"]:
+    # static_image hold 逻辑保留（A3b 触发后保持几帧，限制为 target-related 触发以防止背景误报 hold 泄露）
+    target_anchored_static_triggered = static_image_info["triggered"] and bool(motion.get("target_related", False))
+    if target_anchored_static_triggered:
         detector.static_image_hold_remaining = detector.static_image_hold_frames
         detector.static_image_hold_score = static_image_info["score"]
     elif detector.static_image_hold_remaining > 0:
@@ -535,6 +592,7 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
     alert_confirmed, attack_state_active = detector.alert_state.update(
         suspicious,
         frame_ts=alert_frame_ts,
+        intensity=float(fusion.get("p_adv", 0.0)),
     )
     detector.prev_gray = gray.detach()
     detector.prev_lbp = lbp.detach()

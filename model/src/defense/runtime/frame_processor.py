@@ -227,7 +227,6 @@ class FrameProcessor:
         )
         budget_ok = (
             bool(self.ppe_roi_redetect_enabled)
-            and (not realtime)
             and (not self.processing_history or avg_processing_ms <= target_frame_budget_ms * 0.85)
         )
         if display_options.get("show_boxes", True) and budget_ok:

@@ -14,7 +14,7 @@ import cv2
 from defense.visualization import encode_jpeg, render_preview
 from defense.web.overlay_timeline import interpolate_overlay
 
-from .config import normalize_custom_model_options, project_root, workspace_asset_roots, workspace_material_root, workspace_root
+from .config import normalize_custom_model_options, project_root, workspace_asset_roots, workspace_material_root, workspace_root, write_config_snapshot
 from .evidence import EvidenceSession
 from .frame_processor import FrameProcessor, prepare_frame_640, build_branch_cards, ProcessedFrame
 from .backend_pipeline import DetectionBus, FramePacket, PreviewBus
@@ -268,6 +268,15 @@ class MonitorEngine:
     displayed stream.
     """
 
+    def _overlay_timeline_maxlen(self) -> int:
+        """Dynamic timeline capacity based on expected runtime (2026-06-11 架构修复).
+
+        Base 1000 frames + 120 seconds at source fps = covers up to 2 minutes
+        for long runs at any typical frame rate.
+        """
+        src_fps = getattr(self, '_source_fps', 25.0)
+        return max(1000, int(src_fps * 120))
+
     def __init__(self, cache: PipelineCache) -> None:
         self.cache = cache
         self.lock = threading.Lock()
@@ -283,7 +292,7 @@ class MonitorEngine:
         self.latest_jpeg: bytes | None = None
         self.latest_jpeg_seq = 0
         self.preview_publish_times: deque[float] = deque(maxlen=60)
-        self.overlay_timeline: deque[dict[str, Any]] = deque(maxlen=1000)
+        self.overlay_timeline: deque[dict[str, Any]] = deque(maxlen=self._overlay_timeline_maxlen())
         self.overlay_seq = 0
         self.status: dict[str, Any] = self._empty_status()
         self.display_options: dict[str, bool] = {
@@ -1231,6 +1240,8 @@ class MonitorEngine:
                 max_frames_per_event=int(runtime_config.get("evidence_max_frames_per_event", 40)),
                 clip_fps=int(runtime_config.get("evidence_clip_fps", 6)),
             )
+            # Write config snapshot to evidence session dir (2026-06-11)
+            _cfg_snap_path = write_config_snapshot(runtime_config, evidence.session_dir)
             process_fps_cap = float(runtime_config.get("detector_process_fps_cap", runtime_config.get("process_fps_cap", 15)) or 15)
             target_frame_budget_ms = 1000.0 / max(1.0, min(self._source_fps, process_fps_cap))
             with self.condition:

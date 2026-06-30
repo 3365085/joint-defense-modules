@@ -496,3 +496,28 @@ def public_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         "light_flow_interval": module_a.get("light_flow_interval"),
         "static_image_interval": module_a.get("static_image_interval"),
     }
+
+
+def write_config_snapshot(config: dict[str, Any], target_dir: str | Path) -> Path:
+    """Write the full resolved config to a JSON snapshot in *target_dir*.
+
+    Returns the snapshot path.  Callers that don't have a *target_dir* yet
+    can skip this — the function is designed to be called once per
+    :meth:`MonitorEngine.start` after the evidence session is created.
+    """
+    snapshot = {"$schema": "runtime_config_snapshot", "config": _strip_large_arrays(config)}
+    target = Path(target_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    out = target / "config_snapshot.json"
+    out.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    return out
+
+
+def _strip_large_arrays(d: Any, max_items: int = 100) -> Any:
+    """Recursively truncate large lists/arrays to keep the snapshot readable."""
+    if isinstance(d, dict):
+        return {k: _strip_large_arrays(v, max_items) for k, v in d.items()}
+    if isinstance(d, (list, tuple)):
+        seq = [_strip_large_arrays(v, max_items) for v in d]
+        return seq[:max_items] if len(seq) > max_items else seq
+    return d

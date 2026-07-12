@@ -8,16 +8,19 @@ __pycache__/
 .pixi/
 
 # 运行时产物 / 证据 / 日志（写在源码树外，不入库）
-runtime/
-runtime_evidence/
-runs/
-reports/
-logs/
+# 用 /前缀锚定到仓库根，避免误伤 model/src/defense/runtime 等源码目录
+/runtime/
+/runtime_evidence/
+/runs/
+/reports/
+/logs/
+/model/runtime/
+/model/runs/
 *.log
 _smoke_result.txt
 
 # 大型本地素材 / 模型权重
-素材/
+/素材/
 *.pt
 *.onnx
 *.engine

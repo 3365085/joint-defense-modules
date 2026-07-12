@@ -79,6 +79,40 @@ def test_overlay_timeline_prefers_interpolation_between_records() -> None:
     assert selected["ppe_tracks"][0]["box"][0] == 30
 
 
+def test_overlay_interpolation_uses_nearest_discrete_alert_state() -> None:
+    timeline = OverlayTimeline()
+    first = _record(1, 10.00, x=10)
+    first.update(
+        {
+            "alert_confirmed": True,
+            "attack_detected": True,
+            "reason_codes": ["B_BLIND_GLARE_BLIND"],
+        }
+    )
+    second = _record(2, 10.20, x=50)
+    second.update(
+        {
+            "alert_confirmed": True,
+            "attack_detected": False,
+            "reason_codes": [],
+        }
+    )
+    timeline.push(first)
+    timeline.push(second)
+
+    selected = timeline.select(
+        10.16,
+        match_window_s=0.18,
+        interpolate_s=0.4,
+        hold_s=0.55,
+    )
+
+    assert selected is not None
+    assert selected.get("interpolated") is True
+    assert selected["attack_detected"] is False
+    assert selected["reason_codes"] == []
+
+
 def test_overlay_timeline_can_drop_unmatched_tracks_during_interpolation() -> None:
     timeline = OverlayTimeline()
     first = _record(1, 10.00, x=10)

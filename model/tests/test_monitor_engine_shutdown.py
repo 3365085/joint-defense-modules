@@ -8,6 +8,7 @@ import pytest
 
 from defense.runtime.frame_processor import ProcessedFrame
 from defense.runtime.backend_pipeline import FramePacket, PreviewBus
+from defense.runtime.overlay_records import preview_module_info_from_overlay
 from defense.runtime.pipeline_factory import PipelineCache
 from defense.runtime.runner import MonitorEngine
 
@@ -426,3 +427,212 @@ def test_file_preview_caps_held_overlay_to_reduce_stale_boxes() -> None:
     assert held is not None
     assert held["ppe_tracks"][0]["source"] == "held"
     assert engine._select_preview_overlay(10.42, 0) is None
+
+
+def test_backend_preview_uses_module_a_reason_when_a3b_is_none() -> None:
+    info = preview_module_info_from_overlay(
+        {
+            "p_adv": 0.42,
+            "alert_confirmed": True,
+            "attack_detected": True,
+            "attack_state_active": True,
+            "reason": "B_BLIND_GLARE_BLIND",
+            "reason_codes": ["B_BLIND_GLARE_BLIND"],
+            "a3b_triggered_source": "none",
+            "a3b_reason": "none",
+            "timing_ms": 12.5,
+        }
+    )
+
+    assert info["layer_triggered"] == "MODULE_A_PHYSICAL"
+    assert info["reason_codes"] == ["B_BLIND_GLARE_BLIND"]
+
+
+def test_backend_preview_normal_state_does_not_label_diagnostic_reason_as_layer() -> None:
+    info = preview_module_info_from_overlay(
+        {
+            "alert_confirmed": False,
+            "attack_detected": False,
+            "attack_state_active": False,
+            "reason_codes": ["a1_lbp_single"],
+        }
+    )
+
+    assert info["layer_triggered"] == "NORMAL"
+    assert info["reason_codes"] == ["a1_lbp_single"]
+    assert info["alert_display_held"] is False
+
+
+def test_backend_preview_labels_state_hold_with_last_reason() -> None:
+    engine = MonitorEngine(DummyCache())
+    engine.status.update(
+        {
+            "source_type": "file",
+            "realtime": True,
+            "overlay_match_window_ms": 180.0,
+            "overlay_hold_ms": 550.0,
+            "overlay_interpolate_ms": 400.0,
+            "overlay_max_age_ms": 950.0,
+        }
+    )
+    engine.overlay_timeline.extend(
+        [
+            {
+                "overlay_seq": 1,
+                "source_epoch": 0,
+                "video_time_s": 10.0,
+                "alert_confirmed": True,
+                "attack_detected": True,
+                "attack_state_active": True,
+                "reason_codes": ["B_BLIND_GLARE_BLIND"],
+                "ppe_tracks": [],
+            },
+            {
+                "overlay_seq": 2,
+                "source_epoch": 0,
+                "video_time_s": 10.1,
+                "alert_confirmed": True,
+                "attack_detected": False,
+                "attack_state_active": True,
+                "reason_codes": [],
+                "ppe_tracks": [],
+            },
+        ]
+    )
+
+    selected = engine._select_preview_overlay(10.1, 0)
+    assert selected is not None
+    info = preview_module_info_from_overlay(selected)
+    assert info["alert_display_held"] is True
+    assert info["attack_detected"] is False
+    assert info["alert_last_reason_codes"] == ["B_BLIND_GLARE_BLIND"]
+
+
+def test_backend_preview_labels_live_detection_before_scene_cut_as_timing_hold() -> None:
+    engine = MonitorEngine(DummyCache())
+    engine.status.update(
+        {
+            "source_type": "file",
+            "realtime": True,
+            "overlay_match_window_ms": 180.0,
+            "overlay_hold_ms": 550.0,
+            "overlay_interpolate_ms": 400.0,
+            "overlay_max_age_ms": 950.0,
+        }
+    )
+    engine.overlay_timeline.append(
+        {
+            "overlay_seq": 1,
+            "source_epoch": 0,
+            "frame_idx": 179,
+            "video_time_s": 5.972,
+            "alert_confirmed": True,
+            "attack_detected": True,
+            "attack_state_active": True,
+            "reason_codes": ["B_BLIND_GLARE_BLIND"],
+            "ppe_tracks": [],
+        }
+    )
+
+    selected = engine._select_preview_overlay(
+        6.006,
+        0,
+        display_frame_idx=180,
+        display_scene_cut_frame_idx=180,
+    )
+
+    assert selected is not None
+    info = preview_module_info_from_overlay(selected)
+    assert selected["alert_display_timing_held"] is True
+    assert info["alert_display_held"] is True
+    assert info["alert_last_reason_codes"] == ["B_BLIND_GLARE_BLIND"]
+
+
+def test_backend_preview_keeps_live_detection_without_scene_cut() -> None:
+    engine = MonitorEngine(DummyCache())
+    engine.status.update(
+        {
+            "source_type": "file",
+            "realtime": True,
+            "overlay_match_window_ms": 180.0,
+            "overlay_hold_ms": 550.0,
+            "overlay_interpolate_ms": 400.0,
+            "overlay_max_age_ms": 950.0,
+        }
+    )
+    engine.overlay_timeline.append(
+        {
+            "overlay_seq": 1,
+            "source_epoch": 0,
+            "frame_idx": 179,
+            "video_time_s": 5.972,
+            "alert_confirmed": True,
+            "attack_detected": True,
+            "attack_state_active": True,
+            "reason_codes": ["B_BLIND_GLARE_BLIND"],
+            "ppe_tracks": [],
+        }
+    )
+
+    selected = engine._select_preview_overlay(
+        6.006,
+        0,
+        display_frame_idx=180,
+    )
+
+    assert selected is not None
+    info = preview_module_info_from_overlay(selected)
+    assert selected["alert_display_timing_held"] is False
+    assert info["alert_display_held"] is False
+
+
+def test_backend_preview_labels_reasonless_pulse_inside_active_event_as_hold() -> None:
+    engine = MonitorEngine(DummyCache())
+    engine.status.update(
+        {
+            "source_type": "file",
+            "realtime": True,
+            "overlay_match_window_ms": 180.0,
+            "overlay_hold_ms": 550.0,
+            "overlay_interpolate_ms": 400.0,
+            "overlay_max_age_ms": 950.0,
+        }
+    )
+    engine.overlay_timeline.extend(
+        [
+            {
+                "overlay_seq": 1,
+                "source_epoch": 0,
+                "frame_idx": 179,
+                "video_time_s": 5.972,
+                "alert_confirmed": True,
+                "attack_detected": True,
+                "attack_state_active": True,
+                "reason_codes": ["B_BLIND_GLARE_BLIND"],
+                "ppe_tracks": [],
+            },
+            {
+                "overlay_seq": 2,
+                "source_epoch": 0,
+                "frame_idx": 192,
+                "video_time_s": 6.406,
+                "alert_confirmed": True,
+                "attack_detected": True,
+                "attack_state_active": True,
+                "reason_codes": [],
+                "ppe_tracks": [],
+            },
+        ]
+    )
+
+    selected = engine._select_preview_overlay(
+        6.406,
+        0,
+        display_frame_idx=192,
+        display_scene_cut_frame_idx=180,
+    )
+
+    assert selected is not None
+    info = preview_module_info_from_overlay(selected)
+    assert info["alert_display_held"] is True
+    assert info["alert_last_reason_codes"] == ["B_BLIND_GLARE_BLIND"]

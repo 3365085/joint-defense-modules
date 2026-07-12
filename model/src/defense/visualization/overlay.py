@@ -63,6 +63,32 @@ def _draw_texts_cn(
     frame[:] = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
 
+def _text_width(text: str, size: int) -> int:
+    try:
+        return int(round(float(_font(size).getlength(str(text)))))
+    except Exception:
+        return len(str(text)) * max(1, int(size) // 2)
+
+
+def _fit_text_for_width(text: str, max_width: int, size: int) -> str:
+    value = str(text)
+    if max_width <= 0 or _text_width(value, size) <= max_width:
+        return value
+    suffix = "..."
+    budget = max(0, int(max_width) - _text_width(suffix, size))
+    if budget <= 0:
+        return suffix
+    low = 0
+    high = len(value)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if _text_width(value[:mid], size) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    return f"{value[:low].rstrip()}{suffix}"
+
+
 def _reason_text(values: Any) -> str:
     labels = {
         "glare": "强光干扰",
@@ -73,6 +99,7 @@ def _reason_text(values: Any) -> str:
         "observed_window": "窗口观察触发",
         "single_strong": "单帧强触发",
         "bare_head_without_matched_helmet": "裸头未匹配安全帽",
+        "B_BLIND_GLARE_BLIND": "强光/眩光遮蔽",
     }
     if not values:
         return ""
@@ -95,24 +122,30 @@ def draw_hud(frame: np.ndarray, info: dict[str, Any], frame_idx: int, *, effecti
     p_adv_text = "N/A" if p_adv is None else f"{float(p_adv):.2f}"
     alert = bool(info.get("alert_confirmed", False))
     attack = bool(info.get("attack_detected", info.get("is_attack", False)))
+    held = bool(info.get("alert_display_held", False))
+    alert_color = (0, 165, 255) if held else (0, 0, 255)
 
     text_items = [
-        (f"帧 {frame_idx:05d} | 层 {layer} | 物理扰动={p_adv_text} | {timing:.1f}毫秒", (10, 7), (0, 0, 255), 18)
+        (f"帧 {frame_idx:05d} | 层 {layer} | 物理扰动={p_adv_text} | {timing:.1f}毫秒", (10, 7), alert_color, 18)
     ]
-    state = "告警确认" if alert else ("疑似异常" if attack else "监控中")
-    text_items.append((state, (10, 35), (0, 0, 255), 18))
+    state = "告警保持" if held else ("告警确认" if alert else ("疑似异常" if attack else "监控中"))
+    text_items.append((state, (10, 35), alert_color, 18))
 
     reason_codes = info.get("reason_codes") or info.get("details", {}).get("reason_codes") or []
-    if reason_codes:
+    last_reason_codes = info.get("alert_last_reason_codes") or []
+    if held and last_reason_codes:
+        text = f"上次原因：{_reason_text(last_reason_codes)}"
+        text_items.append((_fit_text_for_width(text, w - 20, 15), (10, 62), alert_color, 15))
+    elif reason_codes and (alert or attack or held):
         text = _reason_text(reason_codes)
-        text_items.append((text[:80], (10, 62), (0, 0, 255), 15))
+        text_items.append((_fit_text_for_width(text, w - 20, 15), (10, 62), alert_color, 15))
     elif effective:
-        text_items.append(("证据帧", (10, 62), (0, 0, 255), 15))
+        text_items.append(("证据帧", (10, 62), alert_color, 15))
     _draw_texts_cn(frame, text_items)
 
     if alert:
         thick = 2 if frame_idx % 2 == 0 else 1
-        cv2.rectangle(frame, (thick, thick), (w - thick, h - thick), (0, 0, 255), thick)
+        cv2.rectangle(frame, (thick, thick), (w - thick, h - thick), alert_color, thick)
     return frame
 
 
@@ -220,10 +253,10 @@ def draw_ppe_hud(frame: np.ndarray, ppe: dict[str, Any] | None) -> np.ndarray:
         f"时序增强={promoted_person_count}/{promoted_head_count}/{promoted_helmet_count} "
         f"未戴帽={int(ppe.get('missing_helmet_count', 0) or 0)}"
     )
-    text_items = [(text, (10, h - 62), color, 17)]
+    text_items = [(_fit_text_for_width(text, w - 20, 17), (10, h - 62), color, 17)]
     reason = str(ppe.get("reason", ""))[:90]
     if reason:
-        text_items.append((_reason_text(reason), (10, h - 32), color, 15))
+        text_items.append((_fit_text_for_width(_reason_text(reason), w - 20, 15), (10, h - 32), color, 15))
     _draw_texts_cn(frame, text_items)
     return frame
 

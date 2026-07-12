@@ -7,6 +7,10 @@ from typing import Any
 import cv2
 
 from defense.visualization import render_preview
+from defense.runtime.overlay_records import (
+    annotate_alert_display_context,
+    preview_module_info_from_overlay,
+)
 
 from .ppe_overlay_summary import load_ppe_overlay_records
 
@@ -54,14 +58,7 @@ def render_ppe_overlay_frame(
         target_shape=frame.shape,
         source_shape=_record_box_source_shape(record),
     )
-    info = {
-        "p_adv": record.get("p_adv"),
-        "alert_confirmed": bool(record.get("alert_confirmed")),
-        "attack_detected": bool(record.get("attack_detected")),
-        "timing_ms": float(record.get("timing_ms") or 0.0),
-        "layer_triggered": record.get("a3b_triggered_source") or "backend",
-        "reason_codes": [record.get("a3b_reason")] if record.get("a3b_reason") else [],
-    }
+    info = preview_module_info_from_overlay(record)
     ppe = {
         "warning": bool(record.get("ppe_warning")),
         "confirmed": bool(record.get("ppe_confirmed")),
@@ -193,9 +190,14 @@ def render_ppe_overlay_video(
                 active_frame = int(active_record.get("frame_idx") or 0)
                 if 0 <= current_frame - active_frame <= max(0, int(hold_frames)):
                     record = active_record
+            display_record = (
+                annotate_alert_display_context(record, records[:record_index])
+                if record is not None
+                else None
+            )
             rendered = render_ppe_overlay_frame(
                 frame,
-                record,
+                display_record,
                 display_options=display_options,
             )
             if record is not None:

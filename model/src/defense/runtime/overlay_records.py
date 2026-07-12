@@ -1,6 +1,128 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
+
+
+def _normalized_reason_codes(raw_reason_codes: Any) -> list[str]:
+    if isinstance(raw_reason_codes, str):
+        raw_reason_codes = [raw_reason_codes]
+    values = raw_reason_codes if isinstance(raw_reason_codes, (list, tuple, set)) else []
+    return [
+        str(code)
+        for code in values
+        if str(code or "").strip() and str(code).lower() != "none"
+    ]
+
+
+def _overlay_reason_codes(overlay: dict[str, Any]) -> list[str]:
+    reason_codes = _normalized_reason_codes(overlay.get("reason_codes"))
+    if not reason_codes:
+        reason = str(overlay.get("reason") or "").strip()
+        if reason and reason.lower() != "none":
+            reason_codes = [reason]
+    a3b_reason = str(overlay.get("a3b_reason") or "").strip()
+    if not reason_codes and a3b_reason and a3b_reason.lower() != "none":
+        reason_codes = [a3b_reason]
+    return reason_codes
+
+
+def _last_active_reason_codes(history: Iterable[dict[str, Any]]) -> list[str]:
+    for item in reversed(list(history)):
+        alert_active = bool(item.get("alert_confirmed") or item.get("attack_state_active"))
+        if not alert_active:
+            break
+        candidate = _overlay_reason_codes(item)
+        if candidate:
+            return candidate
+    return []
+
+
+def annotate_alert_display_context(
+    overlay: dict[str, Any],
+    history: Iterable[dict[str, Any]] = (),
+    *,
+    display_frame_idx: int | None = None,
+    display_scene_cut_frame_idx: int | None = None,
+) -> dict[str, Any]:
+    out = dict(overlay)
+    alert_active = bool(out.get("alert_confirmed") or out.get("attack_state_active"))
+    current_reason_codes = _overlay_reason_codes(out)
+    active_history_reason_codes = _last_active_reason_codes(history)
+    state_frame_idx = out.get("frame_idx")
+    timing_held = bool(
+        out.get("alert_display_timing_held")
+        or (
+            alert_active
+            and display_frame_idx is not None
+            and display_scene_cut_frame_idx is not None
+            and state_frame_idx is not None
+            and int(state_frame_idx) < int(display_scene_cut_frame_idx)
+            and int(display_scene_cut_frame_idx) <= int(display_frame_idx)
+        )
+    )
+    out["alert_display_timing_held"] = timing_held
+    reasonless_active_hold = bool(
+        alert_active
+        and bool(out.get("attack_detected"))
+        and not current_reason_codes
+        and active_history_reason_codes
+    )
+    alert_display_held = bool(
+        out.get("alert_display_held")
+        or (
+            alert_active
+            and (
+                not bool(out.get("attack_detected"))
+                or bool(out.get("held"))
+                or timing_held
+                or reasonless_active_hold
+            )
+        )
+    )
+    out["alert_display_held"] = alert_display_held
+    if not alert_display_held:
+        return out
+
+    last_reason_codes = _normalized_reason_codes(out.get("alert_last_reason_codes"))
+    if not last_reason_codes:
+        if current_reason_codes:
+            last_reason_codes = current_reason_codes
+    if not last_reason_codes:
+        last_reason_codes = active_history_reason_codes
+    out["alert_last_reason_codes"] = last_reason_codes
+    return out
+
+
+def preview_module_info_from_overlay(overlay: dict[str, Any]) -> dict[str, Any]:
+    context = annotate_alert_display_context(overlay)
+    reason_codes = _overlay_reason_codes(context)
+    last_reason_codes = _normalized_reason_codes(
+        context.get("alert_last_reason_codes")
+    )
+
+    a3b_source = str(context.get("a3b_triggered_source") or "").strip()
+    if a3b_source and a3b_source.lower() != "none":
+        layer = a3b_source
+    elif bool(
+        context.get("alert_confirmed")
+        or context.get("attack_detected")
+        or context.get("attack_state_active")
+    ):
+        layer = "MODULE_A_PHYSICAL"
+    else:
+        layer = "NORMAL"
+
+    return {
+        "p_adv": context.get("p_adv"),
+        "alert_confirmed": bool(context.get("alert_confirmed")),
+        "attack_detected": bool(context.get("attack_detected")),
+        "attack_state_active": bool(context.get("attack_state_active")),
+        "alert_display_held": bool(context.get("alert_display_held")),
+        "alert_last_reason_codes": last_reason_codes,
+        "timing_ms": float(context.get("timing_ms") or 0.0),
+        "layer_triggered": layer,
+        "reason_codes": reason_codes,
+    }
 
 
 def build_overlay_record(

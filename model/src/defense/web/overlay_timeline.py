@@ -52,7 +52,8 @@ def interpolate_overlay(
             clone["misses"] = round(_lerp(track.get("misses"), later.get("misses"), ratio))
             clone.setdefault("source", "tracked")
         tracks.append(clone)
-    out = dict(prev)
+    state_source = next_item if ratio >= 0.5 else prev
+    out = dict(state_source)
     out.update({"video_time_s": float(video_time_s), "ppe_tracks": tracks, "interpolated": True})
     return out
 

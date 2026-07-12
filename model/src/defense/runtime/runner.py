@@ -18,7 +18,11 @@ from .config import normalize_custom_model_options, project_root, workspace_asse
 from .evidence import EvidenceSession
 from .frame_processor import FrameProcessor, prepare_frame_640, build_branch_cards, ProcessedFrame
 from .backend_pipeline import DetectionBus, FramePacket, PreviewBus
-from .overlay_records import build_overlay_record
+from .overlay_records import (
+    annotate_alert_display_context,
+    build_overlay_record,
+    preview_module_info_from_overlay,
+)
 from .pipeline_factory import PipelineCache
 
 
@@ -257,6 +261,19 @@ def scan_camera_devices(max_index: int = 8) -> list[dict[str, Any]]:
             if cap is not None:
                 cap.release()
     return devices
+
+
+def _is_preview_scene_cut(previous_frame: Any, frame: Any) -> bool:
+    if previous_frame is None or frame is None:
+        return False
+    if previous_frame.shape[:2] != frame.shape[:2]:
+        return True
+    previous_gray = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
+    current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    previous_small = cv2.resize(previous_gray, (64, 64), interpolation=cv2.INTER_AREA)
+    current_small = cv2.resize(current_gray, (64, 64), interpolation=cv2.INTER_AREA)
+    diff = cv2.absdiff(previous_small, current_small)
+    return bool(float(diff.mean()) >= 45.0 and float((diff >= 25).mean()) >= 0.65)
 
 
 class MonitorEngine:
@@ -1000,6 +1017,9 @@ class MonitorEngine:
         playback_anchor_frame = 0.0
         playback_clock_speed = 1.0
         playback_was_paused = False
+        temporal_previous_frame = None
+        temporal_previous_frame_idx: int | None = None
+        temporal_previous_source_time_s: float | None = None
         try:
             cap = open_capture(source_type, source)
             fps, duration_s, frame_count = self._read_capture_meta(cap)
@@ -1051,6 +1071,9 @@ class MonitorEngine:
                     playback_anchor_frame = next_read_frame
                     playback_clock_speed = speed
                     playback_was_paused = False
+                    temporal_previous_frame = None
+                    temporal_previous_frame_idx = None
+                    temporal_previous_source_time_s = None
                     with self.condition:
                         if run_id == self.run_id:
                             self.status["source_epoch"] = current_epoch
@@ -1089,6 +1112,9 @@ class MonitorEngine:
                             pass
                         cap = open_capture(source_type, source)
                         last_frame_seen = time.perf_counter()
+                        temporal_previous_frame = None
+                        temporal_previous_frame_idx = None
+                        temporal_previous_source_time_s = None
                     time.sleep(0.03)
                     if source_type != "file":
                         continue
@@ -1101,10 +1127,17 @@ class MonitorEngine:
                 frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or packet_seq + 1)
                 if source_time_s <= 0.0 and fps > 0:
                     source_time_s = max(0, frame_idx - 1) / fps
+                current_frame_idx = max(0, frame_idx - 1)
+                temporal_predecessor_valid = bool(
+                    temporal_previous_frame is not None
+                    and temporal_previous_frame_idx is not None
+                    and current_frame_idx == temporal_previous_frame_idx + 1
+                    and temporal_previous_frame.shape[:2] == frame.shape[:2]
+                )
                 packet_seq += 1
                 packet = FramePacket(
                     seq=packet_seq,
-                    frame_idx=max(0, frame_idx - 1),
+                    frame_idx=current_frame_idx,
                     source_time_s=max(0.0, source_time_s),
                     wall_time_ms=time.time() * 1000.0,
                     epoch=current_epoch,
@@ -1116,8 +1149,19 @@ class MonitorEngine:
                         "original_width": int(original_w),
                         "original_height": int(original_h),
                         "capture_resized": bool(capture_resized),
+                        "temporal_predecessor_available": temporal_predecessor_valid,
                     },
+                    previous_frame=temporal_previous_frame if temporal_predecessor_valid else None,
+                    previous_frame_idx=(
+                        temporal_previous_frame_idx if temporal_predecessor_valid else None
+                    ),
+                    previous_source_time_s=(
+                        temporal_previous_source_time_s if temporal_predecessor_valid else None
+                    ),
                 )
+                temporal_previous_frame = frame
+                temporal_previous_frame_idx = current_frame_idx
+                temporal_previous_source_time_s = max(0.0, source_time_s)
                 preview_bus.publish(packet)
                 now = time.perf_counter()
                 if now - last_detection_push >= detect_interval:
@@ -1149,9 +1193,32 @@ class MonitorEngine:
                     next_index = int(round(next_read_frame))
                     current_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (packet.frame_idx + 1))
                     skip_count = max(0, next_index - current_index)
+                    grabbed = 0
                     for _ in range(min(skip_count, 120)):
                         if not cap.grab():
                             break
+                        grabbed += 1
+                    if grabbed > 0:
+                        retrieved, skipped_frame = cap.retrieve()
+                        if retrieved and skipped_frame is not None:
+                            skipped_frame, _ = self._resize_capture_frame(
+                                skipped_frame,
+                                int(capture_max_side),
+                            )
+                            skipped_idx = max(
+                                0,
+                                int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0) - 1,
+                            )
+                            skipped_time_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+                            if skipped_time_s <= 0.0 and fps > 0:
+                                skipped_time_s = skipped_idx / fps
+                            temporal_previous_frame = skipped_frame
+                            temporal_previous_frame_idx = skipped_idx
+                            temporal_previous_source_time_s = max(0.0, skipped_time_s)
+                        else:
+                            temporal_previous_frame = None
+                            temporal_previous_frame_idx = None
+                            temporal_previous_source_time_s = None
                 if source_type == "file" and realtime:
                     elapsed = time.perf_counter() - loop_started
                     wait_s = max(0.0, (frame_period / speed) - elapsed)
@@ -1301,6 +1368,9 @@ class MonitorEngine:
                     feature_options=feature_options,
                     custom_model=custom_model,
                     target_frame_budget_ms=target_frame_budget_ms,
+                    temporal_previous_frame=packet.previous_frame,
+                    temporal_previous_frame_idx=packet.previous_frame_idx,
+                    temporal_previous_source_time_s=packet.previous_source_time_s,
                 )
                 self._after_processed(
                     run_id,
@@ -1341,6 +1411,9 @@ class MonitorEngine:
     def _preview_render_loop(self, run_id: int, preview_bus: PreviewBus, preview_render_fps: float) -> None:
         interval = 1.0 / max(1.0, float(preview_render_fps or 25.0))
         last_seq = 0
+        scene_cut_frame_idx: int | None = None
+        scene_cut_epoch: int | None = None
+        previous_display_frame = None
         while run_id == self.run_id and not self.stop_event.is_set():
             started = time.perf_counter()
             packet = preview_bus.wait_for_frame(last_seq, timeout=interval)
@@ -1351,6 +1424,13 @@ class MonitorEngine:
             if packet.seq <= last_seq:
                 continue
             last_seq = packet.seq
+            if scene_cut_epoch != packet.epoch:
+                scene_cut_epoch = packet.epoch
+                scene_cut_frame_idx = None
+                previous_display_frame = None
+            if _is_preview_scene_cut(previous_display_frame, packet.frame):
+                scene_cut_frame_idx = packet.frame_idx
+            previous_display_frame = packet.frame
             with self.condition:
                 waiting_for_first_file_detection = (
                     str(self.status.get("source_type") or "").lower() == "file"
@@ -1362,7 +1442,12 @@ class MonitorEngine:
                 time.sleep(min(interval, 0.03))
                 continue
             try:
-                overlay = self._select_preview_overlay(packet.source_time_s, packet.epoch)
+                overlay = self._select_preview_overlay(
+                    packet.source_time_s,
+                    packet.epoch,
+                    display_frame_idx=packet.frame_idx,
+                    display_scene_cut_frame_idx=scene_cut_frame_idx,
+                )
                 rendered = self._render_backend_preview(packet, overlay)
                 self._publish_preview(encode_jpeg(rendered, quality=82), run_id)
             except BaseException as exc:
@@ -1372,7 +1457,14 @@ class MonitorEngine:
             if elapsed < interval:
                 time.sleep(interval - elapsed)
 
-    def _select_preview_overlay(self, source_time_s: float, epoch: int) -> dict[str, Any] | None:
+    def _select_preview_overlay(
+        self,
+        source_time_s: float,
+        epoch: int,
+        *,
+        display_frame_idx: int | None = None,
+        display_scene_cut_frame_idx: int | None = None,
+    ) -> dict[str, Any] | None:
         with self.lock:
             records = [
                 dict(item)
@@ -1430,11 +1522,23 @@ class MonitorEngine:
                 )
                 if mixed is not None:
                     mixed["overlay_display_source"] = "interpolated"
+                    mixed = annotate_alert_display_context(
+                        mixed,
+                        records,
+                        display_frame_idx=display_frame_idx,
+                        display_scene_cut_frame_idx=display_scene_cut_frame_idx,
+                    )
                     self._preview_last_overlay = mixed
                     return mixed
         nearest = min(records, key=lambda item: abs(float(item.get("video_time_s") or 0.0) - source_time_s))
         if abs(float(nearest.get("video_time_s") or 0.0) - source_time_s) <= match_s:
             nearest["overlay_display_source"] = "nearest"
+            nearest = annotate_alert_display_context(
+                nearest,
+                records,
+                display_frame_idx=display_frame_idx,
+                display_scene_cut_frame_idx=display_scene_cut_frame_idx,
+            )
             self._preview_last_overlay = nearest
             return nearest
         held = self._preview_last_overlay
@@ -1454,7 +1558,12 @@ class MonitorEngine:
                     clone["source"] = "held"
                     tracks.append(clone)
                 out["ppe_tracks"] = tracks
-                return out
+                return annotate_alert_display_context(
+                    out,
+                    records,
+                    display_frame_idx=display_frame_idx,
+                    display_scene_cut_frame_idx=display_scene_cut_frame_idx,
+                )
         return None
 
     def _render_backend_preview(self, packet: FramePacket, overlay: dict[str, Any] | None) -> Any:
@@ -1475,8 +1584,7 @@ class MonitorEngine:
             if packet.epoch == self.status.get("source_epoch"):
                 self.status["preview_width"] = int(width)
                 self.status["preview_height"] = int(height)
-        if overlay is None:
-            return display_frame
+        overlay = overlay or {}
         scaled_tracks = []
         for track in overlay.get("ppe_tracks", []) or []:
             box = track.get("box") or []
@@ -1490,14 +1598,7 @@ class MonitorEngine:
                 float(box[3]) * height / 640.0,
             ]
             scaled_tracks.append(copy)
-        info = {
-            "p_adv": overlay.get("p_adv"),
-            "alert_confirmed": bool(overlay.get("alert_confirmed")),
-            "attack_detected": bool(overlay.get("attack_detected")),
-            "timing_ms": float(overlay.get("timing_ms") or 0.0),
-            "layer_triggered": overlay.get("a3b_triggered_source") or "backend",
-            "reason_codes": [overlay.get("a3b_reason")] if overlay.get("a3b_reason") else [],
-        }
+        info = preview_module_info_from_overlay(overlay)
         ppe = {
             "warning": bool(overlay.get("ppe_warning")),
             "confirmed": bool(overlay.get("ppe_confirmed")),

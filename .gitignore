@@ -1,0 +1,30 @@
+# Python 缓存/编译产物
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Pixi 环境
+.pixi/
+
+# 运行时产物 / 证据 / 日志（写在源码树外，不入库）
+runtime/
+runtime_evidence/
+runs/
+reports/
+logs/
+*.log
+_smoke_result.txt
+
+# 大型本地素材 / 模型权重
+素材/
+*.pt
+*.onnx
+*.engine
+
+# 嵌套独立仓库（有自己的 .git，主仓不追踪）
+rebuilt_demo/
+
+# 密钥
+*.env
+.stock_keys.env

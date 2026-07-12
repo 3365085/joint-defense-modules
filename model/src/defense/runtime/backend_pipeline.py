@@ -20,6 +20,9 @@ class FramePacket:
     height: int
     fps: float
     flags: dict[str, Any]
+    previous_frame: np.ndarray | None = None
+    previous_frame_idx: int | None = None
+    previous_source_time_s: float | None = None
 
 
 class PreviewBus:

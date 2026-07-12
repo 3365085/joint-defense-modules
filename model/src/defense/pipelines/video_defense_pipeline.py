@@ -464,6 +464,65 @@ class VideoDefensePipeline:
         self.frame_idx += 1
         return frame_640, detections, info, total_timing_ms, module_a_timing_ms
 
+    def _inject_temporal_previous_frame(self, previous_frame: Any | None) -> bool:
+        """Prime A2/A3 with the source frame immediately before the current frame."""
+        if previous_frame is None:
+            return False
+        try:
+            if previous_frame.shape[0] == 640 and previous_frame.shape[1] == 640:
+                previous_640 = previous_frame
+            else:
+                previous_640 = cv2.resize(previous_frame, (640, 640))
+            previous_gray = (
+                previous_640.astype(np.uint8)
+                if previous_640.ndim == 2
+                else cv2.cvtColor(previous_640, cv2.COLOR_BGR2GRAY)
+            )
+            compute_lbp = getattr(self.detector, "_compute_lbp", None)
+            if not callable(compute_lbp) or not hasattr(self.detector, "prev_gray"):
+                return False
+            self.detector.prev_gray = previous_gray
+            self.detector.prev_lbp = compute_lbp(previous_gray)
+            return True
+        except Exception:
+            return False
+
+    def process_runtime_frame(
+        self,
+        frame: Any,
+        *,
+        timestamp: float,
+        previous_frame: Any | None = None,
+        current_source_frame_idx: int | None = None,
+        previous_source_frame_idx: int | None = None,
+        previous_source_time_s: float | None = None,
+    ) -> tuple[np.ndarray, Any, dict[str, Any]]:
+        """Runtime entry point with source time and strict temporal predecessor."""
+        temporal_previous_applied = self._inject_temporal_previous_frame(previous_frame)
+        frame_640, detections, info, _, _ = self._run_detection(
+            frame,
+            timestamp=float(timestamp),
+        )
+        gap_frames = None
+        if current_source_frame_idx is not None and previous_source_frame_idx is not None:
+            gap_frames = int(current_source_frame_idx) - int(previous_source_frame_idx)
+        info["temporal_input"] = {
+            "previous_frame_applied": bool(temporal_previous_applied),
+            "current_source_frame_idx": (
+                int(current_source_frame_idx) if current_source_frame_idx is not None else None
+            ),
+            "previous_source_frame_idx": (
+                int(previous_source_frame_idx) if previous_source_frame_idx is not None else None
+            ),
+            "source_gap_frames": gap_frames,
+            "strict_source_predecessor": bool(temporal_previous_applied and gap_frames == 1),
+            "current_source_time_s": float(timestamp),
+            "previous_source_time_s": (
+                float(previous_source_time_s) if previous_source_time_s is not None else None
+            ),
+        }
+        return frame_640, detections, info
+
     # ------------------------------------------------------------------ offline
 
     def process_frame(self, frame):

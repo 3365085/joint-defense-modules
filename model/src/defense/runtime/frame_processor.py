@@ -213,10 +213,24 @@ class FrameProcessor:
         feature_options: dict[str, Any],
         custom_model: dict[str, Any],
         target_frame_budget_ms: float,
+        temporal_previous_frame: np.ndarray | None = None,
+        temporal_previous_frame_idx: int | None = None,
+        temporal_previous_source_time_s: float | None = None,
     ) -> ProcessedFrame:
         started = time.perf_counter()
         frame_640 = prepare_frame_640(frame)
-        _, detections, info = self.pipeline.process_frame(frame_640)
+        process_runtime_frame = getattr(self.pipeline, "process_runtime_frame", None)
+        if callable(process_runtime_frame):
+            _, detections, info = process_runtime_frame(
+                frame_640,
+                timestamp=float(video_time_s),
+                previous_frame=temporal_previous_frame,
+                current_source_frame_idx=int(frame_idx),
+                previous_source_frame_idx=temporal_previous_frame_idx,
+                previous_source_time_s=temporal_previous_source_time_s,
+            )
+        else:
+            _, detections, info = self.pipeline.process_frame(frame_640)
         static_media = dict(_static_media_details(info))
         redetect_ms = 0.0
         redetect_count = 0
@@ -335,6 +349,7 @@ class FrameProcessor:
         static_media = dict(_static_media_details(info))
         static_media["source_path"] = source
         latency = info.get("latency_breakdown", {}) if isinstance(info.get("latency_breakdown"), dict) else {}
+        temporal_input = info.get("temporal_input", {}) if isinstance(info.get("temporal_input"), dict) else {}
         module_breakdown = latency.get("module_a_breakdown", {}) if isinstance(latency.get("module_a_breakdown"), dict) else {}
         p_adv = info.get("p_adv")
         a3b_soft = self.a3b_soft.update(static_media)
@@ -417,6 +432,12 @@ class FrameProcessor:
             "detector_change_score": _float(latency.get("detector_change_score")),
             "source_frame_shape": latency.get("source_frame_shape", []),
             "detector_frame_shape": latency.get("detector_frame_shape", []),
+            "temporal_input": dict(temporal_input),
+            "temporal_previous_frame_applied": bool(temporal_input.get("previous_frame_applied", False)),
+            "temporal_strict_source_predecessor": bool(
+                temporal_input.get("strict_source_predecessor", False)
+            ),
+            "temporal_source_gap_frames": temporal_input.get("source_gap_frames"),
             "p_adv": None if p_adv is None else _float(p_adv),
             "p_adv_display": _float(info.get("p_adv_display", p_adv or 0.0)),
             "p_adv_missing_reason": str(info.get("p_adv_missing_reason", "")),

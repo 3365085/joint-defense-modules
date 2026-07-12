@@ -281,6 +281,7 @@ class ModuleADetector:
         self.process_fps = 15.0
         self.adv_hits: deque[int] = deque(maxlen=self.max_history)
         self.adv_scores: deque[float] = deque(maxlen=self.max_history)
+        self.adv_support_hits: deque[int] = deque(maxlen=self.max_history)
         self.media_hits: deque[int] = deque(maxlen=self.max_history)
         self.media_scores: deque[float] = deque(maxlen=self.max_history)
         # 支路B 时序确认窗口（与 adv 同机制）
@@ -292,6 +293,58 @@ class ModuleADetector:
         self._alert_hold_frames = int(module_config.get("rebuilt_alert_hold_frames", 12))
         self._alert_hold_remaining = 0
         self._alert_hold_channel = "none"
+        # 候选连续性桥接(2026-06-30 修 adv_patch 漏报):抑制门在持续高 p_adv 段偶发翻假会把连续
+        # 候选打散,N-of-M 确认失败。近 K 帧内有过被放行的 adv 候选且本帧 p_adv 仍触发时,即便本帧
+        # adv_candidate_allowed 翻假也桥接为候选。config rebuilt_adv_candidate_bridge_frames(默认4=当前口径)。
+        self._adv_cand_bridge_frames = int(module_config.get("rebuilt_adv_candidate_bridge_frames", 4))
+        self._adv_cand_bridge_remaining = 0
+        # C1(2026-06-30 修 016 多人交叉干净误报的"基线冻结跑飞"): A1 单支饱和的未确认候选不冻结
+        # 场景基线,让基线学到本场景纹理常态→z-score 抑制恢复;带 A2/A3 佐证的候选(真实结构/致盲攻击)
+        # 仍冻结,不影响攻击检出。config rebuilt_scene_baseline_a1only_carveout(默认开)。
+        self._sb_a1only_carveout = bool(module_config.get("rebuilt_scene_baseline_a1only_carveout", True))
+        self._sb_carveout_a2 = float(module_config.get("rebuilt_scene_baseline_carveout_a2", 0.5))
+        self._sb_carveout_a3 = float(module_config.get("rebuilt_scene_baseline_carveout_a3", 0.5))
+        # 持续对抗升级(2026-07-09 起; 2026-06-30 改场景自适应+fps归一化): 物理补丁持续存在时,场景
+        # 自适应基线会把"持续高纹理"逐步学成本场景常态(z<2)→scene_baseline_normal 长期为真→逐帧
+        # adv_candidate_allowed 被否, 候选被打散, N-of-M 只覆盖极少数帧(实测 400 帧仅 ~28 确认)。
+        #
+        # 判别真实攻击 vs 干净突刺不再用"固定100窗/68帧"硬阈(那两个数是从当前 heldout 反推的,
+        # 干净峰值60 vs 需求68 仅8帧余量→过拟合、且随 fps 变化). 改为两个物理/自适应判据:
+        #   (a) 时间持续下限 floor = round(process_fps * sustained_seconds): 真实物理补丁攻击会
+        #       持续 >~2s, 干净的运动/纹理突刺更短; process_fps 归一化→25/30/60fps 通用。
+        #   (b) 场景自身的良性突发尺度 _benign_run_ref: 记录本场景"未升级即结束"的最长连续
+        #       高 p_adv 段(带慢衰减). 升级要求当前连续段 >= run_mult * _benign_run_ref, 即让
+        #       天然长突发的场景自抬门槛(更少误报), 突发短的场景仍由时间下限兜底。
+        # 升级判据: _adv_run(当前连续高 p_adv 帧数, 容忍1帧间隙) >= floor 且 >= run_mult*ref 时,
+        # 直接升级为 adv 确认(绕过逐帧 adv_candidate_allowed), **不整体削弱**该门。config-gated, 默认开。
+        # require_target 默认关: adv_patch 攻击段前半(帧30-129) target_related 为 0(YOLO 在补丁下
+        # 丢目标)但原始 p_adv 触发~100%; 要求 target 会把升级腰斩; 作为出现干净误报时的收紧旋钮保留。
+        self._sustained_adv_enabled = bool(module_config.get("rebuilt_sustained_adv_escalation", True))
+        # 时间持续下限(秒): 物理补丁攻击持续先验 ~2s。floor = round(process_fps * seconds)。
+        self._sustained_adv_seconds = float(module_config.get("rebuilt_sustained_adv_seconds", 2.0))
+        # 相对本场景良性突发尺度的倍率门槛。
+        self._sustained_adv_run_mult = float(module_config.get("rebuilt_sustained_adv_run_mult", 1.6))
+        # 良性突发参考的慢衰减(每次良性段结束时: ref = max(run_len, ref*decay))。
+        self._sustained_adv_benign_decay = float(module_config.get("rebuilt_sustained_adv_benign_decay", 0.9))
+        self._sustained_adv_require_target = bool(
+            module_config.get("rebuilt_sustained_adv_require_target", False)
+        )
+        # 持续升级只应救援"被场景自适应基线打散的真实候选", 不应把"无目标纯静止背景"的
+        # XGBoost 纹理伪高分(合成补丁贴在空地板/纯背景, p_adv 虚高但逐帧门已判 pure_static_background /
+        # background_*_suppressed 且无 target_related)也累计成持续段→凭空升级成确认(2026-07-09 用户在
+        # adv_patch 空场景抽帧发现: 全程无人却帧帧 ATTACK)。开启后: 无目标背景静止抑制帧不计入 _adv_run,
+        # 持续升级只在真正有攻击证据(目标相关/运动/结构)的连续段上生效。config-gated, 默认开。
+        self._sustained_adv_exclude_static_bg = bool(
+            module_config.get("rebuilt_sustained_adv_exclude_static_bg", True)
+        )
+        # 已弃用的固定窗口/占比(保留读取以兼容旧 config, 逻辑不再依赖)。
+        self._sustained_adv_window = int(module_config.get("rebuilt_sustained_adv_window", 100))
+        self._sustained_adv_ratio = float(module_config.get("rebuilt_sustained_adv_ratio", 0.68))
+        # 自适应运行态: 当前连续高 p_adv 段长度 / 已用间隙容忍 / 本段是否已升级 / 场景良性突发参考。
+        self._adv_run = 0
+        self._adv_run_gap = 0
+        self._adv_run_escalated = False
+        self._benign_run_ref = 0.0
         # 场景自适应基线：近 N 帧的 清晰度/对比度/YOLO置信度强度/最大特征分（攻击候选时冻结更新）
         self._sb_sharp: deque[float] = deque(maxlen=self._scene_baseline_window)
         self._sb_contrast: deque[float] = deque(maxlen=self._scene_baseline_window)
@@ -344,12 +397,18 @@ class ModuleADetector:
         self.process_fps = 15.0
         self.adv_hits.clear()
         self.adv_scores.clear()
+        self.adv_support_hits.clear()
         self.media_hits.clear()
         self.media_scores.clear()
         self.blind_hits.clear()
         self.blind_scores.clear()
         self._alert_hold_remaining = 0
         self._alert_hold_channel = "none"
+        self._adv_cand_bridge_remaining = 0
+        self._adv_run = 0
+        self._adv_run_gap = 0
+        self._adv_run_escalated = False
+        self._benign_run_ref = 0.0
         self._sb_sharp.clear()
         self._sb_contrast.clear()
         self._sb_detstr.clear()
@@ -1687,6 +1746,19 @@ class ModuleADetector:
             blind_type = "motion_blur"
         else:
             blind_type = "visibility"
+
+        # Normal camera/worker motion can drop sharpness and detector strength
+        # together for a short burst. Treat that as a motion artifact unless the
+        # frame also carries attack-like exposure evidence. This keeps Branch B
+        # focused on blinding/flash attacks instead of ordinary panning blur.
+        if (
+            blind_type == "motion_blur"
+            and float(exposure.get("frame_diff_global", 0.0)) >= 0.080
+            and float(exposure.get("exposure_delta", 0.0)) < 0.020
+            and glare_blind < 0.30
+        ):
+            p_blind = min(p_blind, 0.40)
+            blind_type = "motion_blur_scene_motion"
 
         return {
             "p_blind": float(p_blind),
@@ -3072,6 +3144,7 @@ class ModuleADetector:
             and not robust_media_evidence
             and not adv_multi_evidence_rescue
         )
+        structural_adv_evidence_rescue = False
         ta_suspicious = bool(ta_result["suspicious"]) if ta_result is not None else True
         ta_classifier_bonus = bool(ta_result.get("classifier_bonus", False)) if ta_result is not None else False
         # 场景自适应基线抑制（P0）：用 z-score 对**运动场景也生效**，压制干净高能工地场景误报。
@@ -3093,10 +3166,11 @@ class ModuleADetector:
             scene_baseline_normal = bool(
                 (static_normal or moving_normal)
                 and not adv_multi_evidence_rescue
+                and not structural_adv_evidence_rescue
                 and not visibility_texture_rescue
             )
         adv_candidate_allowed = bool(
-            a4["p_adv"] >= self.theta_adv
+            (a4["p_adv"] >= self.theta_adv or structural_adv_evidence_rescue)
             and (max_feature >= 0.48 or adv_multi_evidence_rescue or visibility_texture_rescue)
             and (
                 target_related_feature
@@ -3125,6 +3199,38 @@ class ModuleADetector:
             and not normal_motion_texture_change
         )
         adv_single_frame_candidate = bool(a4["p_adv_triggered"] and adv_candidate_allowed)
+        adv_physical_support = bool(
+            target_related_feature
+            and (
+                (
+                    float(a1["a1_feature_score"]) >= 0.78
+                    and float(a1.get("delta_h_roi_patch_max", 0.0)) >= 0.55
+                    and float(a1.get("delta_h_patch_concentration", 0.0)) >= 0.70
+                )
+                or float(a2["a2_feature_score"]) >= 0.55
+                or float(a3["a3_feature_score"]) >= 0.65
+                or (
+                    float(a4.get("a4_multi_evidence", 0.0)) >= 0.60
+                    and max_feature >= 0.60
+                )
+                or visibility_texture_rescue
+                or a3_residual_fallback
+            )
+        )
+        # 候选连续性桥接(2026-06-30 修 adv_patch 漏报,见 docs/技术.算法/2026-06-30-adv_patch召回根因-*)：
+        # 抑制门在持续高 p_adv 段偶发翻假会把连续候选打散,使 N-of-M 确认失败。近 K 帧内有过被放行的
+        # adv 候选、且本帧 p_adv 仍触发时,即便本帧 adv_candidate_allowed 翻假也桥接为候选。默认关(K=0)。
+        adv_candidate_bridged = False
+        if adv_single_frame_candidate:
+            self._adv_cand_bridge_remaining = self._adv_cand_bridge_frames
+        elif (
+            self._adv_cand_bridge_frames > 0
+            and self._adv_cand_bridge_remaining > 0
+            and bool(a4["p_adv_triggered"])
+        ):
+            self._adv_cand_bridge_remaining -= 1
+            adv_single_frame_candidate = True
+            adv_candidate_bridged = True
         # 支路B 致盲候选：p_blind 触发即候选（_compute_blinding 内部已做"曾有目标+退化"门控）
         blind_single_frame_candidate = bool(blinding.get("p_blind_triggered", False))
         # A3b is disabled as independent trigger — background structures (walls, doorways)
@@ -3135,9 +3241,11 @@ class ModuleADetector:
         if adv_single_frame_candidate:
             self.adv_hits.append(1)
             self.adv_scores.append(float(a4["p_adv"]))
+            self.adv_support_hits.append(1 if adv_physical_support else 0)
         else:
             self.adv_hits.append(0)
             self.adv_scores.append(0.0)
+            self.adv_support_hits.append(0)
         if blind_single_frame_candidate:
             self.blind_hits.append(1)
             self.blind_scores.append(float(blinding.get("p_blind", 0.0)))
@@ -3151,9 +3259,10 @@ class ModuleADetector:
             self.media_hits.append(0)
             self.media_scores.append(0.0)
         adv_count = sum(list(self.adv_hits)[-window_frames:])
+        adv_support_count = sum(list(self.adv_support_hits)[-window_frames:])
         media_count = sum(list(self.media_hits)[-window_frames:])
         blind_count = sum(list(self.blind_hits)[-window_frames:])
-        adv_confirmed = bool(adv_count >= adv_hit_required)
+        adv_confirmed = bool(adv_count >= adv_hit_required and adv_support_count >= 1)
         media_confirmed = bool(media_count >= media_hit_required)
         # 支路B 确认：致盲攻击持续多帧（与高误报场景一致用更高占比），需曾有目标语境
         blind_hit_required = int(math.ceil(window_frames * (0.67 if exposure["high_false_positive_scene"] else 0.60)))
@@ -3184,6 +3293,54 @@ class ModuleADetector:
             and not robust_media_evidence
         )
 
+        # --- 持续对抗升级(场景自适应 + fps归一化, 2026-06-30 重写): 见 __init__ 注释 ---
+        # 追踪原始 p_adv>=theta_adv 的**当前连续段长度** _adv_run(每帧都算, 即使本帧
+        # adv_candidate_allowed 被 scene_baseline_normal 等否决——这正是捕获"持续攻击"的关键)。
+        # 容忍段内 1 帧掉落(补丁下偶发翻假), 掉落 2 帧则视为段结束。段结束且从未升级时, 把该段
+        # 长度学入 _benign_run_ref(本场景良性突发尺度, 带慢衰减); 已升级的段不污染参考(冻结)。
+        raw_adv_trigger = bool(float(a4["p_adv"]) >= self.theta_adv)
+        # 无目标纯背景静止帧(pure_static_background 及 background_*_suppressed 家族, 且无 target_related):
+        # p_adv 高属 XGBoost 对静止纹理的伪响应, 逐帧门已否决其为候选; 不计入持续段, 防止凭空升级。
+        adv_static_bg_no_evidence = bool(
+            self._sustained_adv_exclude_static_bg
+            and not target_related_feature
+            and bool(a3b.get("p_media_background_static_suppressed", False))
+        )
+        sustained_hit = bool(
+            raw_adv_trigger
+            and (target_related_feature or not self._sustained_adv_require_target)
+            and not adv_static_bg_no_evidence
+            and adv_physical_support
+        )
+        if sustained_hit:
+            self._adv_run += 1
+            self._adv_run_gap = 0
+        elif self._adv_run > 0 and self._adv_run_gap < 1:
+            # 段内容忍单帧间隙: 保持不增长, 不结束。
+            self._adv_run_gap += 1
+        else:
+            # 段结束: 未升级的良性段更新场景良性突发参考(慢衰减取 max)。
+            if self._adv_run > 0 and not self._adv_run_escalated:
+                self._benign_run_ref = max(
+                    float(self._adv_run),
+                    self._benign_run_ref * self._sustained_adv_benign_decay,
+                )
+            self._adv_run = 0
+            self._adv_run_gap = 0
+            self._adv_run_escalated = False
+        # 时间下限(帧) = round(process_fps * sustained_seconds); fps 归一化, 物理持续先验。
+        sustained_adv_floor = int(max(1, round(float(self.process_fps) * self._sustained_adv_seconds)))
+        # 场景自适应门槛 = run_mult * 本场景良性突发尺度。
+        sustained_adv_run_bar = float(self._sustained_adv_run_mult) * float(self._benign_run_ref)
+        sustained_adv_escalated = bool(
+            self._sustained_adv_enabled
+            and self._adv_run >= sustained_adv_floor
+            and float(self._adv_run) >= sustained_adv_run_bar
+        )
+        if sustained_adv_escalated:
+            # 标记本段已升级 → 段结束时不污染良性突发参考(冻结)。
+            self._adv_run_escalated = True
+
         global_suppressed = False
         global_suppressed_reason = "none"
         alert_confirmed = False
@@ -3210,6 +3367,12 @@ class ModuleADetector:
         elif blind_confirmed and not global_suppressed:
             alert_confirmed = True
             primary_channel = "blind"
+
+        # 持续对抗升级: 逐帧候选被 scene_baseline_normal 打散、上面各支未确认时, 若长窗内原始
+        # p_adv 持续占优则强制升级为 adv 确认(绕过逐帧门, 不改动 adv_candidate_allowed 本身)。
+        if not alert_confirmed and sustained_adv_escalated and not global_suppressed:
+            alert_confirmed = True
+            primary_channel = "adv"
 
         # --- 报警保持窗口（2026-06-30 行为调优，修复"风机出现时断警告"）---
         # 一旦确认，维持 _alert_hold_frames 帧；期间逐帧候选短暂不足也保持 ATTACK，
@@ -3264,6 +3427,7 @@ class ModuleADetector:
         confirm_window = {
             "window_frames": int(window_frames),
             "adv_hit_required": int(adv_hit_required),
+            "adv_support_count": int(adv_support_count),
             "media_hit_required": int(media_hit_required),
             "blind_hit_required": int(blind_hit_required),
             "adv_count": int(adv_count),
@@ -3286,6 +3450,14 @@ class ModuleADetector:
             "p_blind": float(blinding.get("p_blind", 0.0)),
             "blind_type": str(blinding.get("blind_type", "none")),
             "scene_baseline_normal": bool(scene_baseline_normal),
+            "target_related_feature": bool(target_related_feature),
+            "adv_physical_support": bool(adv_physical_support),
+            "sustained_adv_run": int(self._adv_run),
+            "sustained_adv_floor": int(sustained_adv_floor),
+            "sustained_adv_run_bar": float(sustained_adv_run_bar),
+            "sustained_adv_benign_ref": float(self._benign_run_ref),
+            "sustained_adv_seconds": float(self._sustained_adv_seconds),
+            "sustained_adv_escalated": bool(sustained_adv_escalated),
             "p_media_confirmed_score": float(p_media_confirmed_score),
             "alert_confirmed": bool(alert_confirmed),
             "alert_level": alert_level,
@@ -3303,6 +3475,7 @@ class ModuleADetector:
             "stationary_texture_only_adv": bool(stationary_texture_only_adv),
             "background_plane_adv": bool(background_plane_adv),
             "adv_multi_evidence_rescue": bool(adv_multi_evidence_rescue),
+            "structural_adv_evidence_rescue": bool(structural_adv_evidence_rescue),
             "visibility_texture_probe": bool(visibility_texture_probe),
             "visibility_texture_rescue": bool(visibility_texture_rescue),
             "physical_patch_rescue_evidence": bool(physical_patch_rescue_evidence),
@@ -3506,8 +3679,16 @@ class ModuleADetector:
         （实测只冻结确认帧会让 glare 等攻击的高分帧在确认前被基线吸收→反被 z-score 抑制→漏检）。"""
         if not (self._scene_baseline_enabled or self._blind_enabled):
             return
-        if bool(joint.get("single_frame_candidate", False)) or bool(joint.get("alert_confirmed", False)):
+        if bool(joint.get("alert_confirmed", False)):
             return
+        if bool(joint.get("single_frame_candidate", False)):
+            # C1: A1 单支饱和(A2/A3 无佐证)的未确认候选不冻结基线,避免多人交叉纹理跑飞;
+            # 带 A2/A3 佐证的候选仍冻结(glare/patch 攻击同时抬 A2/A3,照旧冻结+检出)。
+            a2s = float(a2["a2_feature_score"])
+            a3s = float(a3["a3_feature_score"])
+            multi_evidence = a2s >= self._sb_carveout_a2 or a3s >= self._sb_carveout_a3
+            if (not self._sb_a1only_carveout) or multi_evidence:
+                return
         self._sb_sharp.append(float(blinding.get("sharpness", 0.0)))
         self._sb_contrast.append(float(blinding.get("contrast", 0.0)))
         self._sb_detstr.append(float(blinding.get("det_strength", 0.0)))

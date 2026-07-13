@@ -248,11 +248,75 @@ class ModuleADetector:
         self.theta_adv = float(module_config.get("rebuilt_theta_adv", 0.65))
         self.theta_media = float(module_config.get("rebuilt_theta_media", 0.55))
         self.theta_media_raw = float(module_config.get("rebuilt_theta_media_raw", 0.50))
+        # A3b 静态媒体/翻拍作为独立报警触发器: demo 内核移植时禁用(背景结构墙/门框会误报, 原计划改喂
+        # XGBoost 但未完成)→ 主项目原有的静态图片/翻拍检测能力回退。config 控制是否恢复(默认关=保持
+        # demo 现状零风险); 开启后 media 候选可经 N-of-M 独立确认报警。启用前须留出集验证误报不破 7.4%。
+        # 默认开: 收紧门(edge/border_contrast)+持续段门(_media_run>=15)已使留出集48段验证
+        # 误报0%/召回90.5%不变(glare4-4), 且找回手机/电脑屏翻拍检测。设False回退demo禁用现状。
+        self._a3b_independent_trigger = bool(
+            module_config.get("rebuilt_a3b_independent_trigger", True)
+        )
+        # A3b 独立触发的收紧候选门(2026-07-12 数据方案): 直接用 media_candidate_allowed 会让干净视频
+        # 误报81.5%(墙/门框/施工纹理经 screen_like_evidence 后门穿过)。实测可分离维度是 edge(边缘密度,
+        # 反向: 真媒体插入≈0.56 vs 施工繁忙纹理≥0.64)与 border_contrast(正向≥0.85), 非 boundary/area。
+        # 组合门 candidate>=0.70 & 0.45<=edge<=0.58 & border_contrast>=0.80 → 5干净负例全压<=0.3%静默,
+        # 画中画翻拍正例保住~78%候选帧。config 可调, 关闭该收紧则回退到裸 media_candidate_allowed。
+        self._a3b_tighten_gate = bool(
+            module_config.get("rebuilt_a3b_tighten_gate", True)
+        )
+        self._a3b_gate_candidate_min = float(module_config.get("rebuilt_a3b_gate_candidate_min", 0.70))
+        self._a3b_gate_edge_min = float(module_config.get("rebuilt_a3b_gate_edge_min", 0.45))
+        self._a3b_gate_edge_max = float(module_config.get("rebuilt_a3b_gate_edge_max", 0.58))
+        self._a3b_gate_border_contrast_min = float(
+            module_config.get("rebuilt_a3b_gate_border_contrast_min", 0.80)
+        )
+        # A3b 独立触发的持续段确认(2026-07-12): 实测干净误报段只是偶发 6-12 帧蒙过收紧门, 而真翻拍
+        # 持续 ~192 帧过门。要求累计过门帧数 _media_run >= floor(默认15)才确认, 利用"真翻拍持续存在 vs
+        # 误报偶发闪烁"的本质差异挡掉偶发负例, 不过拟合具体场景。容忍段内间隙。
+        self._a3b_media_run_floor = int(module_config.get("rebuilt_a3b_media_run_floor", 15))
+        self._a3b_media_run_gap_tol = int(module_config.get("rebuilt_a3b_media_run_gap_tol", 3))
+        self._media_run = 0
+        self._media_run_gap = 0
         # 支路B（致盲/去信号型攻击：motion_blur/visibility/glare致盲）阈值与场景自适应基线。
         # 这类攻击"抹掉"纹理→A1/A2 反而低于干净帧，靠 A4(支路A) 检不出；改用"相对场景自身
         # 基线的清晰度/对比度/YOLO置信度骤降"来判定（绝对值高的焊接/快动场景不会误报）。
         self.theta_blind = float(module_config.get("rebuilt_theta_blind", 0.55))
         self._blind_enabled = bool(module_config.get("rebuilt_blind_branch", True))
+        # 致盲疑似期冻结基线(2026-07-12 修 glare 008/016 掉零): 完全致盲攻击(强光/去信号)会让
+        # YOLO 持续丢目标, 而这些模糊/暗帧因 p_blind 未过阈不被冻结→被吸进场景基线→基线"适应"攻击→
+        # 相对退化(sharp_drop/det_drop)被吃掉→p_blind 单调塌陷→永不确认。开启后: 曾确立目标(近窗
+        # >=N帧有目标)+ 当前完全丢目标 + 有退化佐证(sharp_drop 或 glare_blind >= 阈)时冻结基线更新,
+        # 使退化信号维持高位。用退化佐证门控, 避免合法人离场也冻结。config 默认开, 可关回退。
+        self._blind_suspect_freeze_baseline = bool(
+            module_config.get("rebuilt_blind_suspect_freeze_baseline", True)
+        )
+        self._blind_suspect_recent_target_min = int(
+            module_config.get("rebuilt_blind_suspect_recent_target_min", 3)
+        )
+        self._blind_suspect_degrade_min = float(
+            module_config.get("rebuilt_blind_suspect_degrade_min", 0.40)
+        )
+        # 致盲持续升级(2026-07-12 修 glare 008/016 完全致盲漏检, 镜像 adv sustained 机制):
+        # 完全致盲(YOLO 持续丢目标)时 adv 通道(需目标框)与 blind 逐帧 N-of-M(证据自毁)双失效。
+        # 用"曾确立目标(长记忆锁, 不用近窗滑窗因致盲后凑不满) + 当前持续无目标框 + 退化佐证
+        # (sharp_drop 或 glare_blind >= 阈)"累计连续段 _blind_run, 达 floor 即升级为致盲确认,
+        # 绕过每帧 p_blind>=theta_blind 的 N-of-M。实测: 攻击段 008=19/016=16 连续帧, 干净段最坏仅6,
+        # floor=12 可分离(救 008/016 到 HIT 且干净段零误触发)。退化佐证+长记忆锁防合法人离场误报。
+        self._blind_sustained_enabled = bool(
+            module_config.get("rebuilt_blind_sustained_escalation", True)
+        )
+        self._blind_sustained_floor = int(
+            module_config.get("rebuilt_blind_sustained_floor", 12)
+        )
+        self._blind_sustained_degrade_min = float(
+            module_config.get("rebuilt_blind_sustained_degrade_min", 0.30)
+        )
+        self._blind_sustained_established_min = int(
+            module_config.get("rebuilt_blind_sustained_established_min", 3)
+        )
+        self._blind_target_established = False  # 长记忆锁: 本场景曾确立过目标
+        self._blind_run = 0
+        self._blind_run_gap = 0
         # 场景自适应基线：对支路A也做"在本场景近况内即视为正常"的额外抑制，压制高能干净场景误报。
         self._scene_baseline_enabled = bool(module_config.get("rebuilt_scene_baseline", True))
         self._scene_baseline_window = int(module_config.get("rebuilt_scene_baseline_window", 30))
@@ -291,6 +355,14 @@ class ModuleADetector:
         # 短暂掉到 N-of-M 阈值以下时 alert_confirmed 立刻翻回正常（"断警告"）。
         # 经 module_a.rebuilt_alert_hold_frames 配置，<=0 关闭。对齐 legacy attack_state_hold。
         self._alert_hold_frames = int(module_config.get("rebuilt_alert_hold_frames", 12))
+        # 报警保持刷新(2026-07-12 修"攻击持续但报警断裂"): 原 held 单调递减、不感知攻击传感器
+        # 是否仍在响, 12帧一到就掉回正常。攻击持续期(p_adv 全程高)逐帧候选被抑制门轮流否决→
+        # N-of-M 确认失效→held 撑不过候选枯竭段→报警断成多段。开启后: held 递减前若原始 p_adv 仍
+        # >=theta_adv(raw_adv_trigger), 则刷新保持窗为满而非递减; p_adv 掉回阈下才按原帧数收尾。
+        # 语义="攻击传感器持续响就持续保持"。person/media/blind 不受影响。config 默认开, 可关回退。
+        self._alert_hold_refresh_on_padv = bool(
+            module_config.get("rebuilt_alert_hold_refresh_on_padv", True)
+        )
         self._alert_hold_remaining = 0
         self._alert_hold_channel = "none"
         # 候选连续性桥接(2026-06-30 修 adv_patch 漏报):抑制门在持续高 p_adv 段偶发翻假会把连续
@@ -336,6 +408,19 @@ class ModuleADetector:
         # 持续升级只在真正有攻击证据(目标相关/运动/结构)的连续段上生效。config-gated, 默认开。
         self._sustained_adv_exclude_static_bg = bool(
             module_config.get("rebuilt_sustained_adv_exclude_static_bg", True)
+        )
+        # 持续升级的目标门(2026-07-12 修 adv_patch 严重欠报): 原 sustained_hit 硬 AND
+        # adv_physical_support(要求本帧 target_related + A1/A2/A3 强物理证据), 而补丁攻击段 YOLO 丢目标、
+        # 强证据也满足不了→真实攻击段(007/008/016/018)升级被腰斩, 全片仅0.4%报警。改用 demo blind-branch
+        # 原则: 门在"最近有目标(recent_target_presence 近8帧>=3) + 本帧仍原始触发 + 非空背景静止", 既防
+        # 空场景凭空升级, 又保留"工人被补丁瞬时遮挡"的检出(遮挡前在场即满足)。adv_physical_support 降级为
+        # 默认关的收紧旋钮 rebuilt_sustained_adv_require_physical_support, 出现干净误报时可回退。
+        self._sustained_adv_require_physical_support = bool(
+            module_config.get("rebuilt_sustained_adv_require_physical_support", False)
+        )
+        # recent_target 门阈值: 近 recent_target_presence(maxlen=8) 帧中有目标的帧数下限。
+        self._sustained_adv_recent_target_min = int(
+            module_config.get("rebuilt_sustained_adv_recent_target_min", 3)
         )
         # 已弃用的固定窗口/占比(保留读取以兼容旧 config, 逻辑不再依赖)。
         self._sustained_adv_window = int(module_config.get("rebuilt_sustained_adv_window", 100))
@@ -409,6 +494,11 @@ class ModuleADetector:
         self._adv_run_gap = 0
         self._adv_run_escalated = False
         self._benign_run_ref = 0.0
+        self._blind_target_established = False
+        self._blind_run = 0
+        self._blind_run_gap = 0
+        self._media_run = 0
+        self._media_run_gap = 0
         self._sb_sharp.clear()
         self._sb_contrast.clear()
         self._sb_detstr.clear()
@@ -3233,10 +3323,34 @@ class ModuleADetector:
             adv_candidate_bridged = True
         # 支路B 致盲候选：p_blind 触发即候选（_compute_blinding 内部已做"曾有目标+退化"门控）
         blind_single_frame_candidate = bool(blinding.get("p_blind_triggered", False))
-        # A3b is disabled as independent trigger — background structures (walls, doorways)
-        # produce false positives. A3b features should be added to XGBoost instead.
-        # Only re-enable when moiré pattern detection is added to A3b.
-        media_single_frame_candidate = False
+        # A3b 独立触发: demo 默认禁用(背景结构墙/门框误报)。config rebuilt_a3b_independent_trigger
+        # 开启时恢复候选, 经收紧门(edge/border_contrast 数据方案)+ N-of-M 确认, 找回画中画翻拍检测。
+        media_gate_ok = bool(media_candidate_allowed)
+        if self._a3b_independent_trigger and self._a3b_tighten_gate and media_gate_ok:
+            _ms = a3b.get("p_media_scores", {}) or {}
+            _edge = float(_ms.get("edge", 0.0))
+            _bc = float(_ms.get("border_contrast", 0.0))
+            _cand = float(_ms.get("candidate_score", 0.0))
+            media_gate_ok = bool(
+                _cand >= self._a3b_gate_candidate_min
+                and self._a3b_gate_edge_min <= _edge <= self._a3b_gate_edge_max
+                and _bc >= self._a3b_gate_border_contrast_min
+            )
+        # 持续段确认: 过门帧累计 _media_run, 达 floor 才算真候选(挡偶发闪烁负例)。容忍段内间隙。
+        if self._a3b_independent_trigger:
+            if media_gate_ok:
+                self._media_run += 1
+                self._media_run_gap = 0
+            elif self._media_run > 0 and self._media_run_gap < self._a3b_media_run_gap_tol:
+                self._media_run_gap += 1
+            else:
+                self._media_run = 0
+                self._media_run_gap = 0
+        media_single_frame_candidate = bool(
+            self._a3b_independent_trigger
+            and media_gate_ok
+            and self._media_run >= self._a3b_media_run_floor
+        )
         single_frame_candidate = bool(adv_single_frame_candidate or blind_single_frame_candidate)
         if adv_single_frame_candidate:
             self.adv_hits.append(1)
@@ -3306,11 +3420,17 @@ class ModuleADetector:
             and not target_related_feature
             and bool(a3b.get("p_media_background_static_suppressed", False))
         )
+        # recent_target 门(demo blind-branch 原则): 最近 8 帧至少 N 帧有目标, 兼顾"补丁瞬时遮挡
+        # 丢目标但遮挡前在场"与"空场景无目标不凭空升级"。adv_physical_support 降为默认关的收紧旋钮。
+        recent_target_present = (
+            sum(self.recent_target_presence) >= self._sustained_adv_recent_target_min
+        )
         sustained_hit = bool(
             raw_adv_trigger
             and (target_related_feature or not self._sustained_adv_require_target)
             and not adv_static_bg_no_evidence
-            and adv_physical_support
+            and recent_target_present
+            and (adv_physical_support or not self._sustained_adv_require_physical_support)
         )
         if sustained_hit:
             self._adv_run += 1
@@ -3340,6 +3460,34 @@ class ModuleADetector:
         if sustained_adv_escalated:
             # 标记本段已升级 → 段结束时不污染良性突发参考(冻结)。
             self._adv_run_escalated = True
+
+        # --- 致盲持续升级(2026-07-12 修完全致盲 glare 008/016 漏检)---
+        # 长记忆锁: 本场景一旦近窗出现过 >=N 帧有目标即永久置位(致盲后近窗滑窗会凑不满, 故用锁)。
+        if sum(self.recent_target_presence) >= self._blind_sustained_established_min:
+            self._blind_target_established = True
+        blind_no_target = len(rois) == 0
+        blind_degrade_evidence = (
+            float(blinding.get("sharp_drop", 0.0)) >= self._blind_sustained_degrade_min
+            or float(blinding.get("glare_blind", 0.0)) >= self._blind_sustained_degrade_min
+        )
+        blind_run_hit = bool(
+            self._blind_sustained_enabled
+            and self._blind_target_established
+            and blind_no_target
+            and blind_degrade_evidence
+        )
+        if blind_run_hit:
+            self._blind_run += 1
+            self._blind_run_gap = 0
+        elif self._blind_run > 0 and self._blind_run_gap < 1:
+            self._blind_run_gap += 1  # 容忍单帧间隙
+        else:
+            self._blind_run = 0
+            self._blind_run_gap = 0
+        blind_sustained_escalated = bool(
+            self._blind_sustained_enabled
+            and self._blind_run >= self._blind_sustained_floor
+        )
 
         global_suppressed = False
         global_suppressed_reason = "none"
@@ -3374,6 +3522,12 @@ class ModuleADetector:
             alert_confirmed = True
             primary_channel = "adv"
 
+        # 致盲持续升级: 完全致盲(持续丢目标)时 adv/blind 逐帧通道双失效, 用"确立后持续缺席+退化佐证"
+        # 的连续段作证据强制升级为 blind 确认(绕过逐帧 p_blind N-of-M)。修 glare 008/016 完全致盲漏检。
+        if not alert_confirmed and blind_sustained_escalated and not global_suppressed:
+            alert_confirmed = True
+            primary_channel = "blind"
+
         # --- 报警保持窗口（2026-06-30 行为调优，修复"风机出现时断警告"）---
         # 一旦确认，维持 _alert_hold_frames 帧；期间逐帧候选短暂不足也保持 ATTACK，
         # 期间再次确认则刷新保持。global_suppressed（明确抑制）时不保持。
@@ -3386,7 +3540,12 @@ class ModuleADetector:
             and self._alert_hold_remaining > 0
             and not global_suppressed
         ):
-            self._alert_hold_remaining -= 1
+            # 攻击传感器仍在响(原始 p_adv>=theta_adv)时刷新保持窗, 而非单调递减:
+            # 消除"攻击持续但报警断裂"。p_adv 掉回阈下则按原帧数递减收尾。
+            if self._alert_hold_refresh_on_padv and raw_adv_trigger:
+                self._alert_hold_remaining = self._alert_hold_frames
+            else:
+                self._alert_hold_remaining -= 1
             alert_confirmed = True
             alert_held = True
             primary_channel = self._alert_hold_channel if self._alert_hold_channel != "none" else "adv"
@@ -3450,6 +3609,10 @@ class ModuleADetector:
             "p_blind": float(blinding.get("p_blind", 0.0)),
             "blind_type": str(blinding.get("blind_type", "none")),
             "scene_baseline_normal": bool(scene_baseline_normal),
+            # 诊断用只读字段(暴露运动抑制门状态, 不改判定逻辑):
+            "normal_motion_texture_change": bool(normal_motion_texture_change),
+            "nonlocal_a1_a3_scene_spike": bool(nonlocal_a1_a3_scene_spike),
+            "low_motion_background_like_adv": bool(low_motion_background_like_adv),
             "target_related_feature": bool(target_related_feature),
             "adv_physical_support": bool(adv_physical_support),
             "sustained_adv_run": int(self._adv_run),
@@ -3688,6 +3851,19 @@ class ModuleADetector:
             a3s = float(a3["a3_feature_score"])
             multi_evidence = a2s >= self._sb_carveout_a2 or a3s >= self._sb_carveout_a3
             if (not self._sb_a1only_carveout) or multi_evidence:
+                return
+        # 致盲疑似期冻结: 曾确立目标 + 当前完全丢目标 + 有退化佐证 → 不更新基线, 阻断致盲帧污染,
+        # 使 sharp_drop/det_drop 维持高位, p_blind 不再单调塌陷。退化佐证门控防合法人离场误冻结。
+        if self._blind_suspect_freeze_baseline:
+            recent_target_established = (
+                sum(self.recent_target_presence) >= self._blind_suspect_recent_target_min
+            )
+            no_current_target = (self.recent_target_presence[-1] == 0) if self.recent_target_presence else True
+            degrade_evidence = (
+                float(blinding.get("sharp_drop", 0.0)) >= self._blind_suspect_degrade_min
+                or float(blinding.get("glare_blind", 0.0)) >= self._blind_suspect_degrade_min
+            )
+            if recent_target_established and no_current_target and degrade_evidence:
                 return
         self._sb_sharp.append(float(blinding.get("sharpness", 0.0)))
         self._sb_contrast.append(float(blinding.get("contrast", 0.0)))

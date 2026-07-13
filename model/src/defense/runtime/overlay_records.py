@@ -112,6 +112,16 @@ def preview_module_info_from_overlay(overlay: dict[str, Any]) -> dict[str, Any]:
     else:
         layer = "NORMAL"
 
+    # 重建 A3b 媒体框信息供预览渲染框出翻拍/静态媒体可疑区域(demo 行为)。
+    a3b_bbox = context.get("a3b_bbox")
+    a3b_confirmed_score = float(
+        context.get("a3b_confirmed_score") or context.get("a3b_confidence") or context.get("a3b_score") or 0.0
+    )
+    media_confirmed = bool(
+        (isinstance(a3b_bbox, (list, tuple)) and len(a3b_bbox) == 4)
+        and (a3b_confirmed_score > 0.0 or str(context.get("a3b_state") or "") == "confirmed")
+    )
+
     return {
         "p_adv": context.get("p_adv"),
         "alert_confirmed": bool(context.get("alert_confirmed")),
@@ -122,6 +132,13 @@ def preview_module_info_from_overlay(overlay: dict[str, Any]) -> dict[str, Any]:
         "timing_ms": float(context.get("timing_ms") or 0.0),
         "layer_triggered": layer,
         "reason_codes": reason_codes,
+        "details": {
+            "a3b": {
+                "p_media_bbox": list(a3b_bbox) if isinstance(a3b_bbox, (list, tuple)) and len(a3b_bbox) == 4 else None,
+                "media_confirmed": media_confirmed,
+                "p_media_confirmed_score": a3b_confirmed_score,
+            }
+        },
     }
 
 

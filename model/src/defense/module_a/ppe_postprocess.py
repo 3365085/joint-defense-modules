@@ -12,6 +12,11 @@ BARE_HEAD_HINTS = ("head", "no_helmet", "without_helmet", "bare_head")
 @dataclass(frozen=True, slots=True)
 class PPEPostprocessConfig:
     min_confidence: float = 0.25
+    # person 仅作上下文/辅助显示，不参与 PPE 报警证据(head+helmet 才是)。
+    # 远距/小目标工人后端 conf 常 0.19-0.24，被统一 min_confidence(0.25) 硬砍导致"没人物框"。
+    # 单独下调 person 显示门(默认 0.18)可恢复远距人物框，且不影响 p_adv 攻击链路与留出集口径。
+    # None 时回退 min_confidence，保持向后兼容。
+    person_display_min_confidence: float | None = None
     candidate_min_confidence: float | None = None
     overlap_iou: float = 0.55
     helmet_head_margin: float = 0.12
@@ -62,6 +67,16 @@ def is_helmet_label(label: str) -> bool:
 
 def is_person_label(label: str) -> bool:
     return label_matches(label, PERSON_HINTS)
+
+
+def _passes_min_confidence(item: "PPEDetection", cfg: "PPEPostprocessConfig") -> bool:
+    """按类别取有效显示门：person 用 person_display_min_confidence(若配置)，
+    其余(head/helmet)沿用 min_confidence。person 非报警证据，放宽仅影响显示，
+    不改变 p_adv/A1-A4 与留出集口径。"""
+    threshold = cfg.min_confidence
+    if cfg.person_display_min_confidence is not None and is_person_label(item.label):
+        threshold = cfg.person_display_min_confidence
+    return item.confidence >= threshold
 
 
 def infer_ppe_model_capabilities(detections: Any, items: Iterable[PPEDetection] | None = None) -> dict[str, Any]:
@@ -214,7 +229,7 @@ def suppress_helmet_false_positives(
     has_person_class: bool | None = None,
 ) -> dict[str, Any]:
     cfg = config or PPEPostprocessConfig()
-    items = [item for item in detections if item.confidence >= cfg.min_confidence]
+    items = [item for item in detections if _passes_min_confidence(item, cfg)]
     heads = [item for item in items if is_bare_head_label(item.label)]
     helmets = [item for item in items if is_helmet_label(item.label)]
     persons = [item for item in items if is_person_label(item.label)]
@@ -539,7 +554,7 @@ def summarize_ppe_from_detections(
 ) -> dict[str, Any]:
     cfg = config or PPEPostprocessConfig()
     all_items = extract_ppe_detections(detections)
-    items = [item for item in all_items if item.confidence >= cfg.min_confidence]
+    items = [item for item in all_items if _passes_min_confidence(item, cfg)]
     capabilities = infer_ppe_model_capabilities(detections, all_items)
     suppression = suppress_helmet_false_positives(
         items,

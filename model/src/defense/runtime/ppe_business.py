@@ -92,6 +92,7 @@ def evaluate_ppe_business(
         ppe["source_auth_media_suppression"] = source_auth_suppression
         ppe["source_auth_temporal_reset"] = clear_temporal_ppe
     tracks = _filter_tracks_for_ppe_counts(tracks, ppe)
+    tracks = _dedup_display_tracks(tracks)  # 显示层同类重叠去重, 消除"一人多框", 不影响报警计数
     return PPEBusinessResult(ppe=ppe, tracks=tracks)
 
 
@@ -224,6 +225,41 @@ def _effective_max_render_misses(max_render_misses: int | None, ppe: dict[str, A
     if str(ppe.get("evidence_mode") or "") == "head_helmet_only":
         return max(base, 8)
     return base
+
+
+def _dedup_display_tracks(
+    tracks: list[dict[str, Any]], *, iou_threshold: float = 0.6
+) -> list[dict[str, Any]]:
+    """显示层同类重叠去重: 同一目标被 YOLO 吐多框(NMS iou_thres=0.7 偏松, 大框套小框)时,
+    渲染前对同类框做 NMS, 每个目标只留最高分框。纯显示层——不改检测数值/p_adv/报警计数,
+    留出集(看 alert_confirmed)不受影响。优先保留 confidence 高、非 held 的框。"""
+    if not tracks or len(tracks) < 2:
+        return tracks
+
+    def _key(t: dict[str, Any]) -> tuple[float, float]:
+        # 排序键: 先真实检出(misses=0)优先, 再按置信度降序
+        held = 1 if int(t.get("misses", 0) or 0) > 0 else 0
+        return (-held, float(t.get("confidence", 0.0) or 0.0))
+
+    order = sorted(range(len(tracks)), key=lambda i: _key(tracks[i]), reverse=True)
+    kept: list[int] = []
+    for idx in order:
+        box = tracks[idx].get("box")
+        if not (isinstance(box, (list, tuple)) and len(box) == 4):
+            kept.append(idx)
+            continue
+        label = str(tracks[idx].get("label", "")).lower()
+        drop = False
+        for k in kept:
+            kb = tracks[k].get("box")
+            if not (isinstance(kb, (list, tuple)) and len(kb) == 4):
+                continue
+            if str(tracks[k].get("label", "")).lower() == label and bbox_iou(list(box), list(kb)) >= iou_threshold:
+                drop = True
+                break
+        if not drop:
+            kept.append(idx)
+    return [tracks[i] for i in sorted(kept)]
 
 
 def _filter_tracks_for_ppe_counts(tracks: list[dict[str, Any]], ppe: dict[str, Any]) -> list[dict[str, Any]]:

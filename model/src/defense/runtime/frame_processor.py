@@ -21,6 +21,72 @@ from .ppe_business import evaluate_ppe_business
 from .ppe_state import SafetyHelmetState
 
 
+import json as _json
+import os as _os
+
+# 只读诊断探针: 环境变量 DEFENSE_FEATURE_PROBE 指向一个 JSONL 路径时, 每帧把 A1/运动/adv/
+# 抑制门等关键数值追加一行。默认关闭, 全程 try/except 吞异常, 绝不影响检测主链路。
+_PROBE_PATH = _os.environ.get("DEFENSE_FEATURE_PROBE") or ""
+
+
+def _feature_probe(info: dict[str, Any], frame_idx: int, detections: Any = None) -> None:
+    if not _PROBE_PATH:
+        return
+    try:
+        # 原始 YOLO 检出计数(未过显示门), 区分"YOLO 没检出头" vs "后处理过滤掉头"
+        raw_person = raw_head = raw_helmet = 0
+        raw_head_confs: list[float] = []
+        if detections is not None:
+            boxes = list(getattr(detections, "boxes", []) or [])
+            classes = list(getattr(detections, "classes", []) or [])
+            confs = list(getattr(detections, "confidences", []) or [])
+            names = getattr(detections, "names", {}) or {}
+            for cid, cf in zip(classes, confs):
+                lbl = str(names.get(int(cid), "")) if isinstance(names, dict) else str(cid)
+                if is_person_label(lbl):
+                    raw_person += 1
+                elif is_bare_head_label(lbl):
+                    raw_head += 1
+                    raw_head_confs.append(round(float(cf), 3))
+                elif is_helmet_label(lbl):
+                    raw_helmet += 1
+        details = info.get("details", {}) if isinstance(info.get("details"), dict) else {}
+        scene = details.get("scene_context", {}) if isinstance(details.get("scene_context"), dict) else {}
+        flow = details.get("flow_context", {}) if isinstance(details.get("flow_context"), dict) else {}
+        joint = details.get("joint_decision", {}) if isinstance(details.get("joint_decision"), dict) else {}
+        a1 = details.get("a1", {}) if isinstance(details.get("a1"), dict) else {}
+        a2 = details.get("a2", {}) if isinstance(details.get("a2"), dict) else {}
+        a3 = details.get("a3", {}) if isinstance(details.get("a3"), dict) else {}
+        row = {
+            "frame": int(frame_idx),
+            "frame_diff_global": round(float(scene.get("frame_diff_global", 0.0)), 4),
+            "exposure_delta": round(float(scene.get("exposure_delta", 0.0)), 4),
+            "overexp": round(float(scene.get("overexposure_ratio", 0.0)), 4),
+            "global_motion_weight": round(float(flow.get("global_motion_weight", 0.0)), 4),
+            "a1": round(float(a1.get("a1_feature_score", 0.0)), 4),
+            "a2": round(float(a2.get("a2_feature_score", 0.0)), 4),
+            "a3": round(float(a3.get("a3_feature_score", 0.0)), 4),
+            "p_adv": round(float(info.get("p_adv") or 0.0), 4),
+            "dominant": str(joint.get("dominant_input", "")),
+            "adv_allowed": bool(joint.get("adv_single_frame_candidate", joint.get("adv_candidate_allowed", False))),
+            "alert": bool(info.get("alert_confirmed", False)),
+            "reasons": list(info.get("reason_codes") or joint.get("reason_codes") or []),
+            # 抑制门(True=该门在抑制): 看晃动时是否失守
+            "gate_normal_motion": bool(joint.get("normal_motion_texture_change", False)),
+            "gate_scene_spike": bool(joint.get("nonlocal_a1_a3_scene_spike", False)),
+            "gate_low_motion_bg": bool(joint.get("low_motion_background_like_adv", False)),
+            "gate_scene_baseline": bool(joint.get("scene_baseline_normal", False)),
+            "raw_person": raw_person,
+            "raw_head": raw_head,
+            "raw_helmet": raw_helmet,
+            "raw_head_confs": raw_head_confs,
+        }
+        with open(_PROBE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 REASON_TEXT = {
     "overexposure": "强光/过曝异常",
     "temporal_texture_change": "时序纹理突变",
@@ -86,13 +152,32 @@ def info_reason(info: dict[str, Any]) -> str:
 
 
 def _static_media_details(info: dict[str, Any]) -> dict[str, Any]:
-    return (
-        info.get("details", {})
-        .get("module_a_features", {})
-        .get("static_media", {})
-        if isinstance(info.get("details"), dict)
-        else {}
-    )
+    details = info.get("details", {})
+    if not isinstance(details, dict):
+        return {}
+    legacy = details.get("module_a_features", {}).get("static_media", {})
+    if isinstance(legacy, dict) and legacy:
+        return legacy
+    # rebuilt 内核把 A3b 静态媒体结果写在 details['a3b'](非 legacy 的 module_a_features.static_media)。
+    # 映射到 a3b_soft/面板期望的字段, 修"A3b面板一直0 + 翻拍区域框不显示"(移植接线遗漏, 非检测问题)。
+    a3b = details.get("a3b", {})
+    if not isinstance(a3b, dict) or not a3b:
+        return {}
+    bbox = a3b.get("p_media_bbox")
+    return {
+        "score": float(a3b.get("p_media_confirmed_score", 0.0) or 0.0),
+        "live_score": float(a3b.get("p_media", 0.0) or 0.0),
+        "live_score_display": float(a3b.get("p_media", 0.0) or 0.0),
+        "p_media": float(a3b.get("p_media", 0.0) or 0.0),
+        "p_media_triggered": bool(a3b.get("p_media_triggered", False)),
+        "triggered": bool(a3b.get("media_confirmed", False)),
+        "p_media_type": a3b.get("p_media_type"),
+        "bbox": list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
+        "candidate_bbox": list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
+        "p_media_bbox": list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
+        "media_candidates": a3b.get("media_candidates", []),
+        "state": str(a3b.get("a3b_state") or ("confirmed" if a3b.get("media_confirmed") else "normal")),
+    }
 
 
 @dataclass(slots=True)
@@ -123,9 +208,16 @@ class FrameProcessor:
         business_min_confidence = float(
             ppe_config.get("business_min_confidence", inference_config.get("confidence", 0.25))
         )
+        # person 仅作辅助显示、不进 PPE 报警证据；远距工人后端 conf 常低于 business 门被砍导致
+        # "没人物框"。单独下调 person 显示门(默认 0.18)恢复远距人物框，不影响 p_adv/留出集口径。
+        _person_display_min = ppe_config.get("person_display_min_confidence", 0.18)
+        person_display_min_confidence = (
+            float(_person_display_min) if _person_display_min is not None else None
+        )
         candidate_min_confidence = ppe_config.get("temporal_candidate_min_confidence")
         self.ppe_postprocess_config = PPEPostprocessConfig(
             min_confidence=business_min_confidence,
+            person_display_min_confidence=person_display_min_confidence,
             candidate_min_confidence=(
                 float(candidate_min_confidence)
                 if candidate_min_confidence is not None
@@ -231,6 +323,7 @@ class FrameProcessor:
             )
         else:
             _, detections, info = self.pipeline.process_frame(frame_640)
+        _feature_probe(info, frame_idx, detections)
         static_media = dict(_static_media_details(info))
         redetect_ms = 0.0
         redetect_count = 0
@@ -358,12 +451,24 @@ class FrameProcessor:
         a3b_smoothed_score = _float(
             static_media.get("live_score_display", static_media.get("score", a3b_observed_score))
         )
+        # rebuilt 内核已对 media 做过 N-of-M 确认(media_confirmed), 是权威结果; 面板不应再经 a3b_soft
+        # 二次确认导致 confirmed_score 时有时无(面板一直显 0)。已确认时用 rebuilt 的 p_media_confirmed_score
+        # 直接回填面板置信度/卡片分数, 并标 confirmed。observed 仍走 a3b_soft(平滑显示)。纯显示, 不改检测。
+        _rebuilt_media_confirmed = bool(static_media.get("triggered"))
+        _rebuilt_media_score = _float(static_media.get("score"))
         a3b_confirmed_score = _float(a3b_soft.get("confirmed_score"))
+        if _rebuilt_media_confirmed and _rebuilt_media_score > a3b_confirmed_score:
+            a3b_confirmed_score = _rebuilt_media_score
         a3b_confidence = _float(a3b_soft.get("confidence", a3b_confirmed_score))
+        if _rebuilt_media_confirmed and _rebuilt_media_score > a3b_confidence:
+            a3b_confidence = _rebuilt_media_score
         a3b_display_score = _float(a3b_soft.get("display_score"), a3b_confidence)
         a3b_card_score = a3b_confidence
         a3b_event_score = a3b_confidence if a3b_confidence > 0 else a3b_observed_score
         a3b_state = str(a3b_soft.get("state") or ("confirmed" if a3b_soft.get("triggered") else "normal"))
+        if _rebuilt_media_confirmed:
+            a3b_state = "confirmed"
+            a3b_triggered = True
         ppe_boxes_count = _int(ppe.get("person_count")) + _int(ppe.get("helmet_count")) + _int(ppe.get("head_count"))
         ppe_suppression = ppe.get("helmet_fp_suppression", {})
         ppe_weak_person_count = (

@@ -110,42 +110,96 @@ def _reason_text(values: Any) -> str:
     return "、".join(labels.get(str(item), str(item)) for item in list(items)[:4])
 
 
+def _ui_scale(h: int, w: int) -> float:
+    """按短边相对 720p 归一化的 UI 缩放, UHD 下自动放大字体/卡片, 保持视觉比例一致。"""
+    return max(0.6, min(3.0, min(h, w) / 720.0))
+
+
+def _rounded_panel(
+    frame: np.ndarray,
+    x1: int, y1: int, x2: int, y2: int,
+    *, radius: int = 14, color: tuple[int, int, int] = (24, 22, 20), alpha: float = 0.62,
+) -> None:
+    """深色半透明矩形面板(卡片底)。就地混合到 frame。radius 参数保留但不再画圆角。"""
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(frame.shape[1], x2); y2 = min(frame.shape[0], y2)
+    if x2 <= x1 or y2 <= y1:
+        return
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay[y1:y2, x1:x2], alpha, frame[y1:y2, x1:x2], 1 - alpha, 0, frame[y1:y2, x1:x2])
+
+
+# 状态配色(BGR): 克制的绿/琥珀/红, 文字统一近白, 不用刺眼纯红大字。
+_STATE_STYLE = {
+    "clear":   {"accent": (120, 200, 120), "label": "监控中"},
+    "suspect": {"accent": (60, 190, 245),  "label": "疑似异常"},
+    "held":    {"accent": (70, 170, 255),  "label": "告警保持"},
+    "alert":   {"accent": (70, 90, 245),   "label": "告警确认"},
+}
+
+
 def draw_hud(frame: np.ndarray, info: dict[str, Any], frame_idx: int, *, effective: bool = False) -> np.ndarray:
     h, w = frame.shape[:2]
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 86), (10, 10, 15), -1)
-    frame = cv2.addWeighted(overlay, 0.68, frame, 0.32, 0)
-
-    layer = str(info.get("layer_triggered", "NORMAL"))
-    timing = float(info.get("timing_ms", 0.0) or 0.0)
+    s = _ui_scale(h, w)
     p_adv = info.get("p_adv")
-    p_adv_text = "N/A" if p_adv is None else f"{float(p_adv):.2f}"
+    p_adv_text = "--" if p_adv is None else f"{float(p_adv):.2f}"
+    detect_fps = info.get("detect_fps")
     alert = bool(info.get("alert_confirmed", False))
     attack = bool(info.get("attack_detected", info.get("is_attack", False)))
     held = bool(info.get("alert_display_held", False))
-    alert_color = (0, 165, 255) if held else (0, 0, 255)
 
-    text_items = [
-        (f"帧 {frame_idx:05d} | 层 {layer} | 物理扰动={p_adv_text} | {timing:.1f}毫秒", (10, 7), alert_color, 18)
-    ]
-    state = "告警保持" if held else ("告警确认" if alert else ("疑似异常" if attack else "监控中"))
-    text_items.append((state, (10, 35), alert_color, 18))
+    key = "held" if (held and not alert) else ("alert" if alert else ("suspect" if attack else "clear"))
+    style = _STATE_STYLE[key]
+    accent = style["accent"]
 
+    pad = int(16 * s)
+    title_sz = int(30 * s)
+    body_sz = int(19 * s)
+    small_sz = int(16 * s)
+    line_gap = int(10 * s)
+
+    # 面板尺寸: 标题行 + 指标行 (+ 可选原因行)
     reason_codes = info.get("reason_codes") or info.get("details", {}).get("reason_codes") or []
     last_reason_codes = info.get("alert_last_reason_codes") or []
+    reason_line = ""
     if held and last_reason_codes:
-        text = f"上次原因：{_reason_text(last_reason_codes)}"
-        text_items.append((_fit_text_for_width(text, w - 20, 15), (10, 62), alert_color, 15))
+        reason_line = f"原因 · {_reason_text(last_reason_codes)}"
     elif reason_codes and (alert or attack or held):
-        text = _reason_text(reason_codes)
-        text_items.append((_fit_text_for_width(text, w - 20, 15), (10, 62), alert_color, 15))
-    elif effective:
-        text_items.append(("证据帧", (10, 62), alert_color, 15))
-    _draw_texts_cn(frame, text_items)
+        reason_line = f"原因 · {_reason_text(reason_codes)}"
 
-    if alert:
-        thick = 2 if frame_idx % 2 == 0 else 1
-        cv2.rectangle(frame, (thick, thick), (w - thick, h - thick), alert_color, thick)
+    metrics = f"p_adv {p_adv_text}"
+    if detect_fps is not None:
+        metrics += f"    检测 {float(detect_fps):.0f} fps"
+    metrics += f"    帧 {frame_idx:05d}"
+
+    panel_x = pad
+    panel_y = pad
+    panel_w = max(
+        _text_width(style["label"], title_sz) + int(64 * s),
+        _text_width(metrics, body_sz) + pad * 2,
+        _text_width(reason_line, small_sz) + pad * 2 if reason_line else 0,
+    )
+    panel_w = min(panel_w, w - pad * 2)
+    rows_h = title_sz + line_gap + body_sz + (line_gap + small_sz if reason_line else 0)
+    panel_h = rows_h + pad * 2
+    _rounded_panel(frame, panel_x, panel_y, panel_x + panel_w, panel_y + panel_h,
+                   color=(28, 24, 22), alpha=0.60)
+
+    ty = panel_y + pad
+    items = [
+        (style["label"], (panel_x + pad, ty), accent, title_sz),
+        (metrics, (panel_x + pad, ty + title_sz + line_gap), (235, 235, 235), body_sz),
+    ]
+    if reason_line:
+        items.append((_fit_text_for_width(reason_line, panel_w - pad * 2, small_sz),
+                      (panel_x + pad, ty + title_sz + line_gap + body_sz + line_gap), (200, 200, 200), small_sz))
+    _draw_texts_cn(frame, items)
+
+    # 告警: 稳定描边(不闪烁), 颜色随状态
+    if alert or held:
+        t = max(2, int(3 * s))
+        cv2.rectangle(frame, (t, t), (w - t, h - t), accent, t)
     return frame
 
 
@@ -162,21 +216,25 @@ def _draw_label(
     y1, y2 = max(0, min(h - 1, y1)), max(0, min(h - 1, y2))
     if x2 <= x1 or y2 <= y1:
         return
+    s = _ui_scale(h, w)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-    font_size = max(6, min(9, int(round(min(h, w) / 180))))
-    pad_x = max(2, font_size // 3)
-    pad_y = max(1, font_size // 5)
+    font_size = max(12, int(round(15 * s)))
+    pad_x = max(4, int(font_size * 0.4))
+    pad_y = max(2, int(font_size * 0.22))
     try:
         bbox = _font(font_size).getbbox(text)
         tw = int(bbox[2] - bbox[0])
         th = int(bbox[3] - bbox[1])
     except Exception:
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.25, 1)
-    label_h = max(7, th + pad_y * 2)
-    label_y1 = max(0, y1 - label_h)
-    label_y2 = min(h - 1, label_y1 + label_h)
-    cv2.rectangle(frame, (x1, label_y1), (min(w - 1, x1 + tw + pad_x * 2), label_y2), color, -1)
-    _draw_text_cn(frame, text, (x1 + pad_x, label_y1 + pad_y), (0, 0, 0), size=font_size)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    label_h = max(font_size + pad_y * 2, th + pad_y * 2)
+    label_w = tw + pad_x * 2
+    # 标签优先放框上方, 顶部空间不足则放框内顶部
+    label_y1 = y1 - label_h if y1 - label_h >= 0 else y1
+    label_y2 = label_y1 + label_h
+    lx2 = min(w - 1, x1 + label_w)
+    _rounded_panel(frame, x1, label_y1, lx2, label_y2, radius=int(4 * s), color=color, alpha=0.92)
+    _draw_text_cn(frame, text, (x1 + pad_x, label_y1 + pad_y), (15, 15, 15), size=font_size)
 
 
 def _is_person_track(track: dict[str, Any]) -> bool:
@@ -225,39 +283,73 @@ def draw_ppe_boxes(
     return rendered
 
 
+def draw_media_box(frame: np.ndarray, info: dict[str, Any] | None) -> np.ndarray:
+    """框出 A3b 检出的翻拍/静态媒体可疑区域(demo 行为)。bbox 为 640 空间, 按当前帧尺寸缩放。
+    仅在 media_confirmed 时画, 避免干扰。纯显示, 不改检测。"""
+    if not info:
+        return frame
+    details = info.get("details", {})
+    a3b = details.get("a3b", {}) if isinstance(details, dict) else {}
+    if not isinstance(a3b, dict) or not a3b.get("media_confirmed"):
+        return frame
+    bbox = a3b.get("p_media_bbox")
+    if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+        return frame
+    h, w = frame.shape[:2]
+    sx, sy = w / 640.0, h / 640.0
+    x1, y1, x2, y2 = [int(round(v * s)) for v, s in zip(bbox, (sx, sy, sx, sy))]
+    color = (0, 140, 255)  # 橙红, 区别于 PPE 框
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    score = float(a3b.get("p_media_confirmed_score", a3b.get("p_media", 0.0)) or 0.0)
+    _draw_label(frame, [x1, y1, x2, y2], f"疑似翻拍/静态媒体 {score:.2f}", color, 2)
+    return frame
+
+
 def draw_ppe_hud(frame: np.ndarray, ppe: dict[str, Any] | None) -> np.ndarray:
     if not ppe:
         return frame
     h, w = frame.shape[:2]
-    y0 = h - 86
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, y0), (w, h), (10, 10, 15), -1)
-    frame = cv2.addWeighted(overlay, 0.62, frame, 0.38, 0)
-    warning = bool(ppe.get("warning") or ppe.get("confirmed"))
-    color = (0, 0, 255)
-    suppression = ppe.get("helmet_fp_suppression", {}) if isinstance(ppe.get("helmet_fp_suppression"), dict) else {}
-    weak_head_count = len(suppression.get("weak_head_indices", suppression.get("suppressed_head_indices", [])) or [])
-    weak_helmet_count = len(suppression.get("weak_helmet_indices", []) or [])
-    weak_person_count = len(suppression.get("weak_person_indices", []) or [])
-    promoted_head_count = int(ppe.get("promoted_head_count", 0) or 0)
-    promoted_helmet_count = int(ppe.get("promoted_helmet_count", 0) or 0)
-    promoted_person_count = int(ppe.get("promoted_person_count", 0) or 0)
-    raw_person_count = int(ppe.get("raw_person_count", ppe.get("person_count", 0)) or 0)
-    inferred_person_count = int(ppe.get("inferred_person_count", raw_person_count) or 0)
-    effective_person_count = int(ppe.get("effective_person_count", ppe.get("person_count", 0)) or 0)
-    text = (
-        f"安全帽 原始人={raw_person_count} 有效人={effective_person_count} 推断人={inferred_person_count} "
-        f"安全帽={int(ppe.get('helmet_count', 0) or 0)} "
-        f"裸头={int(ppe.get('head_count', 0) or 0)} "
-        f"弱证据={weak_person_count}/{weak_head_count}/{weak_helmet_count} "
-        f"时序增强={promoted_person_count}/{promoted_head_count}/{promoted_helmet_count} "
-        f"未戴帽={int(ppe.get('missing_helmet_count', 0) or 0)}"
-    )
-    text_items = [(_fit_text_for_width(text, w - 20, 17), (10, h - 62), color, 17)]
-    reason = str(ppe.get("reason", ""))[:90]
-    if reason:
-        text_items.append((_fit_text_for_width(_reason_text(reason), w - 20, 15), (10, h - 32), color, 15))
-    _draw_texts_cn(frame, text_items)
+    s = _ui_scale(h, w)
+    person_count = int(ppe.get("effective_person_count", ppe.get("person_count", 0)) or 0)
+    helmet_count = int(ppe.get("helmet_count", 0) or 0)
+    head_count = int(ppe.get("head_count", 0) or 0)
+    missing_helmet = int(ppe.get("missing_helmet_count", 0) or 0)
+
+    pad = int(16 * s)
+    sz = int(20 * s)
+    gap = int(28 * s)
+    warn = missing_helmet > 0
+
+    # 底部右对齐的精炼计数条: 人员 / 安全帽 / 裸头 (+ 未戴帽告警)
+    chips = [
+        ("人员", person_count, (235, 210, 120)),
+        ("安全帽", helmet_count, (120, 210, 130)),
+        ("裸头", head_count, (90, 175, 245)),
+    ]
+    if warn:
+        chips.append(("未戴帽", missing_helmet, (70, 90, 245)))
+
+    parts = [f"{name} {val}" for name, val, _ in chips]
+    line = "    ".join(parts)
+    line_w = _text_width(line, sz)
+    panel_w = min(line_w + pad * 2, w - pad * 2)
+    panel_h = sz + pad * 2
+    panel_x2 = w - pad
+    panel_x1 = panel_x2 - panel_w
+    panel_y2 = h - pad
+    panel_y1 = panel_y2 - panel_h
+    _rounded_panel(frame, panel_x1, panel_y1, panel_x2, panel_y2,
+                   radius=int(12 * s), color=(28, 24, 22), alpha=0.58)
+
+    # 逐段上色渲染(数字用对应类别色, 未戴帽标红)
+    items = []
+    cx = panel_x1 + pad
+    ty = panel_y1 + pad
+    for name, val, col in chips:
+        seg = f"{name} {val}"
+        items.append((seg, (cx, ty), col, sz))
+        cx += _text_width(seg, sz) + gap
+    _draw_texts_cn(frame, items)
     return frame
 
 
@@ -278,6 +370,8 @@ def render_preview(
             ppe_tracks,
             show_person_boxes=options.get("show_person_boxes", True),
         )
+    if options.get("show_boxes", True) and info is not None:
+        rendered = draw_media_box(rendered, info)
     if options.get("show_module_hud", True) and info is not None:
         rendered = draw_hud(rendered, info, frame_idx)
     if options.get("show_ppe_hud", True) and ppe is not None:

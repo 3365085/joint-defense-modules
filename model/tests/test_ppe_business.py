@@ -22,7 +22,11 @@ def test_file_realtime_ppe_render_miss_cap_is_configurable() -> None:
         )
         == 3
     )
-    assert _ppe_max_render_misses(source_type="camera", realtime=True, file_realtime_max_misses=3) is None
+    # 实时流(摄像头/网络)现在也有渲染 miss 宽限(默认2, 修"摄像头一抖就清框"),
+    # 可用 stream_max_misses 配置; 显式 None 回退到原无宽限行为。
+    assert _ppe_max_render_misses(source_type="camera", realtime=True) == 2
+    assert _ppe_max_render_misses(source_type="rtsp", realtime=True, stream_max_misses=3) == 3
+    assert _ppe_max_render_misses(source_type="camera", realtime=True, stream_max_misses=None) is None
 
 
 def test_evaluate_ppe_business_applies_summary_and_temporal_state() -> None:

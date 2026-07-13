@@ -36,11 +36,17 @@ def _feature_probe(info: dict[str, Any], frame_idx: int, detections: Any = None)
         # 原始 YOLO 检出计数(未过显示门), 区分"YOLO 没检出头" vs "后处理过滤掉头"
         raw_person = raw_head = raw_helmet = 0
         raw_head_confs: list[float] = []
+        raw_helmet_confs: list[float] = []
+        raw_max_area = 0.0
         if detections is not None:
             boxes = list(getattr(detections, "boxes", []) or [])
             classes = list(getattr(detections, "classes", []) or [])
             confs = list(getattr(detections, "confidences", []) or [])
             names = getattr(detections, "names", {}) or {}
+            for b in boxes:
+                if isinstance(b, (list, tuple)) and len(b) >= 4:
+                    a = abs(float(b[2]) - float(b[0])) * abs(float(b[3]) - float(b[1])) / (640.0 * 640.0)
+                    raw_max_area = max(raw_max_area, a)
             for cid, cf in zip(classes, confs):
                 lbl = str(names.get(int(cid), "")) if isinstance(names, dict) else str(cid)
                 if is_person_label(lbl):
@@ -50,6 +56,7 @@ def _feature_probe(info: dict[str, Any], frame_idx: int, detections: Any = None)
                     raw_head_confs.append(round(float(cf), 3))
                 elif is_helmet_label(lbl):
                     raw_helmet += 1
+                    raw_helmet_confs.append(round(float(cf), 3))
         details = info.get("details", {}) if isinstance(info.get("details"), dict) else {}
         scene = details.get("scene_context", {}) if isinstance(details.get("scene_context"), dict) else {}
         flow = details.get("flow_context", {}) if isinstance(details.get("flow_context"), dict) else {}
@@ -80,6 +87,8 @@ def _feature_probe(info: dict[str, Any], frame_idx: int, detections: Any = None)
             "raw_head": raw_head,
             "raw_helmet": raw_helmet,
             "raw_head_confs": raw_head_confs,
+            "raw_helmet_confs": raw_helmet_confs,
+            "raw_max_area": round(raw_max_area, 3),
         }
         with open(_PROBE_PATH, "a", encoding="utf-8") as fh:
             fh.write(_json.dumps(row, ensure_ascii=False) + "\n")
@@ -276,6 +285,12 @@ class FrameProcessor:
         self.ppe_file_realtime_max_render_misses = int(
             runtime_config.get("ppe_file_realtime_max_render_misses", 2) or 2
         )
+        # 实时流(摄像头/网络)渲染 miss 宽限: 默认 2(与文件一致), 消除摄像头抖动导致的清框闪断。
+        # 缺省键时用 2; 配置显式设为 null 则回退到原"实时流无宽限"行为。
+        _stream_misses = runtime_config.get("ppe_stream_max_render_misses", 2)
+        self.ppe_stream_max_render_misses = (
+            None if _stream_misses is None else int(_stream_misses)
+        )
         a3b_config = config.get("a3b", {}) if isinstance(config.get("a3b"), dict) else {}
         self.source_auth_media_suppression_threshold = float(a3b_config.get("observed_threshold", 0.42))
         self.a3b_soft = A3BSoftTriggerState(a3b_config)
@@ -368,6 +383,7 @@ class FrameProcessor:
                 source_type=source_type,
                 realtime=realtime,
                 file_realtime_max_misses=self.ppe_file_realtime_max_render_misses,
+                stream_max_misses=self.ppe_stream_max_render_misses,
             ),
             postprocess_config=self.ppe_postprocess_config,
             source_auth_media_bbox=static_media.get("p_media_bbox"),
@@ -624,6 +640,7 @@ class FrameProcessor:
             "tracked_boxes_count": int(tracked_boxes_count),
             "render_boxes_count": int(render_boxes_count),
             "ppe_file_realtime_max_render_misses": int(self.ppe_file_realtime_max_render_misses),
+            "ppe_stream_max_render_misses": self.ppe_stream_max_render_misses,
             "ppe_roi_redetect_budget_ok": bool(redetect_budget_ok),
             "ppe_roi_redetect_triggered": bool(redetect_count > 0),
             "ppe_roi_redetect_count": int(redetect_count),
@@ -643,9 +660,19 @@ def _ppe_max_render_misses(
     source_type: str,
     realtime: bool,
     file_realtime_max_misses: int = 2,
+    stream_max_misses: int | None = 2,
 ) -> int | None:
-    if str(source_type or "").lower() == "file" and bool(realtime):
+    """渲染 miss 宽限帧数(head/helmet 漏检若干帧内保持显示)。
+    - 文件回放: 沿用 file_realtime_max_misses(默认2)。
+    - 实时流(摄像头/网络): 之前返回 None(无宽限), 导致摄像头画面天然抖动时任一帧
+      漏检/置信度跌破地板就立刻清框, 主观"很难稳定出框"。给实时流同样开宽限(默认2),
+      纯显示层, 不影响检测/留出集离线口径(留出集走 VideoDefensePipeline 不经此)。
+      设为 None 可回退到原无宽限行为。"""
+    kind = str(source_type or "").lower()
+    if kind == "file" and bool(realtime):
         return max(0, int(file_realtime_max_misses))
+    if kind in {"camera", "rtsp"}:
+        return None if stream_max_misses is None else max(0, int(stream_max_misses))
     return None
 
 

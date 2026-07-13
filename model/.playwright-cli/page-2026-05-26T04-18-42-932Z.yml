@@ -1,0 +1,153 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - heading "B模块模型安全中心" [level=1] [ref=e3]
+    - button "返回监控台" [ref=e4] [cursor=pointer]
+    - button "刷新" [ref=e5] [cursor=pointer]
+  - main [ref=e6]:
+    - generic [ref=e7]:
+      - generic [ref=e8]:
+        - generic [ref=e9]:
+          - generic [ref=e10]: 运行模型配置
+          - generic [ref=e11]: 默认模型
+        - generic [ref=e12]:
+          - generic [ref=e13]: 这里决定A模块即将运行的模型。保存后，监控台开始检测会读取这份配置；B模块扫描、准入和白名单也按同一份配置判断。
+          - generic [ref=e14]:
+            - text: 运行档位
+            - combobox "运行档位" [ref=e15] [cursor=pointer]:
+              - option "全速GPU（TensorRT）" [selected]
+              - option "均衡GPU（ONNX调试）"
+              - option "边缘ONNX（兼容）"
+          - generic [ref=e16]:
+            - checkbox "使用自定义模型" [ref=e17] [cursor=pointer]
+            - text: 使用自定义模型
+          - generic [ref=e18]: 自定义模型路径
+          - generic [ref=e19]:
+            - textbox "选择 .pt / .engine / .onnx 模型文件" [disabled] [ref=e20]
+            - button "浏览模型" [disabled] [ref=e21]
+          - generic [ref=e22]: 同源原始 PT（加速模型准入必填）
+          - generic [ref=e23]:
+            - textbox "选择与加速模型同源的 .pt 文件" [disabled] [ref=e24]
+            - button "浏览PT" [disabled] [ref=e25]
+          - generic [ref=e26]:
+            - generic [ref=e27]:
+              - text: 运行后端
+              - combobox "运行后端" [disabled] [ref=e28] [cursor=pointer]:
+                - option "自动识别" [selected]
+                - option "TensorRT（.engine）"
+                - option "ONNX"
+                - option "PyTorch（.pt）"
+            - generic [ref=e29]:
+              - text: 模型族
+              - combobox "模型族" [disabled] [ref=e30] [cursor=pointer]:
+                - option "自动识别" [selected]
+                - option "Ultralytics / YOLOv8"
+                - option "YOLOv5"
+          - generic [ref=e31]: TensorRT 表示使用已导出的 .engine 加速运行；B模块准入仍以同源原始 PT 为依据。未知模型必须先完成安全扫描，不能只靠路径或手工选择放行。
+          - generic [ref=e32]:
+            - checkbox "测试入口：绕过B模块安全准入直接运行当前模型" [ref=e33] [cursor=pointer]
+            - text: 测试入口：绕过B模块安全准入直接运行当前模型
+          - generic [ref=e34]: 仅用于当前阶段对比毒模型、原模型和净化模型检测效果；不会写入白名单，禁止生产使用。
+          - generic [ref=e35]:
+            - button "保存并应用" [ref=e36] [cursor=pointer]
+            - button "恢复默认模型" [ref=e37] [cursor=pointer]
+      - generic [ref=e38]:
+        - generic [ref=e39]:
+          - generic [ref=e40]: 当前模型准入
+          - generic [ref=e41]: 未检查
+        - generic [ref=e42]:
+          - generic [ref=e43]: 正在读取B模块准入状态。
+          - generic [ref=e44]:
+            - generic [ref=e45]:
+              - generic [ref=e46]: "--"
+              - text: 风险分数
+            - generic [ref=e47]:
+              - generic [ref=e48]: "--"
+              - text: 最近扫描
+            - generic [ref=e49]:
+              - generic [ref=e50]: "--"
+              - text: 白名单命中
+          - generic [ref=e51]:
+            - generic [ref=e52]:
+              - generic [ref=e53]: "--"
+              - text: 原始ASR
+            - generic [ref=e54]:
+              - generic [ref=e55]: "--"
+              - text: 净化后ASR
+            - generic [ref=e56]:
+              - generic [ref=e57]: "--"
+              - text: 净化后Wilson上界
+          - generic [ref=e58]:
+            - generic [ref=e59]:
+              - strong [ref=e60]: 运行档位：
+              - text: 全速GPU（TensorRT）
+            - generic [ref=e61]:
+              - text: 自动刷新
+              - combobox "自动刷新" [ref=e62] [cursor=pointer]:
+                - option "1.5秒" [selected]
+                - option "3秒"
+                - option "关闭"
+          - generic [ref=e63]: 检测运行档位以上方运行模型配置为准；TensorRT 代表 .engine 加速运行链路，不是空壳开关。未知模型必须先用原始 PT 做 B 模块准入。
+          - generic [ref=e64]:
+            - generic [ref=e65]:
+              - strong [ref=e66]: 运行模型：
+              - code [ref=e67]: "--"
+            - generic [ref=e68]:
+              - strong [ref=e69]: 源PT：
+              - code [ref=e70]: "--"
+            - generic [ref=e71]:
+              - strong [ref=e72]: 原始源模型：
+              - code [ref=e73]: "--"
+            - generic [ref=e74]:
+              - strong [ref=e75]: 净化模型：
+              - code [ref=e76]: "--"
+            - generic [ref=e77]:
+              - strong [ref=e78]: 模型指纹：
+              - code [ref=e79]: "--"
+            - generic [ref=e80]:
+              - strong [ref=e81]: 扫描报告：
+              - code [ref=e82]: "--"
+      - generic [ref=e83]:
+        - generic [ref=e84]:
+          - generic [ref=e85]: 白名单完整性
+          - generic [ref=e86]: 未检查
+        - generic [ref=e87]:
+          - generic [ref=e88]: 正在校验白名单和系统指纹。
+          - generic [ref=e89]:
+            - strong [ref=e90]: 白名单文件：
+            - code [ref=e91]: "--"
+          - generic [ref=e92]:
+            - strong [ref=e93]: 签名文件：
+            - code [ref=e94]: "--"
+          - generic [ref=e95]:
+            - strong [ref=e96]: 系统指纹：
+            - code [ref=e97]: "--"
+          - generic [ref=e98]:
+            - strong [ref=e99]: 白名单哈希：
+            - code [ref=e100]: "--"
+      - generic [ref=e101]:
+        - generic [ref=e102]:
+          - generic [ref=e103]: 操作
+          - generic [ref=e104]: 系统自动写入
+        - generic [ref=e105]:
+          - generic [ref=e106]: 白名单只能由原始PT完整扫描通过，或可疑模型净化后二次完整扫描通过后自动写入。用户只能删除或清空，不能手工添加。
+          - generic [ref=e107]:
+            - button "完整扫描并自动净化" [ref=e108] [cursor=pointer]
+            - button "净化并复扫" [ref=e109] [cursor=pointer]
+          - generic [ref=e110]:
+            - button "查看扫描报告" [ref=e111] [cursor=pointer]
+            - button "查看净化报告" [ref=e112] [cursor=pointer]
+          - generic [ref=e113]:
+            - button "打开日志页" [ref=e114] [cursor=pointer]
+            - button "删除当前模型信任" [ref=e115] [cursor=pointer]
+          - button "清空白名单" [ref=e117] [cursor=pointer]
+    - complementary [ref=e118]:
+      - generic [ref=e119]:
+        - generic [ref=e120]:
+          - generic [ref=e121]: 白名单记录
+          - generic [ref=e122]: "0"
+        - generic [ref=e125]: 正在读取白名单。
+      - generic [ref=e126]:
+        - generic [ref=e127]:
+          - generic [ref=e128]: 最近日志
+          - button "刷新日志" [ref=e129] [cursor=pointer]
+        - generic [ref=e132]: 正在读取日志。

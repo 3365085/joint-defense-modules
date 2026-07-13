@@ -1,0 +1,46 @@
+{
+  "config": "D:\\联合防御模块\\model\\configs\\module_a_runtime.yaml",
+  "profile": "desktop_rtx",
+  "a3b_sensitivity": "",
+  "backend": "tensorrt",
+  "videos": [
+    {
+      "video": "D:\\联合防御模块\\素材\\手机随意录制的视频\\固定镜头室外视频.mp4",
+      "frames": 1555,
+      "wall_seconds": 136.536,
+      "fps_effective": 11.39,
+      "alert_frames": 1,
+      "suspicious_frames": 14,
+      "a3b_trigger_frames": 0,
+      "glare_frames": 0,
+      "p_adv_max": 0.4406,
+      "p_adv_mean": 0.1685,
+      "p_media_max": 0.0,
+      "a3b_display_score_max": 0.0,
+      "timing_mean_ms": 69.1,
+      "timing_p95_ms": 144.7,
+      "alert_ranges": [
+        {
+          "start": 479,
+          "end": 479,
+          "count": 1
+        }
+      ],
+      "reason_code_counts": {
+        "local_temporal_texture_change": 1554,
+        "temporal_texture_change": 1283,
+        "extreme_motion_temporal_override": 731,
+        "light_optical_flow_artifact": 520,
+        "paired_temporal_light_flow_change": 324,
+        "motion_artifact": 180,
+        "track_consistency_drop": 140,
+        "paired_temporal_flow_change": 41,
+        "flow_local_anomaly": 12,
+        "paired_track_consistency_drop": 8,
+        "strong_temporal_texture_change": 2,
+        "target_motion_temporal_anomaly": 1,
+        "target_track_consistency_drop": 1
+      }
+    }
+  ]
+}

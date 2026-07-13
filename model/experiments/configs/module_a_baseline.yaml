@@ -1,0 +1,4 @@
+# Compatibility path for legacy artifact-resolution tests.
+# Runtime config moved to configs/module_a_runtime.yaml.
+module_a:
+  frame_size: 640

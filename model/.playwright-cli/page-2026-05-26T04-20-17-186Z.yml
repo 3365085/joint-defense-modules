@@ -1,0 +1,456 @@
+- generic [ref=e1]:
+  - banner [ref=e2]:
+    - heading "B模块模型安全中心" [level=1] [ref=e3]
+    - button "返回监控台" [ref=e4] [cursor=pointer]
+    - button "刷新" [ref=e5] [cursor=pointer]
+  - main [ref=e6]:
+    - generic [ref=e7]:
+      - generic [ref=e8]:
+        - generic [ref=e9]:
+          - generic [ref=e10]: 运行模型配置
+          - generic [ref=e11]: 默认模型
+        - generic [ref=e12]:
+          - generic [ref=e13]: 这里决定A模块即将运行的模型。保存后，监控台开始检测会读取这份配置；B模块扫描、准入和白名单也按同一份配置判断。
+          - generic [ref=e14]:
+            - text: 运行档位
+            - combobox "运行档位" [ref=e15] [cursor=pointer]:
+              - option "全速GPU（TensorRT）" [selected]
+              - option "均衡GPU（ONNX调试）"
+              - option "边缘ONNX（兼容）"
+          - generic [ref=e16]:
+            - checkbox "使用自定义模型" [ref=e17] [cursor=pointer]
+            - text: 使用自定义模型
+          - generic [ref=e18]: 自定义模型路径
+          - generic [ref=e19]:
+            - textbox "选择 .pt / .engine / .onnx 模型文件" [disabled] [ref=e20]
+            - button "浏览模型" [disabled] [ref=e21]
+          - generic [ref=e22]: 同源原始 PT（加速模型准入必填）
+          - generic [ref=e23]:
+            - textbox "选择与加速模型同源的 .pt 文件" [disabled] [ref=e24]
+            - button "浏览PT" [disabled] [ref=e25]
+          - generic [ref=e26]:
+            - generic [ref=e27]:
+              - text: 运行后端
+              - combobox "运行后端" [disabled] [ref=e28] [cursor=pointer]:
+                - option "自动识别" [selected]
+                - option "TensorRT（.engine）"
+                - option "ONNX"
+                - option "PyTorch（.pt）"
+            - generic [ref=e29]:
+              - text: 模型族
+              - combobox "模型族" [disabled] [ref=e30] [cursor=pointer]:
+                - option "自动识别" [selected]
+                - option "Ultralytics / YOLOv8"
+                - option "YOLOv5"
+          - generic [ref=e31]: TensorRT 表示使用已导出的 .engine 加速运行；B模块准入仍以同源原始 PT 为依据。未知模型必须先完成安全扫描，不能只靠路径或手工选择放行。
+          - generic [ref=e32]:
+            - checkbox "测试入口：绕过B模块安全准入直接运行当前模型" [ref=e33] [cursor=pointer]
+            - text: 测试入口：绕过B模块安全准入直接运行当前模型
+          - generic [ref=e34]: 仅用于当前阶段对比毒模型、原模型和净化模型检测效果；不会写入白名单，禁止生产使用。
+          - generic [ref=e35]:
+            - button "保存并应用" [active] [ref=e36] [cursor=pointer]
+            - button "恢复默认模型" [ref=e37] [cursor=pointer]
+          - generic [ref=e681]: 模型运行配置已保存。
+      - generic [ref=e38]:
+        - generic [ref=e39]:
+          - generic [ref=e40]: 当前模型准入
+          - generic [ref=e41]: 已信任
+        - generic [ref=e42]:
+          - generic [ref=e43]: 当前运行模型已通过B模块准入，可以启动A模块检测。
+          - generic [ref=e44]:
+            - generic [ref=e45]:
+              - generic [ref=e46]: "0.000"
+              - text: 风险分数
+            - generic [ref=e47]:
+              - generic [ref=e48]: 2026-05-26 03:16:49 UTC
+              - text: 最近扫描
+            - generic [ref=e49]:
+              - generic [ref=e50]: 是
+              - text: 白名单命中
+          - generic [ref=e51]:
+            - generic [ref=e52]:
+              - generic [ref=e53]: "--"
+              - text: 原始ASR
+            - generic [ref=e54]:
+              - generic [ref=e55]: "--"
+              - text: 净化后ASR
+            - generic [ref=e56]:
+              - generic [ref=e57]: "--"
+              - text: 净化后Wilson上界
+          - generic [ref=e58]:
+            - generic [ref=e59]:
+              - strong [ref=e60]: 运行档位：
+              - text: 全速GPU（TensorRT）
+            - generic [ref=e61]:
+              - text: 自动刷新
+              - combobox "自动刷新" [ref=e62] [cursor=pointer]:
+                - option "1.5秒" [selected]
+                - option "3秒"
+                - option "关闭"
+          - generic [ref=e63]: 检测运行档位以上方运行模型配置为准；TensorRT 代表 .engine 加速运行链路，不是空壳开关。未知模型必须先用原始 PT 做 B 模块准入。
+          - generic [ref=e64]:
+            - generic [ref=e65]:
+              - strong [ref=e66]: 运行模型：
+              - code [ref=e67]: D:\联合防御模块\model\baseline_training\runs\baseline_yolov5\weights\best_fp16_640.engine
+            - generic [ref=e68]:
+              - strong [ref=e69]: 源PT：
+              - code [ref=e70]: D:\联合防御模块\model\baseline_training\runs\baseline_yolov5\weights\best.pt
+            - generic [ref=e71]:
+              - strong [ref=e72]: 原始源模型：
+              - code [ref=e73]: "--"
+            - generic [ref=e74]:
+              - strong [ref=e75]: 净化模型：
+              - code [ref=e76]: "--"
+            - generic [ref=e77]:
+              - strong [ref=e78]: 模型指纹：
+              - code [ref=e79]: sha256:83117cd3986278b7cfdb0642d70548de407944ffcf5a9ca08a6d725bd63ea403
+            - generic [ref=e80]:
+              - strong [ref=e81]: 扫描报告：
+              - code [ref=e82]: D:\联合防御模块\model\runtime\model_security\reports\sha256_83117cd3986278b7cfdb0642d70548de407944ffcf5a9ca08a6d725bd63ea403_full.json
+      - generic [ref=e83]:
+        - generic [ref=e84]:
+          - generic [ref=e85]: 白名单完整性
+          - generic [ref=e86]: 正常
+        - generic [ref=e87]:
+          - generic [ref=e88]: 白名单完整性校验通过。系统指纹状态：正常。
+          - generic [ref=e89]:
+            - strong [ref=e90]: 白名单文件：
+            - code [ref=e91]: D:\联合防御模块\model\runtime\model_security\trusted_registry.json
+          - generic [ref=e92]:
+            - strong [ref=e93]: 签名文件：
+            - code [ref=e94]: D:\联合防御模块\model\runtime\model_security\trusted_registry.seal.json
+          - generic [ref=e95]:
+            - strong [ref=e96]: 系统指纹：
+            - code [ref=e97]: sha256:b775a946db9534376372118b0eb4cd3faeff5ccb78fb0c292e39069f02b20c05
+          - generic [ref=e98]:
+            - strong [ref=e99]: 白名单哈希：
+            - code [ref=e100]: sha256:0eb8bf516a5fc57f82df12d4c98e9809af04ba059bf746d5b0c3c3fc5ea81691
+      - generic [ref=e101]:
+        - generic [ref=e102]:
+          - generic [ref=e103]: 操作
+          - generic [ref=e104]: 系统自动写入
+        - generic [ref=e105]:
+          - generic [ref=e106]: 白名单只能由原始PT完整扫描通过，或可疑模型净化后二次完整扫描通过后自动写入。用户只能删除或清空，不能手工添加。
+          - generic [ref=e107]:
+            - button "完整扫描并自动净化" [ref=e108] [cursor=pointer]
+            - button "净化并复扫" [disabled] [ref=e109]
+          - generic [ref=e110]:
+            - button "查看扫描报告" [ref=e111] [cursor=pointer]
+            - button "查看净化报告" [ref=e112] [cursor=pointer]
+          - generic [ref=e113]:
+            - button "打开日志页" [ref=e114] [cursor=pointer]
+            - button "删除当前模型信任" [ref=e115] [cursor=pointer]
+          - button "清空白名单" [ref=e117] [cursor=pointer]
+    - complementary [ref=e118]:
+      - generic [ref=e119]:
+        - generic [ref=e120]:
+          - generic [ref=e121]: 白名单记录
+          - generic [ref=e122]: "7"
+        - generic [ref=e124]:
+          - article [ref=e1778]:
+            - generic [ref=e1779]:
+              - generic [ref=e1780]:
+                - strong [ref=e1781]: 已信任
+                - text: · 2026-05-26 03:20:32 UTC
+              - button "删除" [ref=e1782] [cursor=pointer]
+            - generic [ref=e1783]:
+              - strong [ref=e1784]: 指纹：
+              - code [ref=e1785]: sha256:75a1c51689987d5faa6dd4048ecf2d8468d0c38b78c34ca6d3f81551c9ab1e12
+            - generic [ref=e1786]:
+              - strong [ref=e1787]: 运行模型：
+              - code [ref=e1788]: D:\联合防御模块\model\runtime\model_security\purified\sha256_0a308788d39df86f98d1da38ed4115779583230741d3b6dc5e199b4d7de094e3\packaged_strict\b2_b_sig_multiperiod_oda_purified_strict.pt
+            - generic [ref=e1789]:
+              - strong [ref=e1790]: 源模型：
+              - code [ref=e1791]: D:\联合防御模块\model\runtime\model_security\purified\sha256_0a308788d39df86f98d1da38ed4115779583230741d3b6dc5e199b4d7de094e3\packaged_strict\b2_b_sig_multiperiod_oda_purified_strict.pt
+            - generic [ref=e1792]:
+              - strong [ref=e1793]: 原始源模型：
+              - code [ref=e1794]: "--"
+            - generic [ref=e1795]:
+              - strong [ref=e1796]: ASR对比：
+              - text: 原始 -- · 净化后 -- · Wilson上界 --
+            - generic [ref=e1797]:
+              - strong [ref=e1798]: 来源：
+              - text: purified_full_scan ·
+              - strong [ref=e1799]: 风险：
+              - text: "0.004"
+          - article [ref=e1800]:
+            - generic [ref=e1801]:
+              - generic [ref=e1802]:
+                - strong [ref=e1803]: 已信任
+                - text: · 2026-05-26 03:17:45 UTC
+              - button "删除" [ref=e1804] [cursor=pointer]
+            - generic [ref=e1805]:
+              - strong [ref=e1806]: 指纹：
+              - code [ref=e1807]: sha256:a79e55b165b612c94221471f93ade841ed71fce3e5cc59e18d699908e50eea1d
+            - generic [ref=e1808]:
+              - strong [ref=e1809]: 运行模型：
+              - code [ref=e1810]: D:\联合防御模块\model\runtime\model_security\purified\sha256_dd841a788a0e0e443c7b6fe62a72e1edc8157beaed3c3eecdd3d77cdec5160f6\packaged_strict\b1_b_invisible_noise_hi_oda_purified_strict.pt
+            - generic [ref=e1811]:
+              - strong [ref=e1812]: 源模型：
+              - code [ref=e1813]: D:\联合防御模块\model\runtime\model_security\purified\sha256_dd841a788a0e0e443c7b6fe62a72e1edc8157beaed3c3eecdd3d77cdec5160f6\packaged_strict\b1_b_invisible_noise_hi_oda_purified_strict.pt
+            - generic [ref=e1814]:
+              - strong [ref=e1815]: 原始源模型：
+              - code [ref=e1816]: "--"
+            - generic [ref=e1817]:
+              - strong [ref=e1818]: ASR对比：
+              - text: 原始 -- · 净化后 -- · Wilson上界 --
+            - generic [ref=e1819]:
+              - strong [ref=e1820]: 来源：
+              - text: purified_full_scan ·
+              - strong [ref=e1821]: 风险：
+              - text: "0.004"
+          - article [ref=e1822]:
+            - generic [ref=e1823]:
+              - generic [ref=e1824]:
+                - strong [ref=e1825]: 已信任
+                - text: · 2026-05-26 03:16:49 UTC
+              - button "删除" [ref=e1826] [cursor=pointer]
+            - generic [ref=e1827]:
+              - strong [ref=e1828]: 指纹：
+              - code [ref=e1829]: sha256:83117cd3986278b7cfdb0642d70548de407944ffcf5a9ca08a6d725bd63ea403
+            - generic [ref=e1830]:
+              - strong [ref=e1831]: 运行模型：
+              - code [ref=e1832]: D:\联合防御模块\model\baseline_training\runs\baseline_yolov5\weights\best_fp16_640.engine
+            - generic [ref=e1833]:
+              - strong [ref=e1834]: 源模型：
+              - code [ref=e1835]: D:\联合防御模块\model\baseline_training\runs\baseline_yolov5\weights\best.pt
+            - generic [ref=e1836]:
+              - strong [ref=e1837]: 原始源模型：
+              - code [ref=e1838]: "--"
+            - generic [ref=e1839]:
+              - strong [ref=e1840]: ASR对比：
+              - text: 原始 -- · 净化后 -- · Wilson上界 --
+            - generic [ref=e1841]:
+              - strong [ref=e1842]: 来源：
+              - text: full_scan ·
+              - strong [ref=e1843]: 风险：
+              - text: "0.000"
+          - article [ref=e1844]:
+            - generic [ref=e1845]:
+              - generic [ref=e1846]:
+                - strong [ref=e1847]: 已信任
+                - text: · 2026-05-26 03:16:23 UTC
+              - button "删除" [ref=e1848] [cursor=pointer]
+            - generic [ref=e1849]:
+              - strong [ref=e1850]: 指纹：
+              - code [ref=e1851]: sha256:6b7b22262f20680d15d89c003db6de099d56d5791dad66b32ae0ec33d08be56c
+            - generic [ref=e1852]:
+              - strong [ref=e1853]: 运行模型：
+              - code [ref=e1854]: D:\联合防御模块\model\run_model\clear_output_head_helmet\b1_b_invisible_noise_hi_oda_purified_strict.pt
+            - generic [ref=e1855]:
+              - strong [ref=e1856]: 源模型：
+              - code [ref=e1857]: D:\联合防御模块\model\run_model\clear_output_head_helmet\b1_b_invisible_noise_hi_oda_purified_strict.pt
+            - generic [ref=e1858]:
+              - strong [ref=e1859]: 原始源模型：
+              - code [ref=e1860]: "--"
+            - generic [ref=e1861]:
+              - strong [ref=e1862]: ASR对比：
+              - text: 原始 -- · 净化后 -- · Wilson上界 --
+            - generic [ref=e1863]:
+              - strong [ref=e1864]: 来源：
+              - text: full_scan ·
+              - strong [ref=e1865]: 风险：
+              - text: "0.004"
+          - article [ref=e1866]:
+            - generic [ref=e1867]:
+              - generic [ref=e1868]:
+                - strong [ref=e1869]: 已信任
+                - text: · 2026-05-26 02:49:57 UTC
+              - button "删除" [ref=e1870] [cursor=pointer]
+            - generic [ref=e1871]:
+              - strong [ref=e1872]: 指纹：
+              - code [ref=e1873]: sha256:3d5087f497116f99ba4fa62f3cc89041513657d9c26952f471e8ed7f04031352
+            - generic [ref=e1874]:
+              - strong [ref=e1875]: 运行模型：
+              - code [ref=e1876]: D:\联合防御模块\model\runtime\model_security\purified\sha256_ba397efae4bf8de9a849600fa0e6d2c739e8d04fff1da83aed5e11fc62924bf8\weight_soup\anchor01_v2_mask_bd_v2_clean_baseline_autodetox_alpha0p2.pt
+            - generic [ref=e1877]:
+              - strong [ref=e1878]: 源模型：
+              - code [ref=e1879]: D:\联合防御模块\model\runtime\model_security\purified\sha256_ba397efae4bf8de9a849600fa0e6d2c739e8d04fff1da83aed5e11fc62924bf8\weight_soup\anchor01_v2_mask_bd_v2_clean_baseline_autodetox_alpha0p2.pt
+            - generic [ref=e1880]:
+              - strong [ref=e1881]: 原始源模型：
+              - code [ref=e1882]: "--"
+            - generic [ref=e1883]:
+              - strong [ref=e1884]: ASR对比：
+              - text: 原始 -- · 净化后 -- · Wilson上界 --
+            - generic [ref=e1885]:
+              - strong [ref=e1886]: 来源：
+              - text: purified_full_scan ·
+              - strong [ref=e1887]: 风险：
+              - text: "0.000"
+          - article [ref=e1888]:
+            - generic [ref=e1889]:
+              - generic [ref=e1890]:
+                - strong [ref=e1891]: 已信任
+                - text: · 2026-05-26 02:24:06 UTC
+              - button "删除" [ref=e1892] [cursor=pointer]
+            - generic [ref=e1893]:
+              - strong [ref=e1894]: 指纹：
+              - code [ref=e1895]: sha256:0cd4eb7c99c77c0d898e4b5c8e03309365647f9771ea3085c937a5734544b9bc
+            - generic [ref=e1896]:
+              - strong [ref=e1897]: 运行模型：
+              - code [ref=e1898]: D:\联合防御模块\model\runtime\model_security\purified\sha256_a4c97d888123aefad82514a9ca54d6db7de32045ba3d5b70cd3a82649b6170d8\weight_soup\anchor01_v4_mask_bd_v4_clean_baseline_autodetox_alpha0p2.pt
+            - generic [ref=e1899]:
+              - strong [ref=e1900]: 源模型：
+              - code [ref=e1901]: D:\联合防御模块\model\runtime\model_security\purified\sha256_a4c97d888123aefad82514a9ca54d6db7de32045ba3d5b70cd3a82649b6170d8\weight_soup\anchor01_v4_mask_bd_v4_clean_baseline_autodetox_alpha0p2.pt
+            - generic [ref=e1902]:
+              - strong [ref=e1903]: 原始源模型：
+              - code [ref=e1904]: "--"
+            - generic [ref=e1905]:
+              - strong [ref=e1906]: ASR对比：
+              - text: 原始 -- · 净化后 -- · Wilson上界 --
+            - generic [ref=e1907]:
+              - strong [ref=e1908]: 来源：
+              - text: purified_full_scan ·
+              - strong [ref=e1909]: 风险：
+              - text: "0.000"
+          - article [ref=e1910]:
+            - generic [ref=e1911]:
+              - generic [ref=e1912]:
+                - strong [ref=e1913]: 已信任
+                - text: · 2026-05-26 02:23:26 UTC
+              - button "删除" [ref=e1914] [cursor=pointer]
+            - generic [ref=e1915]:
+              - strong [ref=e1916]: 指纹：
+              - code [ref=e1917]: sha256:2979008e9edecd8c8049638786355fbda84bbfd30f74a23e0fcdddca178d1389
+            - generic [ref=e1918]:
+              - strong [ref=e1919]: 运行模型：
+              - code [ref=e1920]: D:\联合防御模块\b模块新算法\backbone_soup_full_pipeline_v2_2026-05-24\models\clean_baseline\v2_mask_bd_v2_clean_baseline.pt
+            - generic [ref=e1921]:
+              - strong [ref=e1922]: 源模型：
+              - code [ref=e1923]: D:\联合防御模块\b模块新算法\backbone_soup_full_pipeline_v2_2026-05-24\models\clean_baseline\v2_mask_bd_v2_clean_baseline.pt
+            - generic [ref=e1924]:
+              - strong [ref=e1925]: 原始源模型：
+              - code [ref=e1926]: "--"
+            - generic [ref=e1927]:
+              - strong [ref=e1928]: ASR对比：
+              - text: 原始 -- · 净化后 -- · Wilson上界 --
+            - generic [ref=e1929]:
+              - strong [ref=e1930]: 来源：
+              - text: full_scan ·
+              - strong [ref=e1931]: 风险：
+              - text: "0.000"
+      - generic [ref=e126]:
+        - generic [ref=e127]:
+          - generic [ref=e128]: 最近日志
+          - button "刷新日志" [ref=e129] [cursor=pointer]
+        - generic [ref=e131]:
+          - article [ref=e1932]:
+            - generic [ref=e1933]: 需要复核 扫描完成
+            - generic [ref=e1934]: 2026-05-26 04:14:51 UTC
+            - generic [ref=e1935]: B模块quick扫描完成：review
+          - article [ref=e1936]:
+            - generic [ref=e1937]: 运行中 扫描开始
+            - generic [ref=e1938]: 2026-05-26 04:14:51 UTC
+            - generic [ref=e1939]: B模块quick扫描开始
+          - article [ref=e1940]:
+            - generic [ref=e1941]: 需要复核 扫描完成
+            - generic [ref=e1942]: 2026-05-26 04:14:18 UTC
+            - generic [ref=e1943]: B模块quick扫描完成：review
+          - article [ref=e1944]:
+            - generic [ref=e1945]: 运行中 扫描开始
+            - generic [ref=e1946]: 2026-05-26 04:14:18 UTC
+            - generic [ref=e1947]: B模块quick扫描开始
+          - article [ref=e1948]:
+            - generic [ref=e1949]: 需要复核 扫描完成
+            - generic [ref=e1950]: 2026-05-26 04:13:24 UTC
+            - generic [ref=e1951]: B模块quick扫描完成：review
+          - article [ref=e1952]:
+            - generic [ref=e1953]: 运行中 扫描开始
+            - generic [ref=e1954]: 2026-05-26 04:13:24 UTC
+            - generic [ref=e1955]: B模块quick扫描开始
+          - article [ref=e1956]:
+            - generic [ref=e1957]: 需要复核 扫描完成
+            - generic [ref=e1958]: 2026-05-26 04:12:42 UTC
+            - generic [ref=e1959]: B模块quick扫描完成：review
+          - article [ref=e1960]:
+            - generic [ref=e1961]: 运行中 扫描开始
+            - generic [ref=e1962]: 2026-05-26 04:12:42 UTC
+            - generic [ref=e1963]: B模块quick扫描开始
+          - article [ref=e1964]:
+            - generic [ref=e1965]: scan_clean_trusted 净化完成
+            - generic [ref=e1966]: 2026-05-26 03:20:32 UTC
+            - generic [ref=e1967]: B模块净化完成：scan_clean_trusted
+          - article [ref=e1968]:
+            - generic [ref=e1969]: 已信任 写入白名单
+            - generic [ref=e1970]: 2026-05-26 03:20:32 UTC
+            - generic [ref=e1971]: 净化模型复扫通过，已自动写入白名单
+          - article [ref=e1972]:
+            - generic [ref=e1973]: 运行中 净化开始
+            - generic [ref=e1974]: 2026-05-26 03:20:32 UTC
+            - generic [ref=e1975]: B模块净化开始
+          - article [ref=e1976]:
+            - generic [ref=e1977]: 运行中 purification_auto_queued
+            - generic [ref=e1978]: 2026-05-26 03:20:32 UTC
+            - generic [ref=e1979]: 完整扫描发现疑似投毒模型，自动进入净化并复扫流程
+          - article [ref=e1980]:
+            - generic [ref=e1981]: 疑似风险 扫描完成
+            - generic [ref=e1982]: 2026-05-26 03:20:32 UTC
+            - generic [ref=e1983]: B模块full扫描完成：suspicious
+          - article [ref=e1984]:
+            - generic [ref=e1985]: 运行中 扫描开始
+            - generic [ref=e1986]: 2026-05-26 03:20:32 UTC
+            - generic [ref=e1987]: B模块full扫描开始
+          - article [ref=e1988]:
+            - generic [ref=e1989]: 已信任 purified_runtime_selected
+            - generic [ref=e1990]: 2026-05-26 03:20:06 UTC
+            - generic [ref=e1991]: 已自动选择净化后可信PT作为A模块运行模型
+          - article [ref=e1992]:
+            - generic [ref=e1993]: 已信任 purified_runtime_selected
+            - generic [ref=e1994]: 2026-05-26 03:19:56 UTC
+            - generic [ref=e1995]: 已自动选择净化后可信PT作为A模块运行模型
+          - article [ref=e1996]:
+            - generic [ref=e1997]: 已信任 purified_runtime_selected
+            - generic [ref=e1998]: 2026-05-26 03:18:35 UTC
+            - generic [ref=e1999]: 已自动选择净化后可信PT作为A模块运行模型
+          - article [ref=e2000]:
+            - generic [ref=e2001]: 已信任 purified_runtime_selected
+            - generic [ref=e2002]: 2026-05-26 03:18:01 UTC
+            - generic [ref=e2003]: 已自动选择净化后可信PT作为A模块运行模型
+          - article [ref=e2004]:
+            - generic [ref=e2005]: scan_clean_trusted 净化完成
+            - generic [ref=e2006]: 2026-05-26 03:17:45 UTC
+            - generic [ref=e2007]: B模块净化完成：scan_clean_trusted
+          - article [ref=e2008]:
+            - generic [ref=e2009]: 已信任 写入白名单
+            - generic [ref=e2010]: 2026-05-26 03:17:45 UTC
+            - generic [ref=e2011]: 净化模型复扫通过，已自动写入白名单
+          - article [ref=e2012]:
+            - generic [ref=e2013]: 运行中 净化开始
+            - generic [ref=e2014]: 2026-05-26 03:17:45 UTC
+            - generic [ref=e2015]: B模块净化开始
+          - article [ref=e2016]:
+            - generic [ref=e2017]: 运行中 purification_auto_queued
+            - generic [ref=e2018]: 2026-05-26 03:17:45 UTC
+            - generic [ref=e2019]: 完整扫描发现疑似投毒模型，自动进入净化并复扫流程
+          - article [ref=e2020]:
+            - generic [ref=e2021]: 疑似风险 扫描完成
+            - generic [ref=e2022]: 2026-05-26 03:17:45 UTC
+            - generic [ref=e2023]: B模块full扫描完成：suspicious
+          - article [ref=e2024]:
+            - generic [ref=e2025]: 运行中 扫描开始
+            - generic [ref=e2026]: 2026-05-26 03:17:45 UTC
+            - generic [ref=e2027]: B模块full扫描开始
+          - article [ref=e2028]:
+            - generic [ref=e2029]: 已信任 写入白名单
+            - generic [ref=e2030]: 2026-05-26 03:16:49 UTC
+            - generic [ref=e2031]: 完整扫描通过，模型已自动写入白名单
+          - article [ref=e2032]:
+            - generic [ref=e2033]: 扫描通过 扫描完成
+            - generic [ref=e2034]: 2026-05-26 03:16:49 UTC
+            - generic [ref=e2035]: B模块full扫描完成：clean
+          - article [ref=e2036]:
+            - generic [ref=e2037]: 运行中 扫描开始
+            - generic [ref=e2038]: 2026-05-26 03:16:44 UTC
+            - generic [ref=e2039]: B模块full扫描开始
+          - article [ref=e2040]:
+            - generic [ref=e2041]: 已信任 写入白名单
+            - generic [ref=e2042]: 2026-05-26 03:16:23 UTC
+            - generic [ref=e2043]: 完整扫描通过，模型已自动写入白名单
+          - article [ref=e2044]:
+            - generic [ref=e2045]: 扫描通过 扫描完成
+            - generic [ref=e2046]: 2026-05-26 03:16:23 UTC
+            - generic [ref=e2047]: B模块full扫描完成：clean
+          - article [ref=e2048]:
+            - generic [ref=e2049]: 运行中 扫描开始
+            - generic [ref=e2050]: 2026-05-26 03:16:23 UTC
+            - generic [ref=e2051]: B模块full扫描开始

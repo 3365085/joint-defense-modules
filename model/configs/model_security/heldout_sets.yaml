@@ -1,0 +1,3 @@
+heldout_roots:
+  - D:\security_project_d\model_b_old\datasets\mask_bd_external_eval
+  - D:\security_project_d\model_b_old\datasets\poison_benchmark_cuda_tuned_remap_v2

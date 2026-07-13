@@ -1,0 +1,42 @@
+hybrid_purify_detox:
+  # Primary GPU profile for the clean extraction.
+  #
+  # This mirrors the original project's proven best_2 smoke detox route:
+  # Hybrid-PURIFY-OD, one bounded cycle, 416px validation, and the corrected
+  # poison_benchmark_cuda_tuned_remap_v2 external suite capped at 40 images per
+  # attack. It intentionally keeps the default attack specs from
+  # HybridPurifyConfig instead of overriding trigger geometry.
+  imgsz: 416
+  batch: 8
+  device: 0
+  amp: true
+  cycles: 1
+  phase_epochs: 1
+  feature_epochs: 1
+  recovery_epochs: 1
+  max_images: 800
+  eval_max_images: 100
+  external_eval_max_images_per_attack: 40
+  external_replay_max_images_per_attack: 80
+  external_failure_replay: true
+  external_failure_replay_repeat: 4
+  external_replay_floor_per_attack: 80
+  external_replay_floor_repeat: 1
+  base_clean_repeat: 2
+  recovery_clean_repeat: 5
+  base_attack_repeat: 1
+  max_attack_repeat: 5
+  top_k_attacks_per_cycle: 3
+  run_feature_purifier: false
+  run_phase_finetune: true
+  run_clean_recovery_finetune: true
+  evaluate_each_phase: true
+  rollback_bad_phase: true
+  rollback_unimproved_phase: false
+  external_select_phase_checkpoints: true
+  max_allowed_external_asr: 0.10
+  max_map_drop: 0.05
+  selection_max_map_drop: 0.08
+  require_no_attack_worse: true
+  max_single_attack_asr_worsen: 0.02
+  run_pre_prune: false

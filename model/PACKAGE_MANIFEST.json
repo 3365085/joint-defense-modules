@@ -1,0 +1,645 @@
+{
+  "package": "module_a_latest_frame_pipeline_v5",
+  "created_at": "2026-05-17",
+  "summary": "MP4 BrowserFrameSource refactored to latest-only mailbox detection pipeline; no historical frame queue; stale overlays are not painted.",
+  "key_changes": [
+    "Browser <video> remains the only MP4 playback clock.",
+    "Frontend samples only actually painted frames using requestVideoFrameCallback when available.",
+    "Backend keeps a single latest-frame mailbox for browser frames; slow detection overwrites old pending frames instead of queuing.",
+    "First frame still runs synchronously before preview becomes visible.",
+    "Canvas refuses to paint overlay records older than overlay_max_age_ms.",
+    "A3b confirmed score remains separated from observed score, and p_synth runtime/web branch remains removed."
+  ],
+  "files": [
+    {
+      "path": "PACKAGE_MANIFEST.json",
+      "size": 41072,
+      "sha256": "f89a4337105980617882d19c57398abadea6ee1dda14c1f52ec64cda4d7ab7f7"
+    },
+    {
+      "path": "README_交付说明.md",
+      "size": 3045,
+      "sha256": "cf8ed0458896c53f02e4a2c499e406a279f3e488712199572a4a490c2c392304"
+    },
+    {
+      "path": "README_快速接入.md",
+      "size": 4686,
+      "sha256": "b7ef5b58f908d5cbbe441cc9abb11c85c1844afc69c53ddb411b939f8000f26e"
+    },
+    {
+      "path": "README_本轮必读.md",
+      "size": 1353,
+      "sha256": "22e3ca88fd876a084775b5c67449e2323f4728ac6c88efb7b0dc8e759151fdff"
+    },
+    {
+      "path": "configs/module_a_runtime.yaml",
+      "size": 4892,
+      "sha256": "5ec5c16ec13ddc475838a2f4d7c3bba6ff79db9a58cb2226bd6c0b26f1a01d28"
+    },
+    {
+      "path": "defense/__init__.py",
+      "size": 33,
+      "sha256": "02dbaae5fcfab81f56abfa4ffb72c6ebd4518f103336c202277037036a1027e1"
+    },
+    {
+      "path": "defense/module_a/__init__.py",
+      "size": 458,
+      "sha256": "a03944a89d9ad8b7068f4b240b4394f4c0da08c35da828d264d2816b9e054646"
+    },
+    {
+      "path": "defense/module_a/alert_state.py",
+      "size": 3713,
+      "sha256": "8e5089186e0615dd3e9a234994e2b715b5f7f30aae6fb98ee26069d80201cd0f"
+    },
+    {
+      "path": "defense/module_a/backends/__init__.py",
+      "size": 263,
+      "sha256": "c1ea91ab26b742e5c684e1295bd24ace3b0fc1555fce9bbb703b718ebd0aad64"
+    },
+    {
+      "path": "defense/module_a/backends/detector_backend.py",
+      "size": 18312,
+      "sha256": "36358ebb257f5909423e4c2c7a53f478066d37594f7c36e9aa7511c91faa0ed0"
+    },
+    {
+      "path": "defense/module_a/calibration.py",
+      "size": 3671,
+      "sha256": "b5f86ef54be1d9c494da144c9bd91b3308a7d278dfd2b52f12236b0279e5ba4b"
+    },
+    {
+      "path": "defense/module_a/detector.py",
+      "size": 114155,
+      "sha256": "a453bda37a69fbe34d0f3c902117150e3f0ca47a56bf410a90a5492cbbc96ff3"
+    },
+    {
+      "path": "defense/module_a/features/__init__.py",
+      "size": 39,
+      "sha256": "147814c70335764861a29cea7265553ef757fc334c74f60b6237f7f71e0905be"
+    },
+    {
+      "path": "defense/module_a/features/a3/__init__.py",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "defense/module_a/features/a3/static_media/__init__.py",
+      "size": 93,
+      "sha256": "1888de8ccf7921a4bcd4d8cf7249f1779038176cf33ea31249b0f306e1388500"
+    },
+    {
+      "path": "defense/module_a/features/a3/static_media/candidate_extraction.py",
+      "size": 9734,
+      "sha256": "f009a676f2529115965a2e1189c2394472882bc3e90d7fda67a9b39c6b1cdb7f"
+    },
+    {
+      "path": "defense/module_a/features/a3/static_media/candidate_extraction_torch.py",
+      "size": 15226,
+      "sha256": "986a87c3c315c9b89d5c5ba13d910cf32187995efe2a252642bdfea583be479e"
+    },
+    {
+      "path": "defense/module_a/features/a3/static_media/candidate_track.py",
+      "size": 6187,
+      "sha256": "075d12e675cb4a6a5cb2d06c55926ca72eff15b538db284169130330cd33e2a8"
+    },
+    {
+      "path": "defense/module_a/features/a3/static_media/config.py",
+      "size": 8836,
+      "sha256": "c69d95e639b0d514a44f2800b766c3a13a4f26956ee06000e156c9045220b906"
+    },
+    {
+      "path": "defense/module_a/features/a3/static_media/detector.py",
+      "size": 57346,
+      "sha256": "088c04f3f255d8b10882b26501089299722ddd768efad04e114074783bf7f733"
+    },
+    {
+      "path": "defense/module_a/features/a3/static_media/feature_builder.py",
+      "size": 30924,
+      "sha256": "81b6fed140bd3b4c106875161a79dd25d51442833eec15856c038d5940673446"
+    },
+    {
+      "path": "defense/module_a/features/a3/static_media/homography_verifier.py",
+      "size": 4083,
+      "sha256": "1d8ef83c1251925b60f7de36787d499d782d1530ddc5543274f3bb6cd58d7e60"
+    },
+    {
+      "path": "defense/module_a/features/blur_degradation.py",
+      "size": 5499,
+      "sha256": "732886e60e57f8fa0379e9cacc96bb7887ac7e12bcf6837ff87b323535d5bfa3"
+    },
+    {
+      "path": "defense/module_a/features/lbp_texture.py",
+      "size": 3357,
+      "sha256": "1c4da1b6460128c8ace47ec65c1ec80863b9fd6c4f9383abeeb65bee8221e031"
+    },
+    {
+      "path": "defense/module_a/features/light_flow.py",
+      "size": 8958,
+      "sha256": "524a99578e95ae885151d0047c803d4a45e8e63af9961b42a007f71508f698e6"
+    },
+    {
+      "path": "defense/module_a/features/motion_artifact.py",
+      "size": 3660,
+      "sha256": "9de10934f8d48abe4294417b58b67d8e17b5bda64530cb78d99fecb6c4175cc9"
+    },
+    {
+      "path": "defense/module_a/features/overexposure.py",
+      "size": 604,
+      "sha256": "4a0f62a96a7c9e12b00460eb8043a0a910da9bfd361541dd172a238272062aca"
+    },
+    {
+      "path": "defense/module_a/features/static_image_spoof.py",
+      "size": 242,
+      "sha256": "878270acffda6108ef2cca8f9d91a039d6fdf117f671c267d6b8d226fa93fdf5"
+    },
+    {
+      "path": "defense/module_a/features/temporal_texture.py",
+      "size": 8331,
+      "sha256": "8830951090049a88753f2d196a4e5021cf90b4e77272965b9764313dd2ea46d7"
+    },
+    {
+      "path": "defense/module_a/features/track_consistency.py",
+      "size": 7376,
+      "sha256": "3b13e1edc148de9a76eb1bf56df9b2c8ebf09ed013411406900dffe82194932e"
+    },
+    {
+      "path": "defense/module_a/fusion/__init__.py",
+      "size": 259,
+      "sha256": "9072d9fcff29e9af6dbf63b18bddad61cc87ff8bcdaf79f61bb6c60aaa6efcfe"
+    },
+    {
+      "path": "defense/module_a/fusion/classifier_fusion.py",
+      "size": 4663,
+      "sha256": "e31c55033b6d60c1f8adebe83f7de881451c593da829485899b378b89477f302"
+    },
+    {
+      "path": "defense/module_a/fusion/rule_fusion.py",
+      "size": 10335,
+      "sha256": "d16d895fc1bafbb1dc3c9ab99c3b53ff8f2a305519ecffd481b4baf8ab3969bd"
+    },
+    {
+      "path": "defense/module_a/fusion/target_anchored.py",
+      "size": 16095,
+      "sha256": "5100f33a986a865affcf597c87c6ddadd97bde2e5b371d5d5545f41227dd9aa4"
+    },
+    {
+      "path": "defense/module_a/postprocess/__init__.py",
+      "size": 168,
+      "sha256": "adb61931c5e8e1780edc17f70d5267a14e396b366c30b055fb72e476a091b4a3"
+    },
+    {
+      "path": "defense/module_a/postprocess/ppe_tracking.py",
+      "size": 27988,
+      "sha256": "1f50f53f20b5e3e6c98df68e1013df213cc20668731ca66362c82939d556fc74"
+    },
+    {
+      "path": "defense/module_a/ppe_postprocess.py",
+      "size": 11872,
+      "sha256": "34aa1d5445eddc030c6690254accf80d2e70f270d7ddd911bdb455475c4943b6"
+    },
+    {
+      "path": "defense/module_a/roi_provider.py",
+      "size": 4928,
+      "sha256": "c9bcbfaee647aefa10345f6499a6c2bfaf4599736f932db9e34659183424f893"
+    },
+    {
+      "path": "defense/module_a/scheduler.py",
+      "size": 430,
+      "sha256": "e79b7fed39bfb19c2fa64d7fe8ef50f3df2bdbb9554131705706a58ce0998ec3"
+    },
+    {
+      "path": "defense/module_a/types.py",
+      "size": 2328,
+      "sha256": "c47a8dea3cf2a98436891eabfcafeb1fe0f9f8ba908c15c470e16e9ac7a8b0f8"
+    },
+    {
+      "path": "defense/module_a/utils.py",
+      "size": 2590,
+      "sha256": "7ee39c31b57616091190df8d6ee836b81acf1955123871e23a335d9d426c5a6e"
+    },
+    {
+      "path": "defense/pipelines/__init__.py",
+      "size": 219,
+      "sha256": "0421b43f95f44db34d8ae48e25c756745657508c768969b1e72387fcf9108696"
+    },
+    {
+      "path": "defense/pipelines/stream_source.py",
+      "size": 24552,
+      "sha256": "8e028d9b9a1c4204186d50f826f1210c5ad08144a89199a5510993262091aac5"
+    },
+    {
+      "path": "defense/pipelines/video_defense_pipeline.py",
+      "size": 16602,
+      "sha256": "a45cb3b512569a8eeabaa92ac37a15c115b76363ef5db9160a50e3cdae3ae132"
+    },
+    {
+      "path": "defense/runtime/__init__.py",
+      "size": 570,
+      "sha256": "c832615c7819c022d1d91f93fa259deb6a9d47f2688b3b140cdc0a873d171df0"
+    },
+    {
+      "path": "defense/runtime/config.py",
+      "size": 7024,
+      "sha256": "a2176475713ae627cb3f244cf1b39da1ccc78b7b6dfb449fd5fdb2e31c863a41"
+    },
+    {
+      "path": "defense/runtime/evidence.py",
+      "size": 8881,
+      "sha256": "6f2d4be5cd7e1f5f7417784e9803db50d3aefa3084eb280e7e306f303cb9ebb7"
+    },
+    {
+      "path": "defense/runtime/frame_processor.py",
+      "size": 16757,
+      "sha256": "12f1e9101ce2e20f586e91bfd89b9c76f38011b52395bcc9e6edfec2a6e6f4e2"
+    },
+    {
+      "path": "defense/runtime/pipeline_factory.py",
+      "size": 4670,
+      "sha256": "945f9ac61679f16e7729bf40d7bf2ac5bc42b26783b3369678679204007fb4eb"
+    },
+    {
+      "path": "defense/runtime/ppe_state.py",
+      "size": 1759,
+      "sha256": "287ebff25f497f33d52e42d313741806173158ae07a4da01385bc4ab7acd9526"
+    },
+    {
+      "path": "defense/runtime/runner.py",
+      "size": 47557,
+      "sha256": "55aac236c96f6cedf1d6cd18f90a5ec379b3aa215074212df15a4b0c9fb53a0b"
+    },
+    {
+      "path": "defense/visualization/__init__.py",
+      "size": 180,
+      "sha256": "76b8d8fb07d78daacf2a8457c78aa25035a07aa18f775c7be0d8d522753a0b61"
+    },
+    {
+      "path": "defense/visualization/overlay.py",
+      "size": 5498,
+      "sha256": "d2875114081af6f397c219def6dab371f8130a8eb8f7c8328c64a66f4ede03a2"
+    },
+    {
+      "path": "defense/web/__init__.py",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "defense/web/server.py",
+      "size": 19681,
+      "sha256": "300e15d9c598751afb68e1cf67078a2a2c3aa5f5b4b0412c453c101bb06203b5"
+    },
+    {
+      "path": "defense/web/static/app.js",
+      "size": 76,
+      "sha256": "b366933b608ea4419606107c57a2029bde31cdd19d485bf0749e1623ff7a58fe"
+    },
+    {
+      "path": "defense/web/static/index.html",
+      "size": 71641,
+      "sha256": "06b9ae388f9528b689452427a7022704511748b4122650baea9aee2e0de9dad5"
+    },
+    {
+      "path": "defense/web/static/style.css",
+      "size": 78,
+      "sha256": "5dfc49d096b635ec4806bb0f1ee75610d9a1c9ac49fb9f553766711c4f1de4f0"
+    },
+    {
+      "path": "docs/real_material_validation_v4/frames.csv",
+      "size": 8173,
+      "sha256": "1bffce89dba9eb33134754369cdfd7cf07a3f62698920458848d982f439108a0"
+    },
+    {
+      "path": "docs/real_material_validation_v4/summary.csv",
+      "size": 528,
+      "sha256": "7d06b451bb314d0e5fadf34ac2ecdf8529a40698dd1f9c9dd90d619ffdf8de7d"
+    },
+    {
+      "path": "docs/real_material_validation_v4/summary.json",
+      "size": 1077,
+      "sha256": "fd088a0238ac6ba624d2e70143815dd9cd7c874dc743176b2fa792b2751161ce"
+    },
+    {
+      "path": "docs/新架构说明.md",
+      "size": 4126,
+      "sha256": "27d8dc7d8ea3f2e96e31988563575a619f13aa84f8950dda9aa6f9da6381c44c"
+    },
+    {
+      "path": "docs/替换迁移指南.md",
+      "size": 2606,
+      "sha256": "e1f96d12bfa35c00ee753bfe14fa3fa8754b4805d92b9809d89c92a5eeb869df"
+    },
+    {
+      "path": "docs/本轮修复说明_0.3倍速_UI样式_p_synth清理_路径.md",
+      "size": 3110,
+      "sha256": "c5fb8ef10b7924072bfaa33bff0d31874d4772de028af67632331a93aaea875f"
+    },
+    {
+      "path": "docs/本轮修复说明_BrowserFrameSource同步_A3b显示.md",
+      "size": 2599,
+      "sha256": "ba55a54b52ce7539fe8048e4d487f19ba39c0f181463563db1279f50f92a89e3"
+    },
+    {
+      "path": "docs/本轮修复说明_v4.md",
+      "size": 3923,
+      "sha256": "e6b44f11fbc717e3c0fc60140bdbe3be4c3262b866073f213244d0f902b8a7b7"
+    },
+    {
+      "path": "docs/本轮修复说明_启动门控_禁用拖动_渲染平滑.md",
+      "size": 4389,
+      "sha256": "05e1d558d6ad14123adaeb7198005177ffa1a993fed7e553fa7259dbbeb9686b"
+    },
+    {
+      "path": "docs/本轮彻底重构_播放时钟同步.md",
+      "size": 3593,
+      "sha256": "d574a70b2da9b62a392b6f26fb5cf95a3dfd9dffddb0c116179441790547d4f2"
+    },
+    {
+      "path": "docs/本轮重构说明_v5_取帧检测线路.md",
+      "size": 3380,
+      "sha256": "4a875bec76581311191eb71067ee04bdd747c3b9ec599634fa97a641ec7edbf3"
+    },
+    {
+      "path": "docs/算法与函数实现总结.md",
+      "size": 5151,
+      "sha256": "bc1d55c7cfef8d9060d2204c4175afe6207b133887c4e68a8a8001799c419219"
+    },
+    {
+      "path": "docs/重构变更摘要.md",
+      "size": 1142,
+      "sha256": "fb8ac190ced5df2e9017a2716de822bc55a9c25d80e506e9905960f14f3ccac1"
+    },
+    {
+      "path": "docs/验证报告.md",
+      "size": 858,
+      "sha256": "5db92003a0a13298237815e46c0fffcb981407345f186006daca526d0075636c"
+    },
+    {
+      "path": "experiments/configs/module_a_baseline.yaml",
+      "size": 144,
+      "sha256": "7105653d2dcc2931673feea4a886940edbb8bd93e0568f4a28c4000efd2cf755"
+    },
+    {
+      "path": "pixi.lock",
+      "size": 60190,
+      "sha256": "13272b3d886abc5ccb1808f3aa924bc7aa3f461d25e2621392b5f64fb7412cac"
+    },
+    {
+      "path": "pixi.toml",
+      "size": 984,
+      "sha256": "4a4ff0a1ec1a4bc986fb0c728ff03d223804b2dd3bf81bb392a43de472f9658b"
+    },
+    {
+      "path": "pytest.ini",
+      "size": 751,
+      "sha256": "3b646e7a1f8666363c485bc149c9e6789ee90554bd198d7367d1a564ca3aa42c"
+    },
+    {
+      "path": "requirements-runtime.txt",
+      "size": 85,
+      "sha256": "a39232a7a530454395346e745dd9d7d4a8e278e226a6fa1e2f0081ba890428e6"
+    },
+    {
+      "path": "tests/README.md",
+      "size": 3423,
+      "sha256": "4ef8384ab7e736cfaba069be2e67efa79ce242888aab164b3a39f3f2f9e6e6b4"
+    },
+    {
+      "path": "tests/__init__.py",
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/classifier_calibration_report.json",
+      "size": 3671,
+      "sha256": "098e8f4fbf002685f7a59b2b7e539e211d76575811208f49e0a2e040b8c010ae"
+    },
+    {
+      "path": "tests/conftest.py",
+      "size": 1129,
+      "sha256": "f523ce447cf9022fdbd3dbf9db2a64c67afc0690952ff7a8982cc3c7d79bb96a"
+    },
+    {
+      "path": "tests/probe_web_start.py",
+      "size": 3019,
+      "sha256": "3375270bb7861231d348d0100531e709c95c7e1f0d1a9b5eadf8dcdad617b0e4"
+    },
+    {
+      "path": "tests/profile_a3b_internals.py",
+      "size": 4578,
+      "sha256": "674bf084ee34d3d4057ca5130856e7a8286fb904180a5fe2b6aa88ed0d86ad1b"
+    },
+    {
+      "path": "tests/profile_a3b_internals_report.json",
+      "size": 5670,
+      "sha256": "94c7bc64be999cc7f54ce9b8431c034742f4325ce8cbba6b6364a09d427402db"
+    },
+    {
+      "path": "tests/profile_feature_timings.py",
+      "size": 5253,
+      "sha256": "fe91821532e69afc7b611080bf9342e050da82bc3753666b03ee6c23e02e3273"
+    },
+    {
+      "path": "tests/profile_feature_timings_report.json",
+      "size": 10307,
+      "sha256": "b79ba77a2c1c9fab78063988cb10de22354da9c7b3082a1582163682b97c66d9"
+    },
+    {
+      "path": "tests/run_samples_smoke.py",
+      "size": 7323,
+      "sha256": "77a84729f3f34f66013a5d3e7a8c151df5f931adc7e0594b50a826ef3cd23de4"
+    },
+    {
+      "path": "tests/run_samples_smoke_edge.py",
+      "size": 4977,
+      "sha256": "ea0853efdafa6c8bf1db0f9cc18ea0b986720beb5262bc962fabcb552c8163f8"
+    },
+    {
+      "path": "tests/run_samples_smoke_torch.py",
+      "size": 5238,
+      "sha256": "cef4238f4b49cb9ab59215355176581225836091f91db23602de82389ef4072c"
+    },
+    {
+      "path": "tests/samples_smoke_edge_report.json",
+      "size": 6313,
+      "sha256": "2499c4b648f5b5510a04ce37ec67eb34a083c825d4093a3da2755b3b8804796e"
+    },
+    {
+      "path": "tests/samples_smoke_report.json",
+      "size": 6891,
+      "sha256": "e25ab29fba2e5ac043beea839222e88c0bea1afffe554669bad7d348b1db2f89"
+    },
+    {
+      "path": "tests/samples_smoke_torch_report.json",
+      "size": 6343,
+      "sha256": "0b4ec4a1bf2f3e3ab3cffda43ea9ab1bac4d09e35eb060dfea57e1bd0c41bacf"
+    },
+    {
+      "path": "tests/test_a1_overexposure.py",
+      "size": 2627,
+      "sha256": "0be9c3a3d20f078595d7167d0b26c0be522f9ff63592479f51b29ed0b9deb045"
+    },
+    {
+      "path": "tests/test_a2_texture_and_temporal.py",
+      "size": 6180,
+      "sha256": "7a71f35e024cac62e84bba8d511f5e40ec290f15b2805dc57e2ae7d096ea6d68"
+    },
+    {
+      "path": "tests/test_a3_motion_blur_flow.py",
+      "size": 4690,
+      "sha256": "d43a3d97490fe7ea59ef40422532d6e278a57c145d8f828c5b231db7977fcfad"
+    },
+    {
+      "path": "tests/test_a3_track_consistency.py",
+      "size": 2315,
+      "sha256": "05753bba14e1c4fb60dd04532d527648dafaaedce43a52003b58de0d961bedc6"
+    },
+    {
+      "path": "tests/test_a3b_display_and_natural_exposure.py",
+      "size": 2262,
+      "sha256": "d5093d134423bb61bca5b75dddb85839036002817b1517d3b461fa8036c4f3bc"
+    },
+    {
+      "path": "tests/test_a4_rule_fusion.py",
+      "size": 3141,
+      "sha256": "521489a84ebe3012e91daf5b5ea2b04429fa1b86442e7064d3964a19242f4bad"
+    },
+    {
+      "path": "tests/test_alert_state.py",
+      "size": 3069,
+      "sha256": "a896fa7f721031946103ef19ce5d2d4cd3b48c5ae737aea06a1f83e544f226f1"
+    },
+    {
+      "path": "tests/test_artifact_path_resolution.py",
+      "size": 1806,
+      "sha256": "6c66dc3cef168d33530371d96cdbb1913351deea12082f38447d6c9f157ce875"
+    },
+    {
+      "path": "tests/test_browser_frame_mailbox.py",
+      "size": 513,
+      "sha256": "ef495fcf7386d93b75481aafbf41cb41cf046dae99914b9590bff987be4d6c94"
+    },
+    {
+      "path": "tests/test_classifier_threshold_override.py",
+      "size": 2386,
+      "sha256": "58220e7c6d1e087d9447031b6f416146089c3e0e9206e1cb8e9e533eb2815b5c"
+    },
+    {
+      "path": "tests/test_full_flow_stability.py",
+      "size": 3795,
+      "sha256": "d0ddaea5000b5ef87574d51e197c0ede6ce89ef8f4e7505b88a0a3affea604fd"
+    },
+    {
+      "path": "tests/test_module_a_detector_integration.py",
+      "size": 4500,
+      "sha256": "f5bd0bd64469e807a35d0222884a92e1f5714a3539a492e0fea51de37d05559d"
+    },
+    {
+      "path": "tests/test_ppe_alert_state.py",
+      "size": 5049,
+      "sha256": "790be8d9a8f965b008e78953e3f01c2923f1d6a6d962517aeff82a38304b84a6"
+    },
+    {
+      "path": "tests/test_ppe_display_tracking.py",
+      "size": 2750,
+      "sha256": "fd83acff379752d1c81451dcd1175cec56301f47d5f13a9aabf8dfff4644a008"
+    },
+    {
+      "path": "tests/test_ppe_postprocess.py",
+      "size": 2963,
+      "sha256": "5b814d8cb52c0517ced04d08e5eee250c3031a4e1b2e13fa8f67f9bc939b4c85"
+    },
+    {
+      "path": "tests/test_roi_provider.py",
+      "size": 1529,
+      "sha256": "63c4b574109de6fd809bad6118476066e03aa1dfc3e3a2f261bd3dcf1f710aa4"
+    },
+    {
+      "path": "tests/test_samples_smoke_report_regression.py",
+      "size": 2502,
+      "sha256": "d120e6c89f5f34738e04eaf384bfd897f1c2f034de52244f865c101430585c82"
+    },
+    {
+      "path": "tests/test_video_diagnostic_contract.py",
+      "size": 2238,
+      "sha256": "61edebbe1d2cdd2f548eaa846cc50bb562bcc10e174f546e183b37b1807484b7"
+    },
+    {
+      "path": "tools/__init__.py",
+      "size": 1,
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "path": "tools/a3b_material_audit.py",
+      "size": 10591,
+      "sha256": "a5935aad91fc7217da5e94fdab870f5b638ab03e0d7fbc14fa21de7a2084deaa"
+    },
+    {
+      "path": "tools/calibrate_classifier_threshold.py",
+      "size": 6326,
+      "sha256": "79fe786120d72b0387ce1db75a8fbea2e01ad5be96121441f43675cd4d727e94"
+    },
+    {
+      "path": "tools/extract_yolo_fp_frames.py",
+      "size": 4159,
+      "sha256": "2347bb34a45896356a97b5a666df71aa08b9490548df7838fdd18990004c87ac"
+    },
+    {
+      "path": "tools/make_yolo_fp_review_sheet.py",
+      "size": 3663,
+      "sha256": "9dc35976d760b43e826a55b4bd83375d39bfb7da9c02a155484d088dc08fd79d"
+    },
+    {
+      "path": "tools/module_a_monitor_app.py",
+      "size": 1107,
+      "sha256": "fddae5a452cfbbcf0403ba849843301945475af101b14e159267664abc7b240e"
+    },
+    {
+      "path": "tools/render_ppe_debug_video.py",
+      "size": 7960,
+      "sha256": "71f0ee7f81d49f0f8f879e60b4aa4711dd7247984c81fcbf144547972e459b56"
+    },
+    {
+      "path": "tools/run_yolo_fp_mining.py",
+      "size": 12305,
+      "sha256": "909242a2585e5e80d631c7f2cce6abca4be88d316109bcac00ecebdca78390ad"
+    },
+    {
+      "path": "tools/video_diagnostic.py",
+      "size": 10938,
+      "sha256": "c92c29adf277c1ef129fbdf27f62076eb71fe0545ce5584762e7dd34263c1365"
+    },
+    {
+      "path": "使用大项目环境_本机快速配置.bat",
+      "size": 123,
+      "sha256": "e1e19ebd3bbd31fdaa8f753fa1171a629fa61dd047f8467d3f26f49f8e4d2ac3"
+    },
+    {
+      "path": "启动_模块A监控台.bat",
+      "size": 43,
+      "sha256": "00c3c613b2dd322b3af12ebf0660f9e2d8831849086098b168b3f4a10484423d"
+    },
+    {
+      "path": "安装或更新依赖_首次运行.bat",
+      "size": 55,
+      "sha256": "7e29493dba50202e022b72d692b346886d9ee7f167d85758875f2b87f90c9a23"
+    },
+    {
+      "path": "异常记录/监控台/20260517_034037_file_tiny_empty_smoke/manifest.json",
+      "size": 437,
+      "sha256": "0836b169d282c69969188bd3c0541bb1e23e5da6b112ef7b36641ba1f0ad1745"
+    },
+    {
+      "path": "架构说明.md",
+      "size": 8203,
+      "sha256": "8dea9781c602633a24974cc6f67cb9aaa857739b4be5bc357dec5a3a03350e89"
+    },
+    {
+      "path": "模块A技术路线与实现说明.md",
+      "size": 9479,
+      "sha256": "469ce1165d47bf023bf003f0debb5af60f706b15ef2fbfb347d2694ac0771200"
+    },
+    {
+      "path": "验证CUDA环境.bat",
+      "size": 49,
+      "sha256": "d36520f66672b134226513003ac57138f427a36ea402ae8b3f2b3c88840b07d2"
+    }
+  ]
+}

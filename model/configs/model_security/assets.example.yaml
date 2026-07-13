@@ -1,0 +1,15 @@
+assets:
+  suspicious_model: models/best_2_poisoned.pt
+  teacher_model: D:/path/to/model_b/reference_models/best.pt
+  train_images: D:/path/to/model_b/datasets/helmet_head_yolo_train_remap/images/train
+  train_labels: D:/path/to/model_b/datasets/helmet_head_yolo_train_remap/labels/train
+  data_yaml: configs/model_b_train_remap.local.yaml
+  external_replay_roots:
+    - D:/path/to/model_b/datasets/poison_benchmark_cuda_tuned_remap_v2
+  external_eval_roots:
+    - D:/path/to/model_b/datasets/mask_bd_external_eval
+  source_materials: source_materials
+  output_root: runs/hybrid_purify_primary
+  target_classes:
+    - helmet
+  device: 0

@@ -1,0 +1,123 @@
+- main [ref=e2]:
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]: 模块A监控台
+      - generic [ref=e6]: 未运行
+    - generic [ref=e8]:
+      - strong [ref=e9]: 等待输入源
+      - generic [ref=e10]: 选择 MP4、RTSP 或摄像头后开始检测。告警会在画面上用红框标出。
+  - complementary [ref=e11]:
+    - generic [ref=e12]:
+      - generic [ref=e13]: 输入源
+      - generic [ref=e14]: 全速GPU
+    - generic [ref=e15]:
+      - generic [ref=e16]: 输入类型
+      - combobox [ref=e17]:
+        - option "MP4 文件路径" [selected]
+        - option "RTSP / HTTP 视频流"
+        - option "本机摄像头编号"
+      - generic [ref=e18]: MP4 文件
+      - generic [ref=e19]:
+        - textbox [ref=e20]: D:\联合防御模块\素材\手机随意录制的视频\固定镜头室外视频.mp4
+        - button "浏览" [ref=e21] [cursor=pointer]
+      - generic [ref=e22]: 点击“浏览”可打开资源管理器选择本机 MP4，也可以手动粘贴路径。
+      - generic [ref=e24]: MP4预览固定为 1.0x；检测由后端输入源异步处理。
+      - generic [ref=e25]:
+        - generic [ref=e26]:
+          - generic [ref=e27]: B模块模型安全
+          - generic [ref=e28]: 未检查
+        - generic [ref=e29]: 模型可信状态尚未检查。
+        - generic [ref=e30]:
+          - generic [ref=e31]:
+            - generic [ref=e32]: "--"
+            - text: 风险分数
+          - generic [ref=e33]:
+            - generic [ref=e34]: "--"
+            - text: 最近扫描
+        - generic [ref=e35]:
+          - button "打开安全中心" [ref=e36] [cursor=pointer]
+          - button "刷新状态" [ref=e37] [cursor=pointer]
+        - generic [ref=e38]:
+          - checkbox "测试入口：绕过B模块安全准入直接运行当前模型" [ref=e39]
+          - text: 测试入口：绕过B模块安全准入直接运行当前模型
+        - generic [ref=e40]: 仅用于当前阶段对比毒模型/净化模型效果；不会写入白名单，禁止生产使用。
+      - generic [ref=e41]: 画面叠加
+      - generic [ref=e42]:
+        - generic [ref=e43]:
+          - checkbox "显示目标框和置信度" [checked] [ref=e44]
+          - text: 显示目标框和置信度
+        - generic [ref=e45]:
+          - checkbox "显示模块A状态文字" [checked] [ref=e46]
+          - text: 显示模块A状态文字
+        - generic [ref=e47]:
+          - checkbox "显示安全帽画面提示" [checked] [ref=e48]
+          - text: 显示安全帽画面提示
+      - generic [ref=e49]: 检测功能
+      - generic [ref=e51]:
+        - checkbox "翻拍/假目标检测（A3b）" [checked] [ref=e52]
+        - text: 翻拍/假目标检测（A3b）
+      - generic [ref=e53]:
+        - button "开始检测" [ref=e54] [cursor=pointer]
+        - button "停止" [ref=e55] [cursor=pointer]
+      - generic [ref=e56]:
+        - button "暂停" [ref=e57] [cursor=pointer]
+        - combobox [ref=e58]:
+          - option "0.5x"
+          - option "1.0x" [selected]
+          - option "1.5x"
+          - option "2.0x"
+        - slider [ref=e59]: "0"
+        - generic [ref=e60]:
+          - generic [ref=e61]: 0.0s / 0.0s
+          - generic [ref=e62]: idle
+    - generic [ref=e64]:
+      - generic [ref=e65]:
+        - generic [ref=e66]:
+          - generic [ref=e67]:
+            - generic [ref=e68]: 物理对抗扰动（p_adv）
+            - generic [ref=e69]: 系统待机
+          - generic [ref=e71]: "--"
+          - generic [ref=e73]: 尚未开始检测。
+        - generic [ref=e74]:
+          - generic [ref=e75]:
+            - generic [ref=e76]: 翻拍/假目标检测（A3b）
+            - generic [ref=e77]: 系统待机
+          - generic [ref=e79]: "--"
+          - generic [ref=e81]: 检测画面中是否出现屏幕翻拍、照片等非真人目标。
+      - generic [ref=e82]:
+        - generic [ref=e83]:
+          - generic [ref=e84]: "0"
+          - text: 当前帧
+        - generic [ref=e85]:
+          - generic [ref=e86]: "0.000"
+          - text: 攻击概率
+        - generic [ref=e87]:
+          - generic [ref=e88]: "0.0"
+          - text: 处理耗时 ms
+        - generic [ref=e89]:
+          - generic [ref=e90]: "0"
+          - text: 模块A告警
+        - generic [ref=e91]:
+          - generic [ref=e92]: "0"
+          - text: 安全帽告警
+        - generic [ref=e93]:
+          - generic [ref=e94]: "0"
+          - text: A3b警告
+        - generic [ref=e95]:
+          - generic [ref=e96]: 0/0
+          - text: 人员/安全帽
+    - generic [ref=e97] [cursor=pointer]:
+      - generic [ref=e98]:
+        - generic [ref=e99]: ▼
+        - text: 模块A扰动告警
+      - generic [ref=e100]: "-"
+    - generic [ref=e102] [cursor=pointer]:
+      - generic [ref=e103]:
+        - generic [ref=e104]: ▼
+        - text: 安全帽业务告警
+      - generic [ref=e105]: 独立通道
+    - generic [ref=e107] [cursor=pointer]:
+      - generic [ref=e108]:
+        - generic [ref=e109]: ▼
+        - text: A3b警告记录
+      - generic [ref=e110]: A3b通道

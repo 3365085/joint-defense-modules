@@ -557,13 +557,15 @@ def test_seven_archive_candidate_scope_survives_staging_and_fast_report(tmp_path
     assert "archive" in report.reasons[0]
 
 
-def test_default_runtime_config_scans_head_and_helmet_with_person_context():
+def test_default_runtime_config_scans_head_and_helmet_without_person_context():
+    # 生产配置已切换为同学的 2 类模型(class_names=[helmet, head], 无 person)。
+    # 扫描目标仍是 helmet/head; person 上下文类天然为空; preserve_classes 独立配置项仍保留。
     cfg = load_runtime_config(profile="default")
 
     resolution = model_security_scanner._external_target_resolution(cfg)
 
     assert resolution["target_classes"] == ["helmet", "head"]
-    assert resolution["context_classes"] == ["person"]
+    assert resolution["context_classes"] == []
     assert resolution["preserve_classes"] == ["person"]
 
 

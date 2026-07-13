@@ -1,0 +1,337 @@
+# Module A runtime config. Web layer reads this config; runtime flags are injected by defense.runtime.config.
+inference:
+  model_family: yolov8
+  backend: tensorrt
+  device: cuda:0
+  half: true
+  confidence: 0.25
+  image_size: 640
+  warmup_frames: 4
+  class_names: [helmet, head]
+  artifacts:
+    engine:
+      - baseline_training/runs/classmate_maskbd_v4/best.engine
+    onnx:
+      - baseline_training/runs/classmate_maskbd_v4/best.onnx
+    pytorch:
+      - baseline_training/runs/classmate_maskbd_v4/best.pt
+
+module_a:
+  require_gpu: true
+  device: cuda:0
+  frame_size: 640
+  a4_classifier_path: "D:/联合防御模块/rebuilt_demo/data/a4_classifier.pkl"
+  grid_roi_count: 4
+  emit_roi_details: true
+  emit_roi_texture_details: true
+  emit_roi_temporal_details: true
+  emit_roi_motion_details: true
+
+  lbp_radius: 3
+  temporal_threshold: 0.25
+  temporal_grid_size: 16
+  temporal_persistence_frames: 2
+  temporal_adaptive_baseline: true
+  temporal_adaptive_multiplier: 2.0
+  keyframe_interval: 3
+  light_flow_enabled: true
+  light_flow_interval: 3
+  light_flow_temporal_candidate: 0.025
+  light_flow_local_temporal_candidate: 0.18
+  static_image_enabled: true
+  static_image_interval: 6
+  static_image_temporal_candidate: 0.015
+  static_image_local_temporal_candidate: 0.10
+
+  roi_min_confidence: 0.24
+  roi_margin: 10
+  roi_target_labels: [person, helmet, head]
+  roi_stabilize_overlaps_enabled: true
+  roi_stabilize_same_label_iou: 0.50
+  roi_stabilize_head_helmet_iou: 0.18
+  roi_stabilize_head_helmet_center_distance: 0.055
+  temporal_detector_reuse_threshold: 0.008
+  temporal_detector_reuse_max_gap: 1
+
+  natural_exposure_suppression_enabled: true
+  natural_exposure_max_ratio: 0.40
+  natural_exposure_max_light_flow: 0.35
+  natural_exposure_max_motion_score: 1.01
+  target_anchored_global_fallback_overexposure_threshold: 0.50
+  no_target_fallback_window_frames: 45
+  no_target_fallback_max_exposure_ratio: 0.0005
+  no_target_blur_score_threshold: 0.15
+  no_target_blur_low_energy_threshold: 0.64
+  no_target_occlusion_local_ratio_threshold: 0.55
+  strong_static_glare_ratio_threshold: 0.10
+  static_media_camera_motion_max_flow_ratio: 0.42
+  static_media_exposure_motion_suppress_enabled: true
+  static_media_exposure_motion_min_ratio: 0.001
+  static_media_exposure_motion_min_temporal: 0.20
+
+  p_adv_threshold: 0.55
+  p_adv_display_alpha: 0.28
+  a3b_display_alpha: 0.28
+  alert_window: 5
+  alert_trigger_count: 3
+  # rebuilt 候选连续性桥接(2026-06-30 修 adv_patch 漏报): 高 p_adv 段桥接被抑制门偶发翻假打散的候选。
+  # K 扫描定 K=4(留出集召回 90.5%、误报回落 7.4%,优于 K=6 的 11.1%)。验证中,双口径通过前不提交。
+  rebuilt_adv_candidate_bridge_frames: 4
+
+runtime:
+  capture_queue_size: 1
+  result_queue_size: 1
+  preview_fps: 25
+  preview_render_fps: 25
+  preview_max_side: 960
+  preview_never_wait_for_detection: true
+  backend_source_pipeline: true
+  process_fps_cap: 60
+  detector_process_fps_cap: 60
+  detector_thread_warmup_timeout_s: 30
+  detector_thread_warmup_frames: 4
+  detector_queue_policy: latest_only
+  overlay_lookahead_s: 0.35
+  overlay_match_window_ms: 180
+  overlay_hold_ms: 550
+  overlay_interpolate_ms: 400
+  overlay_max_age_ms: 950
+  evidence_enabled: true
+  evidence_pre_frames: 12
+  evidence_post_frames: 18
+  evidence_fps: 6
+  evidence_clip_fps: 6
+  evidence_max_frames_per_event: 40
+  jpeg_quality: 82
+
+ppe_tracking:
+  enabled: true
+  business_min_confidence: 0.25
+  temporal_candidate_min_confidence: 0.18
+  prefer_helmet_on_head_overlap: true
+  head_helmet_mutex_iou: 0.20
+  head_helmet_mutex_center_distance: 0.055
+  head_helmet_mutex_min_helmet_confidence: 0.25
+  alert_window: 6
+  alert_trigger_count: 3
+  alert_hold_frames: 12
+  event_hold_frames: 45
+  fast_alert_window: 3
+  fast_alert_trigger_count: 2
+  fast_alert_min_head_confidence: 0.65
+  iou_match_threshold: 0.30
+  max_missed_frames: 10
+  max_missed_ms: 700
+  min_track_hits: 1
+  hold_last_box: true
+  smooth_alpha: 0.82
+  show_held_boxes: true
+  weak_promotion_hits: 3
+  weak_head_min_avg_confidence: 0.30
+  weak_helmet_min_avg_confidence: 0.30
+  weak_helmet_isolated_min_avg_confidence: 0.50
+  weak_edge_promotion_hits: 4
+  weak_edge_min_avg_confidence: 0.45
+
+a3b:
+  enabled: true
+  observed_threshold: 0.42
+  trigger_threshold: 0.62
+  strong_single_frame_threshold: 0.78
+  observed_only_warning_threshold: 0.50
+  observed_only_track_threshold: 0.50
+  observed_only_source_keywords:
+    - 视频中出现干扰视频
+  trigger_source_keywords:
+    - 视频中出现干扰视频
+  window_size: 12
+  min_window_hits: 3
+  observed_only_min_window_hits: 3
+  min_consecutive_hits: 2
+  decay: 0.88
+  max_gap_frames: 5
+  trigger_hold_frames: 5
+  allow_soft_trigger: true
+  allow_single_strong_trigger: true
+  allow_window_accumulated_trigger: true
+  allow_observed_only_warning: true
+
+
+model_security:
+  enabled: true
+  startup_policy: hash_trust
+  unknown_model_policy: warn
+  production_unknown_model_policy: block
+  background_scan_unknown: true
+  trust_registry: runtime/model_security/trusted_registry.json
+  report_dir: runtime/model_security/reports
+  activation_cache_dir: runtime/model_security/activation_cache
+  scanner_version: model_security_runtime_v2
+  max_layers: 4
+  max_probes: 8
+  batch_size: 1
+  device: auto
+  time_budget_s: 30
+  early_trust_score: 0.03
+  early_suspicious_score: 0.85
+  external_eval_target_classes: [helmet, head]
+  external_eval_preserve_classes: [person]
+  external_eval_max_images_per_attack: 8
+  external_eval_allowed_max_asr: 0.10
+  external_eval_suspicious_asr: 0.50
+  external_eval_conf: 0.26
+  external_eval_iou: 0.70
+
+profiles:
+  desktop_rtx:
+    inference:
+      backend: tensorrt
+      device: cuda:0
+      half: true
+      confidence: 0.25
+    module_a:
+      require_gpu: true
+      device: cuda:0
+      light_flow_interval: 3
+      static_image_interval: 3
+    runtime:
+      preview_fps: 25
+      process_fps_cap: 60
+      overlay_match_window_ms: 180
+      overlay_hold_ms: 550
+      overlay_interpolate_ms: 400
+      overlay_max_age_ms: 950
+      overlay_lookahead_s: 0.35
+
+  desktop_debug_onnx:
+    inference:
+      backend: onnx
+      device: cuda:0
+      half: true
+      confidence: 0.25
+    module_a:
+      require_gpu: true
+      device: cuda:0
+      light_flow_interval: 3
+      static_image_interval: 4
+    runtime:
+      preview_fps: 20
+      process_fps_cap: 12
+      overlay_lookahead_s: 0.35
+
+  edge_fast:
+    inference:
+      backend: onnx
+      device: cuda:0
+      half: true
+      confidence: 0.30
+    module_a:
+      require_gpu: true
+      device: cuda:0
+      emit_roi_details: false
+      light_flow_interval: 5
+      static_image_interval: 5
+      temporal_detector_reuse_threshold: 0.012
+      temporal_detector_reuse_max_gap: 2
+    runtime:
+      preview_fps: 15
+      process_fps_cap: 8
+      overlay_lookahead_s: 0.45
+      capture_queue_size: 1
+
+  cpu_smoke:
+    inference:
+      backend: onnx
+      device: cpu
+      half: false
+      confidence: 0.35
+    module_a:
+      require_gpu: false
+      device: cpu
+      light_flow_enabled: false
+      static_image_enabled: false
+    runtime:
+      preview_fps: 8
+      process_fps_cap: 8
+      overlay_lookahead_s: 0.45
+
+  empty_smoke:
+    inference:
+      backend: onnx
+      device: cpu
+      half: false
+      confidence: 0.35
+    module_a:
+      require_gpu: false
+      device: cpu
+      light_flow_enabled: false
+      static_image_enabled: false
+    runtime:
+      allow_empty_backend: true
+      evidence_enabled: false
+      preview_fps: 5
+      process_fps_cap: 5
+      overlay_lookahead_s: 0.45
+
+  high_quality:
+    inference:
+      backend: tensorrt
+      model_family: yolov8
+      device: cuda:0
+      half: true
+      confidence: 0.25
+      image_size: 640
+    module_a:
+      require_gpu: true
+      device: cuda:0
+      light_flow_interval: 2
+      static_image_interval: 3
+    runtime:
+      preview_fps: 25
+      preview_render_fps: 25
+      process_fps_cap: 60
+      detector_process_fps_cap: 60
+
+  balanced:
+    inference:
+      backend: onnx
+      device: cuda:0
+      half: true
+      confidence: 0.28
+      image_size: 640
+    module_a:
+      require_gpu: true
+      device: cuda:0
+      light_flow_interval: 3
+      static_image_interval: 4
+    runtime:
+      preview_fps: 25
+      preview_render_fps: 25
+      process_fps_cap: 30
+      detector_process_fps_cap: 30
+
+  low_power:
+    inference:
+      backend: onnx
+      device: cuda:0
+      half: true
+      confidence: 0.30
+      image_size: 512
+    module_a:
+      require_gpu: true
+      device: cuda:0
+      emit_roi_details: false
+      emit_roi_texture_details: false
+      emit_roi_temporal_details: false
+      emit_roi_motion_details: false
+      light_flow_interval: 6
+      static_image_interval: 8
+      temporal_detector_reuse_threshold: 0.015
+      temporal_detector_reuse_max_gap: 3
+    runtime:
+      preview_fps: 25
+      preview_render_fps: 20
+      process_fps_cap: 6
+      detector_process_fps_cap: 6
+      detector_queue_policy: latest_only
+      overlay_lookahead_s: 0.45

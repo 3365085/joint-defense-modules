@@ -108,13 +108,16 @@ def test_external_target_can_explicitly_include_person_when_allowed():
     assert resolution["person_target_allowed"] is True
 
 
-def test_default_runtime_config_scans_head_and_helmet_with_person_context():
+def test_default_runtime_config_scans_head_and_helmet_without_person_context():
+    # 生产配置已切换为同学的 2 类模型(class_names=[helmet, head], 无 person)。
+    # 扫描目标仍是 helmet/head; person 上下文类天然为空(class_names 里没有 person);
+    # preserve_classes 是独立配置项(external_eval_preserve_classes 默认 ["person"]), 仍保留。
     cfg = load_runtime_config(profile="default")
 
     resolution = model_security_scanner._external_target_resolution(cfg)
 
     assert resolution["target_classes"] == ["helmet", "head"]
-    assert resolution["context_classes"] == ["person"]
+    assert resolution["context_classes"] == []
     assert resolution["preserve_classes"] == ["person"]
 
 

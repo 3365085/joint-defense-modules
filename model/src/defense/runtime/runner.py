@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import platform
 import threading
 import time
@@ -145,6 +146,29 @@ def validate_file_source(source: str) -> Path:
     return path
 
 
+def _probe_tcp_reachable(url: str, timeout_ms: int = 3000) -> None:
+    """对 http(s) 流地址做一次短超时 TCP 连接探活。不可达立即抛 RuntimeError,
+    避免 OpenCV/FFMPEG 在设备离线时走内部重试阻塞十几秒。"""
+    import socket
+
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    sock = None
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=max(0.5, timeout_ms / 1000.0))
+    except OSError as exc:
+        raise RuntimeError(f"网络流不可达 {host}:{port} ({exc})") from exc
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 def open_capture(source_type: str, source: str, timeout_ms: int = 5000) -> cv2.VideoCapture:
     source_type = str(source_type or "file").lower()
     if source_type == "camera":
@@ -156,15 +180,13 @@ def open_capture(source_type: str, source: str, timeout_ms: int = 5000) -> cv2.V
         except ValueError as exc:
             raise ValueError("摄像头输入必须是编号，例如 0 或 1") from exc
         if platform.system().lower().startswith("win"):
-            cap = None
-            for backend in (cv2.CAP_DSHOW, getattr(cv2, "CAP_MSMF", cv2.CAP_ANY), cv2.CAP_ANY):
-                if cap is not None:
-                    cap.release()
-                cap = cv2.VideoCapture(index, backend)
+            # Windows 依次尝试 DSHOW → MSMF → 默认后端, 命中第一个能打开的。
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            for backend in (getattr(cv2, "CAP_MSMF", cv2.CAP_ANY), cv2.CAP_ANY):
                 if cap.isOpened():
                     break
-            if cap is None:
-                cap = cv2.VideoCapture(index, cv2.CAP_ANY)
+                cap.release()
+                cap = cv2.VideoCapture(index, backend)
         else:
             cap = cv2.VideoCapture(index, cv2.CAP_ANY)
     elif source_type == "file":
@@ -173,12 +195,38 @@ def open_capture(source_type: str, source: str, timeout_ms: int = 5000) -> cv2.V
             raise FileNotFoundError(f"视频文件不存在: {path}")
         cap = cv2.VideoCapture(str(path))
     elif source_type == "rtsp":
-        cap = cv2.VideoCapture(str(source), cv2.CAP_FFMPEG)
-        try:
-            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(timeout_ms))
-            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(timeout_ms))
-        except Exception:
-            pass
+        url = normalize_source_text(source)
+        scheme = urlparse(url).scheme.lower()
+        # HTTP(S) MJPEG 网络摄像头(如 192.168.x.x:8081/video)用默认后端即可秒开;
+        # FFMPEG 后端对 HTTP multipart 流会阻塞卡死, 只对真正的 rtsp/rtmp 用它。
+        if scheme in {"http", "https"}:
+            # HTTP MJPEG 网络摄像头在线时默认后端秒开; 但设备离线/拒连时
+            # OpenCV 会走 FFMPEG tcp 重试卡 ~14s, 故先做一次短超时 TCP 探活,
+            # 不可达则立即抛错, 避免整条链路阻塞。
+            _probe_tcp_reachable(url, timeout_ms=timeout_ms)
+            cap = cv2.VideoCapture()
+            # 设读超时: 摄像头 TCP 保持但停止推帧(设备假死)时, 让 read() 有上界返回,
+            # 采集循环的 5s 无帧重连才能真正兜底, 不会永久阻塞在 read()。
+            try:
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(timeout_ms))
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(timeout_ms))
+            except Exception:
+                pass
+            cap.open(url, cv2.CAP_ANY)
+        else:
+            # 真 rtsp/rtmp: OPEN_TIMEOUT_MSEC 对 FFMPEG 后端常不生效(实测不可达地址
+            # 阻塞 ~30s), 故 (1) 先短超时 TCP 探活秒判不可达, (2) 用环境变量向 FFMPEG
+            # 注入 stimeout(微秒)兜底连接/读取超时。
+            _probe_tcp_reachable(url, timeout_ms=timeout_ms)
+            stimeout_us = int(max(1, timeout_ms) * 1000)
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"stimeout;{stimeout_us}|rtsp_transport;tcp"
+            cap = cv2.VideoCapture()
+            try:
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(timeout_ms))
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(timeout_ms))
+            except Exception:
+                pass
+            cap.open(url, cv2.CAP_FFMPEG)
     else:
         raise ValueError(f"不支持的输入类型: {source_type}")
     try:
@@ -309,6 +357,7 @@ class MonitorEngine:
         self.latest_jpeg: bytes | None = None
         self.latest_jpeg_seq = 0
         self.preview_publish_times: deque[float] = deque(maxlen=60)
+        self.detect_times: deque[float] = deque(maxlen=60)  # 检测(YOLO+模块A)完成时刻, 算实测检测fps
         self.overlay_timeline: deque[dict[str, Any]] = deque(maxlen=self._overlay_timeline_maxlen())
         self.overlay_seq = 0
         self.status: dict[str, Any] = self._empty_status()
@@ -539,6 +588,7 @@ class MonitorEngine:
             self.overlay_timeline.clear()
             self.overlay_seq = 0
             self.preview_publish_times.clear()
+            self.detect_times.clear()
             self.recent_events.clear()
             self.recent_ppe_events.clear()
             self.recent_source_events.clear()
@@ -858,6 +908,7 @@ class MonitorEngine:
                 self.overlay_timeline.clear()
                 self.latest_jpeg = None
                 self.preview_publish_times.clear()
+                self.detect_times.clear()
                 self._preview_last_overlay = None
                 if self.detection_bus is not None:
                     self.detection_bus.clear()
@@ -1123,11 +1174,18 @@ class MonitorEngine:
                 original_h, original_w = frame.shape[:2]
                 frame, capture_resized = self._resize_capture_frame(frame, int(capture_max_side))
                 h, w = frame.shape[:2]
-                source_time_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
-                frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or packet_seq + 1)
-                if source_time_s <= 0.0 and fps > 0:
-                    source_time_s = max(0, frame_idx - 1) / fps
-                current_frame_idx = max(0, frame_idx - 1)
+                if source_type == "file":
+                    # 本地文件: 用容器时间戳/帧号定位, 支持 seek。
+                    source_time_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+                    frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or packet_seq + 1)
+                    if source_time_s <= 0.0 and fps > 0:
+                        source_time_s = max(0, frame_idx - 1) / fps
+                    current_frame_idx = max(0, frame_idx - 1)
+                else:
+                    # 实时流(摄像头/网络流): POS_FRAMES/POS_MSEC 不可靠(常年返回 0),
+                    # 用单调递增的抓帧序号做帧号, 时间用挂钟相对起点估算。
+                    current_frame_idx = packet_seq
+                    source_time_s = (packet_seq / fps) if fps > 0 else 0.0
                 temporal_predecessor_valid = bool(
                     temporal_previous_frame is not None
                     and temporal_previous_frame_idx is not None
@@ -1372,12 +1430,20 @@ class MonitorEngine:
                     temporal_previous_frame_idx=packet.previous_frame_idx,
                     temporal_previous_source_time_s=packet.previous_source_time_s,
                 )
+                # 实测检测帧率(YOLO+模块A 全链路, 与 demo detect_fps 同口径)。
+                self.detect_times.append(time.perf_counter())
+                detect_fps = 0.0
+                if len(self.detect_times) >= 2:
+                    _elapsed = self.detect_times[-1] - self.detect_times[0]
+                    if _elapsed > 1e-6:
+                        detect_fps = (len(self.detect_times) - 1) / _elapsed
                 self._after_processed(
                     run_id,
                     processed,
                     evidence,
                     preview_mode="backend_source_pipeline",
                     extra_status={
+                        "fps": round(float(detect_fps), 1),
                         "source_fps": self._source_fps,
                         "source_duration_s": self._source_duration_s,
                         "source_frame_count": self._source_frame_count,
@@ -1599,6 +1665,7 @@ class MonitorEngine:
             ]
             scaled_tracks.append(copy)
         info = preview_module_info_from_overlay(overlay)
+        info["detect_fps"] = float(status.get("fps", 0.0) or 0.0)
         ppe = {
             "warning": bool(overlay.get("ppe_warning")),
             "confirmed": bool(overlay.get("ppe_confirmed")),

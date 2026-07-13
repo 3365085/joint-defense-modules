@@ -1539,8 +1539,9 @@
       $("clockText").textContent = `${fmtSeconds(sourceTime)} / ${fmtSeconds(duration)}`;
       const dropped = Number(status?.dropped_detection_frames || 0);
       const previewFps = status?.source_ended ? "0.0" : Number(status?.preview_fps || 0).toFixed(1);
+      const detectFps = status?.source_ended ? "0.0" : Number(status?.fps || 0).toFixed(1);
       const pipelineMode = status?.source_ended ? "ended" : (status?.detector_pipeline_mode || "idle");
-      $("pipelineText").textContent = `${pipelineMode} · ${previewFps}fps · drop ${dropped}`;
+      $("pipelineText").textContent = `${pipelineMode} · 检测${detectFps}fps · 预览${previewFps}fps · drop ${dropped}`;
       lastControlRunId = Number(status?.run_id || lastControlRunId || 0);
     }
 
@@ -1745,7 +1746,7 @@
       }
     }
     async function pickFile() {
-      setError("姝ｅ湪鎵撳紑璧勬簮绠＄悊鍣?..");
+      setError("正在打开资源管理器...");
       $("browseBtn").disabled = true;
       try {
         const data = await api("/api/pick-file", {mode: "video", current_path: $("sourceValue").value || ""});
@@ -1772,7 +1773,7 @@
         const devices = data.devices || [];
         cameraDevicesLoaded = true;
         if (!devices.length) {
-      $("cameraSelect").innerHTML = '<option value="">扫描中...</option>';
+          $("cameraSelect").innerHTML = '<option value="">未发现摄像头</option>';
           setError("未发现可打开摄像头，请确认摄像头未被其他软件占用。");
           return;
         }

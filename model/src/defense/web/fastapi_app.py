@@ -478,6 +478,7 @@ def create_app(
 
     @app.post("/api/display-options")
     async def display_options(request: Request) -> JSONResponse:
+        require_http_access(request)
         payload = await _body(request)
         options = payload.get("display_options") if isinstance(payload.get("display_options"), dict) else payload
         display = _engine(request.app).update_display_options(options or {})

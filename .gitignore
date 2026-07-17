@@ -28,6 +28,7 @@ _smoke_result.txt
 # 嵌套独立仓库 / 独立工作区 / 实验区（有自己的管理或全是产物，主仓不追踪）
 rebuilt_demo/
 b模块新算法/
+incoming_deliveries/
 purification_lab/
 # doc/ 是早期文档归档（含大 csv/png/视频产物），当前文档统一在 docs/；旧归档不入主仓
 /doc/
@@ -38,6 +39,8 @@ a3b_research_out/
 New Session.md
 /model/**/feature_probe.jsonl
 /model/**/head_probe_frames/
+/model/native/**/target/
+/model/native/**/*.whl
 
 # 密钥
 *.env

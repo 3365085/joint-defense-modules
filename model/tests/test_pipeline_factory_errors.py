@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from defense.module_a.backends.detector_backend import DetectionFrameResult
 from defense.runtime import pipeline_factory
 
@@ -140,3 +142,41 @@ def test_empty_backend_is_rejected_outside_empty_profile(monkeypatch, tmp_path: 
         assert "empty_smoke" in str(exc)
     else:
         raise AssertionError("empty backend should be rejected outside empty_smoke")
+
+
+def test_pipeline_constructor_failure_closes_created_backend(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    backend = DummyBackend()
+    backend.closed = False
+    backend.close = lambda: setattr(backend, "closed", True)
+
+    class ConstructorFailingPipeline:
+        def __init__(self, _backend, *, config):
+            del config
+            raise RuntimeError("pipeline construction exploded")
+
+    monkeypatch.setattr(
+        pipeline_factory,
+        "VideoDefensePipeline",
+        ConstructorFailingPipeline,
+    )
+    monkeypatch.setattr(
+        pipeline_factory,
+        "create_detector_backend",
+        lambda config, root: backend,
+    )
+    monkeypatch.setattr(
+        pipeline_factory,
+        "load_runtime_config",
+        lambda **kwargs: {
+            "runtime": {},
+            "inference": {"backend": "dummy"},
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="pipeline construction exploded"):
+        pipeline_factory.PipelineCache(root=tmp_path).get(profile="default")
+
+    assert backend.closed is True

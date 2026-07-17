@@ -312,6 +312,52 @@ def test_report_exit_code_fails_on_late_post_attack_realert() -> None:
     assert report_exit_code(report) == 1
 
 
+def test_report_exit_code_allows_confirmation_at_delay_limit() -> None:
+    report = {
+        "summary": {
+            "failed_clips": 0,
+            "positive_missed_clips": 0,
+            "negative_false_positive_clips": 0,
+            "positive_pre_attack_false_positive_clips": 0,
+        },
+        "runtime": {"max_first_confirmation_delay_s": 2.0},
+        "clips": [
+            {
+                "is_positive": True,
+                "first_delay_s": 2.0,
+                "post_attack_confirmed_frames": 0,
+                "post_attack_linger_frames": 0,
+                "temporal_strict_predecessor_complete": True,
+            }
+        ],
+    }
+
+    assert report_exit_code(report) == 0
+
+
+def test_report_exit_code_fails_on_confirmation_after_delay_limit() -> None:
+    report = {
+        "summary": {
+            "failed_clips": 0,
+            "positive_missed_clips": 0,
+            "negative_false_positive_clips": 0,
+            "positive_pre_attack_false_positive_clips": 0,
+        },
+        "runtime": {"max_first_confirmation_delay_s": 2.0},
+        "clips": [
+            {
+                "is_positive": True,
+                "first_delay_s": 2.001,
+                "post_attack_confirmed_frames": 0,
+                "post_attack_linger_frames": 0,
+                "temporal_strict_predecessor_complete": True,
+            }
+        ],
+    }
+
+    assert report_exit_code(report) == 1
+
+
 def test_report_exit_code_fails_on_temporal_gap_violation(tmp_path: Path) -> None:
     row = _matrix_rows()[3]
     manifest_path = tmp_path / "matrix.json"

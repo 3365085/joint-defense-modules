@@ -21,11 +21,36 @@ from defense.module_a.ppe_postprocess import PPEPostprocessConfig, summarize_ppe
 from defense.runtime.a3b_soft_trigger import A3BSoftTriggerState
 from defense.runtime.overlay_records import build_overlay_record
 from defense.runtime import pipeline_factory
-from defense.runtime.config import apply_custom_model, apply_feature_options, load_runtime_config, normalize_custom_model_options
+from defense.runtime.config import (
+    DEFAULT_CONFIG_PATH,
+    apply_custom_model,
+    apply_feature_options,
+    load_runtime_config,
+    normalize_custom_model_options,
+)
 from defense.runtime.ppe_business import evaluate_ppe_business
 from defense.runtime.ppe_state import SafetyHelmetState
 from defense.runtime.runner import MonitorEngine
 from defense.web.fastapi_app import create_app
+
+
+def _offline_model_security_config(tmp_path: Path) -> Path:
+    config_text = DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    production_lock = "  production_unique_model: true"
+    assert config_text.count(production_lock) == 1
+    config_path = tmp_path / "module_a_runtime.offline-test.yaml"
+    config_path.write_text(
+        config_text.replace(production_lock, "  production_unique_model: false"),
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def _offline_model_security_service(tmp_path: Path) -> ModelSecurityService:
+    return ModelSecurityService(
+        config_path=_offline_model_security_config(tmp_path),
+        root=tmp_path,
+    )
 
 
 class _Detections:
@@ -190,7 +215,7 @@ def test_trust_records_backfills_old_purified_metrics_from_reports(tmp_path: Pat
 
 
 def test_trusted_purified_status_prefers_registry_bound_purification_report(tmp_path: Path):
-    svc = ModelSecurityService(root=tmp_path)
+    svc = _offline_model_security_service(tmp_path)
     poisoned = tmp_path / "poisoned.pt"
     purified = tmp_path / "poisoned_净化完毕.pt"
     poisoned.write_bytes(b"poisoned-model" * 128)
@@ -289,7 +314,7 @@ def test_trusted_purified_status_prefers_registry_bound_purification_report(tmp_
 
 
 def test_purification_report_requires_matching_source_hash_for_admission(tmp_path: Path):
-    svc = ModelSecurityService(root=tmp_path)
+    svc = _offline_model_security_service(tmp_path)
     engine = tmp_path / "runtime.engine"
     old_source = tmp_path / "old_source.pt"
     new_source = tmp_path / "new_source.pt"
@@ -327,7 +352,7 @@ def test_purification_report_requires_matching_source_hash_for_admission(tmp_pat
 
 
 def test_purification_report_without_source_hash_is_not_source_bound(tmp_path: Path):
-    svc = ModelSecurityService(root=tmp_path)
+    svc = _offline_model_security_service(tmp_path)
     engine = tmp_path / "runtime.engine"
     source = tmp_path / "source.pt"
     purified = tmp_path / "legacy_purified.pt"
@@ -363,7 +388,7 @@ def test_purification_report_without_source_hash_is_not_source_bound(tmp_path: P
 
 
 def test_full_scan_report_without_source_hash_is_not_source_bound(tmp_path: Path):
-    svc = ModelSecurityService(root=tmp_path)
+    svc = _offline_model_security_service(tmp_path)
     engine = tmp_path / "runtime.engine"
     source = tmp_path / "source.pt"
     engine.write_bytes(b"same-runtime-engine" * 128)
@@ -1059,7 +1084,7 @@ def test_external_contract_noise_does_not_drive_full_scan_asr():
 def test_accelerated_export_writes_trusted_record_and_catalog(tmp_path: Path, monkeypatch):
     source = tmp_path / "clean.pt"
     source.write_bytes(b"trusted-source" * 128)
-    svc = ModelSecurityService(root=tmp_path)
+    svc = _offline_model_security_service(tmp_path)
     custom_model = {
         "enabled": True,
         "path": str(source),
@@ -1174,7 +1199,7 @@ def test_model_security_page_displays_class_name_warning():
     assert "helmet,head,person" in html
 
 
-def test_fastapi_start_can_bypass_model_security_for_test_only():
+def test_fastapi_start_can_bypass_model_security_for_test_only(tmp_path: Path):
     class FakeEngine:
         def __init__(self) -> None:
             self.run_id = 0
@@ -1208,7 +1233,12 @@ def test_fastapi_start_can_bypass_model_security_for_test_only():
 
     engine = FakeEngine()
     security = FakeModelSecurity()
-    app = create_app(engine=engine, model_security=security, bind_host="127.0.0.1")
+    app = create_app(
+        config_path=_offline_model_security_config(tmp_path),
+        engine=engine,
+        model_security=security,
+        bind_host="127.0.0.1",
+    )
     client = TestClient(app)
 
     custom_model = {
@@ -1222,7 +1252,7 @@ def test_fastapi_start_can_bypass_model_security_for_test_only():
         json={
             "source_type": "file",
             "source": "D:/tmp/source.mp4",
-            "profile": "empty_smoke",
+            "profile": "default",
             "custom_model": custom_model,
             "test_bypass_model_security": True,
         },
@@ -1235,6 +1265,28 @@ def test_fastapi_start_can_bypass_model_security_for_test_only():
     assert payload["model_security"]["test_bypass_model_security"] is True
     assert engine.started_with["custom_model"] == custom_model
     assert security.events[0][0] == "model_security_bypass_start"
+
+    disabled_custom_model = {
+        "enabled": False,
+        "path": "D:/tmp/stale-old-model.pt",
+        "backend": "auto",
+        "model_family": "auto",
+    }
+    res = client.post(
+        "/api/start",
+        json={
+            "source_type": "file",
+            "source": "D:/tmp/source.mp4",
+            "profile": "desktop_rtx",
+            "custom_model": disabled_custom_model,
+            "test_bypass_model_security": True,
+        },
+    )
+
+    assert res.status_code == 200
+    assert engine.started_with["profile"] == "desktop_rtx"
+    assert engine.started_with["custom_model"] == disabled_custom_model
+    assert security.events[1][0] == "model_security_bypass_start"
 
 
 def test_file_realtime_preview_drops_unmatched_interpolated_tracks():
@@ -1366,7 +1418,7 @@ def test_high_a3b_sensitivity_warns_after_two_observed_only_hits():
     assert result["debug"]["observed_only_window_hits"] == 2
 
 
-def test_fastapi_start_returns_json_when_source_file_is_missing():
+def test_fastapi_start_returns_json_when_source_file_is_missing(tmp_path: Path):
     class FakeEngine:
         run_id = 0
 
@@ -1385,7 +1437,12 @@ def test_fastapi_start_returns_json_when_source_file_is_missing():
                 "blocking_reason": "",
             }
 
-    app = create_app(engine=FakeEngine(), model_security=FakeModelSecurity(), bind_host="127.0.0.1")
+    app = create_app(
+        config_path=_offline_model_security_config(tmp_path),
+        engine=FakeEngine(),
+        model_security=FakeModelSecurity(),
+        bind_host="127.0.0.1",
+    )
     client = TestClient(app)
 
     res = client.post(
@@ -1393,7 +1450,7 @@ def test_fastapi_start_returns_json_when_source_file_is_missing():
         json={
             "source_type": "file",
             "source": "D:/missing.mp4",
-            "profile": "empty_smoke",
+            "profile": "default",
             "test_bypass_model_security": True,
         },
     )

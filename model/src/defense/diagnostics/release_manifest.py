@@ -338,14 +338,17 @@ def _resolve_rebuilt_data_dir(
 ) -> tuple[Path, str, list[dict[str, Any]]]:
     bundled = runtime_root / "src" / "defense" / "module_a" / "rebuilt" / "data"
     candidates: list[tuple[str, Path]] = []
-    env_dir = os.environ.get("MODULE_A_REBUILT_DATA_DIR")
+    env_dir = os.environ.get("MODULE_A_ARTIFACT_DIR")
     if env_dir:
-        candidates.append(("MODULE_A_REBUILT_DATA_DIR", Path(env_dir).expanduser()))
+        candidates.append(("MODULE_A_ARTIFACT_DIR", Path(env_dir).expanduser()))
     candidates.extend(
         [
+            (
+                "main_project_runtime_artifacts",
+                runtime_root / "runtime" / "artifacts" / "module_a",
+            ),
             ("bundled_rebuilt_data", bundled),
             ("model_data", runtime_root / "data"),
-            ("repository_rebuilt_demo_data", runtime_root.parent / "rebuilt_demo" / "data"),
         ]
     )
 
@@ -365,31 +368,29 @@ def _resolve_rebuilt_data_dir(
 
 
 def _module_a_native_manifest() -> dict[str, Any]:
-    discover_error: str | None = None
     try:
-        spec = importlib.util.find_spec("module_a_native")
-    except Exception as exc:
-        spec = None
-        discover_error = _error_text(exc)
+        from defense.module_a.native_bridge import status as native_status
 
-    try:
-        module = importlib.import_module("module_a_native")
+        bridge = native_status()
     except Exception as exc:
         return {
-            "discoverable": spec is not None,
+            "discoverable": False,
             "available": False,
-            "origin": getattr(spec, "origin", None),
+            "origin": None,
             "module_file": None,
             "error": _error_text(exc),
-            "discovery_error": discover_error,
+            "discovery_error": _error_text(exc),
         }
     return {
-        "discoverable": spec is not None,
-        "available": True,
-        "origin": getattr(spec, "origin", None),
-        "module_file": getattr(module, "__file__", None),
-        "error": None,
-        "discovery_error": discover_error,
+        **bridge,
+        "discoverable": bool(
+            bridge.get("binary_path")
+            or bridge.get("distribution")
+        ),
+        "origin": bridge.get("binary_path"),
+        "module_file": bridge.get("binary_path"),
+        "error": bridge.get("load_error"),
+        "discovery_error": None,
     }
 
 

@@ -1805,7 +1805,7 @@ def test_fastapi_model_security_endpoints():
     assert res.status_code == 200
     assert res.json()["ok"] is True
     assert "model_security" in res.json()
-    res = client.post("/api/model-security/scan", json={"scan_type": "quick", "background": False, "profile": "empty_smoke"})
+    res = client.post("/api/model-security/scan", json={"scan_type": "quick", "background": False, "profile": "default"})
     assert res.status_code == 200
     assert res.json()["ok"] is True
     assert "report" in res.json()

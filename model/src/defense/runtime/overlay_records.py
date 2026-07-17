@@ -28,7 +28,12 @@ def _overlay_reason_codes(overlay: dict[str, Any]) -> list[str]:
 
 def _last_active_reason_codes(history: Iterable[dict[str, Any]]) -> list[str]:
     for item in reversed(list(history)):
-        alert_active = bool(item.get("alert_confirmed") or item.get("attack_state_active"))
+        alert_active = bool(
+            item.get("module_a_alert_confirmed")
+            or item.get("module_a_attack_state_active")
+            or item.get("alert_confirmed")
+            or item.get("attack_state_active")
+        )
         if not alert_active:
             break
         candidate = _overlay_reason_codes(item)
@@ -45,7 +50,12 @@ def annotate_alert_display_context(
     display_scene_cut_frame_idx: int | None = None,
 ) -> dict[str, Any]:
     out = dict(overlay)
-    alert_active = bool(out.get("alert_confirmed") or out.get("attack_state_active"))
+    alert_active = bool(
+        out.get("module_a_alert_confirmed")
+        or out.get("module_a_attack_state_active")
+        or out.get("alert_confirmed")
+        or out.get("attack_state_active")
+    )
     current_reason_codes = _overlay_reason_codes(out)
     active_history_reason_codes = _last_active_reason_codes(history)
     state_frame_idx = out.get("frame_idx")
@@ -63,16 +73,21 @@ def annotate_alert_display_context(
     out["alert_display_timing_held"] = timing_held
     reasonless_active_hold = bool(
         alert_active
-        and bool(out.get("attack_detected"))
+        and bool(
+            out.get("module_a_attack_detected")
+            or out.get("attack_detected")
+        )
         and not current_reason_codes
         and active_history_reason_codes
     )
     alert_display_held = bool(
         out.get("alert_display_held")
+        or out.get("module_a_alert_held")
         or (
             alert_active
             and (
                 not bool(out.get("attack_detected"))
+                and not bool(out.get("module_a_attack_detected"))
                 or bool(out.get("held"))
                 or timing_held
                 or reasonless_active_hold
@@ -124,11 +139,67 @@ def preview_module_info_from_overlay(overlay: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "p_adv": context.get("p_adv"),
-        "alert_confirmed": bool(context.get("alert_confirmed")),
-        "attack_detected": bool(context.get("attack_detected")),
-        "attack_state_active": bool(context.get("attack_state_active")),
+        # The preview renderer needs the umbrella Module A state so confirmed
+        # A3b results produce the same top-level red alert as confirmed
+        # physical attacks.  Physical fields remain available separately.
+        "alert_confirmed": bool(
+            context.get("module_a_alert_confirmed")
+            or context.get("alert_confirmed")
+        ),
+        "physical_alert_confirmed": bool(
+            context.get("physical_alert_confirmed")
+            or context.get("alert_confirmed")
+        ),
+        "module_a_alert_confirmed": bool(
+            context.get("module_a_alert_confirmed")
+            or context.get("alert_confirmed")
+        ),
+        "module_a_alert_channel": str(
+            context.get("module_a_alert_channel") or "none"
+        ),
+        "single_frame_suspicious": bool(
+            context.get("single_frame_suspicious", False)
+        ),
+        "attack_detected": bool(
+            context.get("module_a_attack_detected")
+            or context.get("attack_detected")
+        ),
+        "physical_attack_detected": bool(
+            context.get("physical_attack_detected")
+            or context.get("attack_detected")
+        ),
+        "module_a_attack_detected": bool(
+            context.get("module_a_attack_detected")
+            or context.get("attack_detected")
+        ),
+        "attack_state_active": bool(
+            context.get("module_a_attack_state_active")
+            or context.get("attack_state_active")
+        ),
+        "physical_attack_state_active": bool(
+            context.get("physical_attack_state_active")
+            or context.get("attack_state_active")
+        ),
+        "module_a_attack_state_active": bool(
+            context.get("module_a_attack_state_active")
+            or context.get("attack_state_active")
+        ),
         "alert_display_held": bool(context.get("alert_display_held")),
         "alert_last_reason_codes": last_reason_codes,
+        "module_a_primary_channel": str(
+            context.get("module_a_primary_channel") or "none"
+        ),
+        "module_a_alert_held": bool(
+            context.get("module_a_alert_held", False)
+        ),
+        "module_a_alert_hold_remaining": int(
+            context.get("module_a_alert_hold_remaining") or 0
+        ),
+        "p_blind": float(context.get("p_blind") or 0.0),
+        "p_blind_triggered": bool(
+            context.get("p_blind_triggered", False)
+        ),
+        "blind_type": str(context.get("blind_type") or "none"),
         "timing_ms": float(context.get("timing_ms") or 0.0),
         "layer_triggered": layer,
         "reason_codes": reason_codes,
@@ -160,12 +231,68 @@ def build_overlay_record(
         "source_time_s": float(status.get("source_time_s") or status.get("video_time_s") or 0.0),
         "wall_time_ms": float(status.get("wall_time_ms") or 0.0),
         "frame_idx": int(status.get("frame_idx") or 0),
+        "module_a_processed_frame_idx": status.get(
+            "module_a_processed_frame_idx"
+        ),
+        "module_a_source_frame_idx": status.get(
+            "module_a_source_frame_idx"
+        ),
+        "module_a_input_frame_idx": status.get(
+            "module_a_input_frame_idx"
+        ),
         "p_adv": status.get("p_adv"),
         "p_adv_display": status.get("p_adv_display"),
         "p_adv_missing_reason": str(status.get("p_adv_missing_reason") or ""),
         "alert_confirmed": bool(status.get("alert_confirmed")),
+        "physical_alert_confirmed": bool(
+            status.get("physical_alert_confirmed")
+            or status.get("alert_confirmed")
+        ),
+        "module_a_alert_confirmed": bool(
+            status.get("module_a_alert_confirmed")
+            or status.get("alert_confirmed")
+        ),
+        "module_a_alert_channel": str(
+            status.get("module_a_alert_channel") or "none"
+        ),
+        "single_frame_suspicious": bool(
+            status.get("single_frame_suspicious", False)
+        ),
         "attack_detected": bool(status.get("attack_detected")),
+        "physical_attack_detected": bool(
+            status.get("physical_attack_detected")
+            or status.get("attack_detected")
+        ),
+        "module_a_attack_detected": bool(
+            status.get("module_a_attack_detected")
+            or status.get("attack_detected")
+        ),
         "attack_state_active": bool(status.get("attack_state_active")),
+        "physical_attack_state_active": bool(
+            status.get("physical_attack_state_active")
+            or status.get("attack_state_active")
+        ),
+        "module_a_attack_state_active": bool(
+            status.get("module_a_attack_state_active")
+            or status.get("attack_state_active")
+        ),
+        "module_a_primary_channel": str(
+            status.get("module_a_primary_channel") or "none"
+        ),
+        "module_a_alert_held": bool(
+            status.get("module_a_alert_held", False)
+        ),
+        "module_a_alert_hold_remaining": int(
+            status.get("module_a_alert_hold_remaining") or 0
+        ),
+        "module_a_fresh_confirmed": bool(
+            status.get("module_a_fresh_confirmed", False)
+        ),
+        "p_blind": float(status.get("p_blind") or 0.0),
+        "p_blind_triggered": bool(
+            status.get("p_blind_triggered", False)
+        ),
+        "blind_type": str(status.get("blind_type") or "none"),
         "reason": str(status.get("reason") or ""),
         "reason_codes": list(status.get("reason_codes") or []),
         "ppe_warning": bool(status.get("ppe_warning")),
@@ -217,6 +344,15 @@ def build_overlay_record(
         "ppe_tracks": [dict(track) for track in ppe_tracks],
         "timing_ms": float(status.get("timing_ms") or 0.0),
         "processing_ms": float(status.get("processing_ms") or 0.0),
+        "detector_cycle_ms": float(
+            status.get("detector_cycle_ms") or 0.0
+        ),
+        "evidence_update_ms": float(
+            status.get("evidence_update_ms") or 0.0
+        ),
+        "overlay_status_publish_ms": float(
+            status.get("overlay_status_publish_ms") or 0.0
+        ),
         "detector_inference_ms": float(status.get("detector_inference_ms") or 0.0),
         "module_a_timing_ms": float(status.get("module_a_timing_ms") or 0.0),
         "display_options": dict(status.get("display_options") or display_options),
@@ -229,11 +365,27 @@ def build_overlay_record(
         "a3b_event_score": float(status.get("a3b_event_score") or status.get("a3b_confidence") or status.get("a3b_confirmed_score") or status.get("a3b_observed_score") or 0.0),
         "a3b_state": str(status.get("a3b_state") or "normal"),
         "a3b_triggered": bool(status.get("a3b_triggered")),
+        "a3b_confirmed_alert": bool(
+            status.get("a3b_confirmed_alert")
+            or (
+                status.get("a3b_triggered")
+                and str(status.get("a3b_state") or "").strip().lower()
+                == "confirmed"
+            )
+        ),
         "a3b_p_media": float(status.get("a3b_p_media") or 0.0),
         "a3b_bbox": status.get("a3b_bbox"),
         "a3b_triggered_source": str(status.get("a3b_triggered_source") or "none"),
         "a3b_reason": str(status.get("a3b_reason") or ""),
         "a3b_debug": dict(status.get("a3b_debug") or {}),
+        "a3b_result_seq": int(status.get("a3b_result_seq") or 0),
+        "a3b_source_frame_idx": status.get("a3b_source_frame_idx"),
+        "a3b_source_timestamp": status.get("a3b_source_timestamp"),
+        "a3b_source_fps": float(status.get("a3b_source_fps") or 0.0),
+        "a3b_source_interval_frames": int(
+            status.get("a3b_source_interval_frames") or 0
+        ),
+        "a3b_result_fresh": bool(status.get("a3b_result_fresh", False)),
         "raw_boxes_count": int(status.get("raw_boxes_count") or 0),
         "ppe_boxes_count": int(status.get("ppe_boxes_count") or 0),
         "tracked_boxes_count": int(status.get("tracked_boxes_count") or 0),

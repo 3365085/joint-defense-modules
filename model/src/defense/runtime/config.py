@@ -8,7 +8,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .config_schema import validate_runtime_config
+from .authoritative_model import (
+    AuthoritativeModelValidationError,
+    validate_production_model_config,
+)
+from .config_schema import ConfigValidationError, validate_runtime_config
 
 try:
     import yaml
@@ -128,6 +132,7 @@ def load_runtime_config(
     profile: str = "default",
     feature_options: dict[str, Any] | None = None,
     custom_model: dict[str, Any] | None = None,
+    allow_test_custom_model: bool = False,
 ) -> dict[str, Any]:
     """Load Module A runtime config with profile and UI overrides applied.
 
@@ -139,10 +144,29 @@ def load_runtime_config(
     raw = _read_mapping(path)
     profiles = raw.pop("profiles", {}) if isinstance(raw.get("profiles", {}), dict) else {}
     cfg = copy.deepcopy(raw)
+    selected_profile: dict[str, Any] | None = None
     if profile and profile != "default":
         if profile not in profiles:
             raise KeyError(f"未知运行档位: {profile}; 可用档位: {', '.join(sorted(profiles))}")
-        deep_merge(cfg, profiles[profile])
+        selected_profile = profiles[profile]
+        deep_merge(cfg, selected_profile)
+        profile_runtime = selected_profile.get("runtime", {}) if isinstance(selected_profile, dict) else {}
+        if (
+            isinstance(profile_runtime, dict)
+            and "process_fps_cap" in profile_runtime
+            and "detector_process_fps_cap" not in profile_runtime
+        ):
+            cfg.setdefault("runtime", {})["detector_process_fps_cap"] = profile_runtime[
+                "process_fps_cap"
+            ]
+        if (
+            isinstance(profile_runtime, dict)
+            and "preview_fps" in profile_runtime
+            and "preview_render_fps" not in profile_runtime
+        ):
+            cfg.setdefault("runtime", {})["preview_render_fps"] = profile_runtime[
+                "preview_fps"
+            ]
 
     # Environment override remains useful when the package is embedded in a
     # larger project whose weights/configs live outside the delivery folder.
@@ -152,10 +176,30 @@ def load_runtime_config(
         set_nested(cfg, "inference.device", env_device)
 
     apply_feature_options(cfg, feature_options or {})
-    resolved_custom = apply_custom_model(cfg, normalize_custom_model_options(custom_model))
+    normalized_custom = normalize_custom_model_options(custom_model)
+    production_unique_model = bool(
+        cfg.get("runtime", {}).get("production_unique_model", False)
+        if isinstance(cfg.get("runtime"), dict)
+        else False
+    )
+    if production_unique_model and bool(normalized_custom.get("enabled", False)):
+        if not allow_test_custom_model:
+            raise ConfigValidationError(
+                "生产运行已锁定唯一 YOLO 模型，禁止 custom_model 覆盖。"
+            )
+        # Explicit localhost-only Web test entry.  This changes only the
+        # effective in-memory copy; the authoritative production YAML remains
+        # locked and normal callers cannot opt in accidentally.
+        cfg.setdefault("runtime", {})["production_unique_model"] = False
+        cfg["runtime"]["test_custom_model_bypass"] = True
+    resolved_custom = apply_custom_model(cfg, normalized_custom)
     cfg.setdefault("runtime", {})["profile"] = profile or "default"
     cfg.setdefault("runtime", {})["custom_model"] = resolved_custom
     validate_runtime_config(cfg)
+    try:
+        validate_production_model_config(cfg, PROJECT_ROOT)
+    except AuthoritativeModelValidationError as exc:
+        raise ConfigValidationError(str(exc)) from exc
     return cfg
 
 

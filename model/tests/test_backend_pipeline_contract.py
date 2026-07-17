@@ -62,6 +62,25 @@ def test_detection_bus_drains_unconsumed_frame_once_after_close() -> None:
     assert bus.pop_latest(item.seq, timeout=0.01) is None
 
 
+def test_detection_bus_wait_until_consumed_unblocks_on_pop() -> None:
+    bus = DetectionBus()
+    bus.push(_packet(1, 0.0))
+    results: list[bool] = []
+
+    thread = threading.Thread(
+        target=lambda: results.append(bus.wait_until_consumed(1, timeout=0.5))
+    )
+    thread.start()
+    time.sleep(0.02)
+
+    item = bus.pop_latest(0, timeout=0.01)
+    thread.join(timeout=1.0)
+
+    assert item is not None
+    assert item.seq == 1
+    assert results == [True]
+
+
 def test_preview_bus_continues_while_detection_consumer_is_slow() -> None:
     preview = PreviewBus()
     detection = DetectionBus()

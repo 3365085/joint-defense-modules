@@ -11,6 +11,7 @@ from typing import Any
 
 CATEGORY_ORDER = ("P1", "P2", "P3", "N1", "N2", "N3", "N4")
 DEFAULT_MAX_POST_ATTACK_LINGER_FRAMES = 20
+DEFAULT_MAX_FIRST_CONFIRMATION_DELAY_S = 2.0
 REQUIRED_MANIFEST_FIELDS = (
     "clip_id",
     "path",
@@ -541,6 +542,12 @@ def report_exit_code(report: Mapping[str, Any]) -> int:
             DEFAULT_MAX_POST_ATTACK_LINGER_FRAMES,
         )
     )
+    max_first_confirmation_delay_s = float(
+        runtime_options.get(
+            "max_first_confirmation_delay_s",
+            DEFAULT_MAX_FIRST_CONFIRMATION_DELAY_S,
+        )
+    )
     clips = report.get("clips")
     if isinstance(clips, Iterable):
         for row in clips:
@@ -550,6 +557,13 @@ def report_exit_code(report: Mapping[str, Any]) -> int:
             if temporal_complete is False:
                 return 1
             if row.get("is_positive") is True:
+                first_delay_s = row.get("first_delay_s")
+                if first_delay_s is not None:
+                    try:
+                        if float(first_delay_s) > max_first_confirmation_delay_s:
+                            return 1
+                    except (TypeError, ValueError):
+                        return 1
                 post_attack_linger_frames = int(
                     row.get("post_attack_linger_frames") or 0
                 )

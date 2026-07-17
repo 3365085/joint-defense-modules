@@ -4,6 +4,26 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
+PPE_LABEL_ALIASES = {
+    "person": "person",
+    "worker": "person",
+    "human": "person",
+    "pedestrian": "person",
+    "people": "person",
+    "man": "person",
+    "woman": "person",
+    "helmet": "helmet",
+    "hardhat": "helmet",
+    "hard_hat": "helmet",
+    "safety_helmet": "helmet",
+    "hat": "helmet",
+    "head": "head",
+    "person_head": "head",
+    "bare_head": "head",
+    "no_helmet": "head",
+    "without_helmet": "head",
+}
+
 PERSON_HINTS = ("person", "worker", "human", "pedestrian")
 HELMET_HINTS = ("helmet", "hardhat", "hard_hat", "safety_helmet")
 BARE_HEAD_HINTS = ("head", "no_helmet", "without_helmet", "bare_head")
@@ -54,19 +74,30 @@ def label_matches(label: str, hints: tuple[str, ...]) -> bool:
     return any(hint in normalized for hint in hints)
 
 
+def canonical_ppe_label(label: str) -> str | None:
+    normalized = normalize_label(label)
+    exact = PPE_LABEL_ALIASES.get(normalized)
+    if exact is not None:
+        return exact
+    if any(hint in normalized for hint in BARE_HEAD_HINTS):
+        return "head"
+    if any(hint in normalized for hint in HELMET_HINTS):
+        return "helmet"
+    if any(hint in normalized for hint in PERSON_HINTS):
+        return "person"
+    return None
+
+
 def is_bare_head_label(label: str) -> bool:
-    return label_matches(label, BARE_HEAD_HINTS)
+    return canonical_ppe_label(label) == "head"
 
 
 def is_helmet_label(label: str) -> bool:
-    normalized = normalize_label(label)
-    if is_bare_head_label(normalized):
-        return False
-    return label_matches(normalized, HELMET_HINTS)
+    return canonical_ppe_label(label) == "helmet"
 
 
 def is_person_label(label: str) -> bool:
-    return label_matches(label, PERSON_HINTS)
+    return canonical_ppe_label(label) == "person"
 
 
 def _passes_min_confidence(item: "PPEDetection", cfg: "PPEPostprocessConfig") -> bool:

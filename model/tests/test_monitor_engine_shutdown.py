@@ -69,11 +69,18 @@ def test_stop_reports_threads_that_do_not_exit() -> None:
     engine.status["running"] = True
 
     engine.stop()
-    release.set()
-    thread.join(timeout=1.0)
-
     assert engine.status["stop_threads_pending"] == ["stubborn-worker"]
     assert engine.status["warning"] == "worker_threads_did_not_stop"
+    assert engine.status["pipeline_cache_release_deferred"] is True
+    assert cache.clear_count == 0
+
+    release.set()
+    thread.join(timeout=1.0)
+    engine.stop()
+
+    assert engine.status["stop_threads_pending"] == []
+    assert engine.capture_thread is None
+    assert engine.status["pipeline_cache_release_deferred"] is False
     assert cache.clear_count == 1
 
 
@@ -229,6 +236,73 @@ def test_after_processed_discards_stale_epoch_result() -> None:
     assert engine.status["source_epoch"] == 2
     assert engine.status["frame_idx"] == 10
     assert engine.status["raw_boxes_count"] == 3
+
+
+def test_after_processed_keeps_end_state_timings_on_one_frame_snapshot() -> None:
+    class EmptyEvidence:
+        session_dir = "evidence"
+        manifest_path = "manifest.json"
+        saved_event_count = 0
+
+        @staticmethod
+        def update(**_kwargs):  # type: ignore[no-untyped-def]
+            return []
+
+    engine = MonitorEngine(DummyCache())
+    engine.run_id = 12
+    engine.status.update(
+        {
+            "run_id": 12,
+            "running": False,
+            "source_ended": True,
+            "source_epoch": 1,
+            "source_time_s": 1.0,
+            "video_time_s": 1.0,
+            "timing_ms": 11.0,
+            "processing_ms": 12.0,
+            "detector_inference_ms": 13.0,
+            "module_a_timing_ms": 14.0,
+        }
+    )
+    processed = ProcessedFrame(
+        frame_idx=7,
+        frame_640=np.zeros((8, 8, 3), dtype=np.uint8),
+        rendered_frame=np.zeros((8, 8, 3), dtype=np.uint8),
+        info={},
+        ppe={},
+        ppe_tracks=[],
+        status={
+            "frame_idx": 7,
+            "source_epoch": 1,
+            "source_type": "file",
+            "source_time_s": 0.96,
+            "video_time_s": 0.96,
+            "timing_ms": 71.0,
+            "processing_ms": 72.0,
+            "detector_inference_ms": 73.0,
+            "module_a_timing_ms": 74.0,
+            "latency_breakdown": {"module_a_total_ms": 74.0},
+        },
+    )
+
+    engine._after_processed(
+        12,
+        processed,
+        EmptyEvidence(),
+        preview_mode="backend_source_pipeline",
+        extra_status={"source_epoch": 1},
+        publish_jpeg=False,
+    )
+
+    status = engine.get_status()
+    assert status["source_ended"] is True
+    assert status["timing_ms"] == 71.0
+    assert status["processing_ms"] == 72.0
+    assert status["detector_inference_ms"] == 73.0
+    assert status["module_a_timing_ms"] == 74.0
+    assert status["latency_breakdown"]["module_a_total_ms"] == 74.0
+    assert status["timing_frame_idx"] == 7
+    assert status["latency_frame_idx"] == 7
 
 
 def test_publish_preview_discards_stale_epoch_frame() -> None:

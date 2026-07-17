@@ -5,7 +5,39 @@ from typing import Any
 
 import cv2
 
+from .classifier_features import (
+    build_classifier_features,
+    build_static_media_classifier_features,
+)
 from .types import ModuleAInput, ModuleAResult
+
+
+def _select_fusion_p_adv(
+    fusion_backend: str,
+    *,
+    rule_p_adv: float,
+    classifier_result: dict[str, Any] | None,
+) -> float:
+    classifier_p_adv = float((classifier_result or {}).get("classifier_p_adv", 0.0))
+    if fusion_backend == "classifier":
+        return classifier_p_adv
+    if fusion_backend == "rule_or_classifier":
+        return max(float(rule_p_adv), classifier_p_adv)
+    return float(rule_p_adv)
+
+
+def _select_fusion_suspicious(
+    fusion_backend: str,
+    *,
+    rule_suspicious: bool,
+    classifier_result: dict[str, Any] | None,
+) -> bool:
+    classifier_suspicious = bool((classifier_result or {}).get("classifier_triggered", False))
+    if fusion_backend == "classifier":
+        return classifier_suspicious
+    if fusion_backend == "rule_or_classifier":
+        return bool(rule_suspicious or classifier_suspicious)
+    return bool(rule_suspicious)
 
 
 def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
@@ -34,7 +66,6 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
     a3_motion_ms = 0.0
     a3b_static_media_ms = 0.0
     a4_fusion_ms = 0.0
-    source_auth_ms = 0.0
 
     # A1 — overexposure
     _t0 = time.perf_counter()
@@ -390,8 +421,11 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
     _a4_t0 = time.perf_counter()
     fusion = detector.fusion.compute(texture, temporal, motion, overexposure, blur, track)
 
-    # A4 classifier 仍然运行（计算 p_adv），但不独立触发 suspicious
+    # A4 classifier score is always retained for diagnostics. The configured
+    # fusion backend selects the authoritative p_adv/display signal here and
+    # the authoritative suspicious signal after the rule-side hold logic.
     classifier_result = None
+    rule_p_adv = float(fusion.get("p_adv", 0.0))
     if detector.classifier_fusion is not None:
         classifier_features = build_classifier_features(
             overexposure=overexposure,
@@ -405,17 +439,19 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
         )
         classifier_result = detector.classifier_fusion.compute(classifier_features)
         fusion.update(classifier_result)
-        # p_adv 取 rule 和 classifier 的 max（用于显示/记录）
-        rule_p_adv = float(fusion.get("p_adv", 0.0))
-        classifier_p_adv = float(classifier_result.get("classifier_p_adv", 0.0))
-        combined_p_adv = max(rule_p_adv, classifier_p_adv)
         fusion["p_adv_raw"] = rule_p_adv
-        fusion["p_adv"] = rule_p_adv
-    else:
-        combined_p_adv = float(fusion.get("p_adv", 0.0))
+    selected_p_adv = _select_fusion_p_adv(
+        detector.fusion_backend,
+        rule_p_adv=rule_p_adv,
+        classifier_result=classifier_result,
+    )
+    fusion["fusion_backend"] = detector.fusion_backend
+    fusion["rule_p_adv"] = rule_p_adv
+    fusion["selected_p_adv"] = selected_p_adv
+    fusion["p_adv"] = selected_p_adv
     detector.p_adv_display_score = detector._ema(
         detector.p_adv_display_score,
-        combined_p_adv,
+        selected_p_adv,
         detector.p_adv_display_alpha,
     )
     detector._p_adv_display_hold.append(float(detector.p_adv_display_score))
@@ -457,10 +493,17 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
         reason_codes = [code for code in reason_codes if code not in suppressed_codes]
     if bool(motion.get("physical_media_motion_triggered", False)):
         suspicious = True
-        fusion["p_adv"] = max(
-            float(fusion.get("p_adv", 0.0)),
+        rule_p_adv = max(
+            rule_p_adv,
             float(motion.get("physical_media_motion_score", detector.physical_media_motion_min_p_adv)),
         )
+        fusion["rule_p_adv"] = rule_p_adv
+        fusion["selected_p_adv"] = _select_fusion_p_adv(
+            detector.fusion_backend,
+            rule_p_adv=rule_p_adv,
+            classifier_result=classifier_result,
+        )
+        fusion["p_adv"] = fusion["selected_p_adv"]
         if "physical_patch_motion" not in reason_codes:
             reason_codes.append("physical_patch_motion")
     fusion["reason_codes"] = reason_codes
@@ -531,12 +574,6 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
         has_target_motion = "target_motion_temporal_anomaly" in reason_codes
         has_motion_artifact = "motion_artifact" in reason_codes
         has_temporal_texture = "local_temporal_texture_change" in reason_codes
-        has_blur_pair = (
-            "local_blur_degradation" in reason_codes
-            and "paired_temporal_blur_degradation" in reason_codes
-        )
-        has_pair_track = "paired_track_consistency_drop" in reason_codes
-
         strong_attack_triggered = bool(
             (
                 has_target_track_drop
@@ -574,6 +611,24 @@ def process_module_a(detector: Any, item: ModuleAInput) -> ModuleAResult:
                 reason_codes.append(strong_attack_reason)
             fusion["reason_codes"] = reason_codes
 
+    rule_suspicious = suspicious
+    classifier_suspicious = bool(
+        (classifier_result or {}).get("classifier_triggered", False)
+    )
+    suspicious = _select_fusion_suspicious(
+        detector.fusion_backend,
+        rule_suspicious=rule_suspicious,
+        classifier_result=classifier_result,
+    )
+    if (
+        classifier_suspicious
+        and detector.fusion_backend in {"classifier", "rule_or_classifier"}
+        and "classifier_fusion" not in reason_codes
+    ):
+        reason_codes.append("classifier_fusion")
+    fusion["reason_codes"] = reason_codes
+    fusion["rule_suspicious"] = rule_suspicious
+    fusion["classifier_suspicious"] = classifier_suspicious
     fusion["is_suspicious"] = suspicious
     detector._sync_if_profile()
     a4_fusion_ms = (time.perf_counter() - _a4_t0) * 1000.0

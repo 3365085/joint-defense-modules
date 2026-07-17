@@ -116,7 +116,12 @@ class SafetyHelmetState:
             return False
         if int(ppe.get("raw_head_count", 0) or 0) <= 0:
             return False
-        if int(ppe.get("helmet_count", 0) or 0) > 0:
+        if "missing_helmet_count" in ppe:
+            if int(ppe.get("missing_helmet_count", 0) or 0) <= 0:
+                return False
+        elif int(ppe.get("helmet_count", 0) or 0) > 0:
+            # Backwards compatibility for direct callers using the older
+            # summary shape without target-level missing-helmet counts.
             return False
         confidence = _float(ppe.get("max_head_confidence"))
         return confidence >= self.fast_min_confidence

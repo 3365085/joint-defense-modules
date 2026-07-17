@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import platform
 import threading
@@ -12,13 +13,29 @@ from urllib.parse import unquote, urlparse
 
 import cv2
 
+from defense.pipelines.video_decoder import VideoDecoder
+from defense.pipelines.video_decoder_factory import create_video_decoder
 from defense.visualization import encode_jpeg, render_preview
 from defense.web.overlay_timeline import interpolate_overlay
 
-from .config import normalize_custom_model_options, project_root, workspace_asset_roots, workspace_material_root, workspace_root, write_config_snapshot
+from .authoritative_model import validate_artifact_binding
+from .config import (
+    load_runtime_config,
+    normalize_custom_model_options,
+    project_root,
+    workspace_asset_roots,
+    workspace_material_root,
+    workspace_root,
+    write_config_snapshot,
+)
 from .evidence import EvidenceSession
-from .frame_processor import FrameProcessor, prepare_frame_640, build_branch_cards, ProcessedFrame
-from .backend_pipeline import DetectionBus, FramePacket, PreviewBus
+from .frame_processor import FrameProcessor, build_branch_cards, ProcessedFrame
+from .backend_pipeline import (
+    DetectionBus,
+    FramePacket,
+    PreviewBus,
+    SharedFrameLease,
+)
 from .overlay_records import (
     annotate_alert_display_context,
     build_overlay_record,
@@ -35,6 +52,414 @@ _INVISIBLE_PATH_CHARS = {
     "\u2060",
     "\u00a0",
 }
+_DETECTOR_FPS_WINDOW_FRAMES = 240
+
+
+def _empty_decoder_status(requested_backend: str = "nvdec") -> dict[str, Any]:
+    return {
+        "requested_backend": str(requested_backend or "nvdec"),
+        "backend": "not_started",
+        "effective_backend": "not_started",
+        "codec": "not_started",
+        "gpu_device": "cuda:0",
+        "output_format": "not_started",
+        "frame_device": "not_started",
+        "decode_p50_ms": 0.0,
+        "decode_p95_ms": 0.0,
+        "decode_ms": {"p50": 0.0, "p95": 0.0},
+        "d2d_copy_p50_ms": 0.0,
+        "d2d_copy_p95_ms": 0.0,
+        "d2d_copy_ms": {"p50": 0.0, "p95": 0.0},
+        "gpu_to_cpu_copy_p50_ms": 0.0,
+        "gpu_to_cpu_copy_p95_ms": 0.0,
+        "gpu_to_cpu_copy_ms": {"p50": 0.0, "p95": 0.0},
+        "frames_decoded": 0,
+        "bytes_decoded": 0,
+        "fallback_count": 0,
+        "fallback_reason": "not_started",
+        "fallback_reasons": [],
+        "close_error": "not_started",
+        "closed": False,
+        "eof": False,
+        "surface_clone_policy": "not_started",
+        "source_alias_mode": "not_started",
+        "source_alias_cleanup_error": "",
+        "decode_source": None,
+        "derived_cache_used": False,
+        "derived_cache_validation": "not_used",
+        "source_sha256": None,
+        "decode_source_sha256": None,
+        "derived_metadata_path": None,
+        "derived_metadata_sha256": None,
+        "source_asset_id": None,
+        "source_role": None,
+        "source_label": None,
+        "source_attack_type": None,
+        "source_codec": None,
+        "derived_codec": None,
+        "derived_profile_id": None,
+        "derived_profile_sha256": None,
+        "derived_expected_frame_count": 0,
+        "derived_expected_duration_s": 0.0,
+        "transcode_decode_backend": None,
+        "transcode_encode_backend": None,
+        "derived_frame_parity": False,
+        "derived_frame_count_match": False,
+        "derived_fps_match": False,
+    }
+
+
+def _decoder_status_contract(snapshot: dict[str, Any]) -> dict[str, Any]:
+    requested = str(snapshot.get("requested_backend") or "nvdec")
+    effective = str(
+        snapshot.get("effective_backend")
+        or snapshot.get("backend")
+        or "not_started"
+    )
+    decode_p50 = float(snapshot.get("decode_ms_p50") or 0.0)
+    decode_p95 = float(snapshot.get("decode_ms_p95") or 0.0)
+    d2d_p50 = float(snapshot.get("d2d_copy_ms_p50") or 0.0)
+    d2d_p95 = float(snapshot.get("d2d_copy_ms_p95") or 0.0)
+    d2h_p50 = float(snapshot.get("d2h_copy_ms_p50") or 0.0)
+    d2h_p95 = float(snapshot.get("d2h_copy_ms_p95") or 0.0)
+    fallback_reason = str(snapshot.get("fallback_reason") or "none")
+    close_error = str(snapshot.get("close_error") or "none")
+    frame_device = str(snapshot.get("frame_device") or "host")
+    gpu_device = snapshot.get("gpu_device")
+    return {
+        **snapshot,
+        "requested_backend": requested,
+        "backend": effective,
+        "effective_backend": effective,
+        "codec": str(snapshot.get("codec") or "unknown"),
+        "gpu_device": str(gpu_device or ("cpu" if frame_device == "host" else "unknown")),
+        "output_format": str(snapshot.get("output_format") or "unknown"),
+        "frame_device": frame_device,
+        "decode_p50_ms": decode_p50,
+        "decode_p95_ms": decode_p95,
+        "decode_ms": {"p50": decode_p50, "p95": decode_p95},
+        "d2d_copy_p50_ms": d2d_p50,
+        "d2d_copy_p95_ms": d2d_p95,
+        "d2d_copy_ms": {"p50": d2d_p50, "p95": d2d_p95},
+        "gpu_to_cpu_copy_p50_ms": d2h_p50,
+        "gpu_to_cpu_copy_p95_ms": d2h_p95,
+        "gpu_to_cpu_copy_ms": {"p50": d2h_p50, "p95": d2h_p95},
+        "frames_decoded": int(snapshot.get("frames_decoded") or 0),
+        "bytes_decoded": int(snapshot.get("bytes_decoded") or 0),
+        "fallback_count": int(snapshot.get("fallback_count") or 0),
+        "fallback_reason": fallback_reason,
+        "fallback_reasons": list(snapshot.get("fallback_reasons") or []),
+        "close_error": close_error,
+        "closed": bool(snapshot.get("closed", False)),
+        "eof": bool(snapshot.get("eof", False)),
+        "decode_source": snapshot.get("decode_source"),
+        "derived_cache_used": bool(
+            snapshot.get("derived_cache_used", False)
+        ),
+        "derived_cache_validation": str(
+            snapshot.get("derived_cache_validation") or "not_used"
+        ),
+        "source_sha256": snapshot.get("source_sha256"),
+        "decode_source_sha256": snapshot.get("decode_source_sha256"),
+        "derived_metadata_path": snapshot.get("derived_metadata_path"),
+        "derived_metadata_sha256": snapshot.get(
+            "derived_metadata_sha256"
+        ),
+        "source_asset_id": snapshot.get("source_asset_id"),
+        "source_role": snapshot.get("source_role"),
+        "source_label": snapshot.get("source_label"),
+        "source_attack_type": snapshot.get("source_attack_type"),
+        "source_codec": snapshot.get("source_codec"),
+        "derived_codec": snapshot.get("derived_codec"),
+        "derived_profile_id": snapshot.get("derived_profile_id"),
+        "derived_profile_sha256": snapshot.get(
+            "derived_profile_sha256"
+        ),
+        "derived_expected_frame_count": max(
+            0,
+            int(snapshot.get("derived_expected_frame_count") or 0),
+        ),
+        "derived_expected_duration_s": max(
+            0.0,
+            float(snapshot.get("derived_expected_duration_s") or 0.0),
+        ),
+        "transcode_decode_backend": snapshot.get(
+            "transcode_decode_backend"
+        ),
+        "transcode_encode_backend": snapshot.get(
+            "transcode_encode_backend"
+        ),
+        "derived_frame_parity": bool(
+            snapshot.get("derived_frame_parity", False)
+        ),
+        "derived_frame_count_match": bool(
+            snapshot.get("derived_frame_count_match", False)
+        ),
+        "derived_fps_match": bool(
+            snapshot.get("derived_fps_match", False)
+        ),
+    }
+
+
+def _timing_distribution(samples: deque[float]) -> dict[str, float | int]:
+    values = [
+        float(value)
+        for value in samples
+        if math.isfinite(float(value)) and float(value) >= 0.0
+    ]
+    if not values:
+        return {
+            "count": 0,
+            "latest": 0.0,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+        }
+    ordered = sorted(values)
+
+    def percentile(ratio: float) -> float:
+        position = (len(ordered) - 1) * min(1.0, max(0.0, ratio))
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return (
+            ordered[lower] * (1.0 - weight)
+            + ordered[upper] * weight
+        )
+
+    return {
+        "count": len(values),
+        "latest": values[-1],
+        "mean": sum(values) / len(values),
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "max": ordered[-1],
+    }
+
+
+def _evidence_writer_status_contract(
+    evidence: EvidenceSession | Any | None = None,
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = dict(snapshot or {})
+    if evidence is not None and snapshot is None:
+        writer_status = getattr(evidence, "writer_status", None)
+        if callable(writer_status):
+            try:
+                data = dict(writer_status() or {})
+            except Exception as exc:
+                data = {
+                    "enabled": bool(getattr(evidence, "enabled", False)),
+                    "alive": False,
+                    "failed": 1,
+                    "last_error": (
+                        "evidence_writer_status_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    ),
+                }
+        else:
+            data = {
+                "enabled": bool(getattr(evidence, "enabled", False)),
+                "alive": False,
+            }
+    normalized = {
+        "enabled": bool(data.get("enabled", False)),
+        "alive": bool(data.get("alive", False)),
+        "queue_capacity": max(0, int(data.get("queue_capacity") or 0)),
+        "pending": max(0, int(data.get("pending") or 0)),
+        "completed": max(0, int(data.get("completed") or 0)),
+        "failed": max(0, int(data.get("failed") or 0)),
+        "queue_full": max(0, int(data.get("queue_full") or 0)),
+        "drain_ms": max(0.0, float(data.get("drain_ms") or 0.0)),
+        "last_error": str(data.get("last_error") or ""),
+    }
+    return {
+        "evidence_writer": normalized,
+        **{
+            f"evidence_writer_{key}": value
+            for key, value in normalized.items()
+        },
+    }
+
+
+def _authoritative_status_contract(
+    authoritative: dict[str, Any],
+    *,
+    fallback_backend: str = "tensorrt",
+) -> dict[str, Any]:
+    artifacts = (
+        authoritative.get("artifacts", {})
+        if isinstance(authoritative.get("artifacts"), dict)
+        else {}
+    )
+    source = (
+        dict(authoritative.get("source") or {})
+        if isinstance(authoritative.get("source"), dict)
+        else {}
+    )
+    engine = (
+        dict(artifacts.get("engine") or {})
+        if isinstance(artifacts.get("engine"), dict)
+        else {}
+    )
+    onnx = (
+        dict(artifacts.get("onnx") or {})
+        if isinstance(artifacts.get("onnx"), dict)
+        else {}
+    )
+    source_sha256 = source.get("sha256")
+    if source_sha256:
+        engine.setdefault("source_sha256", source_sha256)
+        onnx.setdefault("source_sha256", source_sha256)
+    return {
+        "model_id": authoritative.get(
+            "model_id",
+            "mask_bd_v4_clean_baseline",
+        ),
+        "locked": True,
+        "metadata_valid": bool(
+            authoritative.get("metadata_valid", False)
+        ),
+        "source": source or None,
+        "engine": engine or None,
+        "onnx": onnx or None,
+        "metadata_path": authoritative.get("metadata_path"),
+        "class_names": authoritative.get(
+            "class_names",
+            ["helmet", "head"],
+        ),
+        "image_size": authoritative.get("image_size", 640),
+        "backend": authoritative.get("backend", fallback_backend),
+        "half": bool(authoritative.get("half", True)),
+    }
+
+
+def _native_status_contract(snapshot: dict[str, Any]) -> dict[str, Any]:
+    fallback_reason = str(
+        snapshot.get("fallback_reason")
+        or snapshot.get("load_error")
+        or "none"
+    )
+    enabled_stages = list(snapshot.get("enabled_stages") or [])
+    return {
+        **snapshot,
+        "version": str(
+            snapshot.get("crate_version")
+            or snapshot.get("version")
+            or "unknown"
+        ),
+        "enabled_stages": enabled_stages,
+        "fallback_reason": fallback_reason,
+    }
+
+
+def _empty_a3b_health() -> dict[str, Any]:
+    return {
+        "a3b_background_enabled": False,
+        "a3b_generation": 0,
+        "a3b_active_worker_count": 0,
+        "a3b_retired_worker_count": 0,
+        "a3b_live_worker_count": 0,
+        "a3b_global_live_worker_count": 0,
+        "a3b_global_worker_limit": 0,
+        "a3b_worker_limit_scope": "process",
+        "a3b_worker_timeout_s": 0.0,
+        "a3b_max_retired_workers": 0,
+        "a3b_active_worker_started_at": None,
+        "a3b_active_worker_age_s": 0.0,
+        "a3b_active_worker_frame_idx": None,
+        "a3b_active_worker_timestamp": None,
+        "a3b_timed_out_worker_count": 0,
+        "a3b_worker_rejected_count": 0,
+        "a3b_last_worker_rejected_at": None,
+        "a3b_schedule_blocked": False,
+        "a3b_schedule_blocked_reason": "none",
+        "a3b_error_count": 0,
+        "a3b_last_error": None,
+        "a3b_last_error_at": None,
+        "a3b_last_success_at": None,
+        "a3b_source_frame_idx": None,
+        "a3b_source_timestamp": None,
+        "a3b_source_fps": 0.0,
+        "a3b_source_interval_frames": 0,
+        "media_source_frame_units": 0,
+        "media_tighten_aspect_ratio": 0.0,
+        "media_tighten_aspect_pass": False,
+        "a3b_last_attempt_frame_idx": None,
+        "a3b_last_attempt_timestamp": None,
+        "a3b_result_published_at": None,
+        "a3b_result_age_s": 0.0,
+        "a3b_result_lease_s": 0.0,
+        "a3b_result_fresh": False,
+        "a3b_result_expired_count": 0,
+        "a3b_result_seq": 0,
+    }
+
+
+def _empty_module_a_effective_config() -> dict[str, Any]:
+    return {
+        "detector_impl": None,
+        "analysis_max_hz": None,
+        "detector_process_fps_cap": None,
+        "a3b_sensitivity": None,
+        "a3b_source_keyword_policy": "diagnostic_only",
+        "a3b_source_keyword_match_required": False,
+        "a3b_observed_only_source_keywords": [],
+        "a3b_trigger_source_keywords": [],
+        "static_image_enabled": None,
+        "static_image_interval": None,
+        "static_image_worker_timeout_s": None,
+        "static_image_result_lease_s": None,
+        "static_image_max_retired_workers": None,
+        "static_image_global_worker_limit": None,
+        "rebuilt_theta_media_raw": None,
+        "rebuilt_theta_media": None,
+        "rebuilt_theta_adv": None,
+        "rebuilt_theta_blind": None,
+        "rebuilt_blind_confirm_ratio": None,
+        "rebuilt_alert_hold_frames": None,
+        "rebuilt_a3b_alert_hold_frames": None,
+        "rebuilt_alert_hold_refresh_on_padv": None,
+        "rebuilt_adv_candidate_bridge_frames": None,
+        "rebuilt_a4_classifier_rescue_underexposed_max": None,
+        "rebuilt_sustained_adv_escalation": None,
+        "rebuilt_sustained_adv_seconds": None,
+        "rebuilt_sustained_adv_run_mult": None,
+        "rebuilt_sustained_adv_benign_decay": None,
+        "rebuilt_sustained_adv_require_target": None,
+        "rebuilt_sustained_adv_require_physical_support": None,
+        "rebuilt_sustained_adv_exclude_static_bg": None,
+        "rebuilt_sustained_adv_recent_target_min": None,
+        "rebuilt_blind_sustained_escalation": None,
+        "rebuilt_blind_sustained_floor": None,
+        "rebuilt_blind_sustained_degrade_min": None,
+        "rebuilt_blind_sustained_established_min": None,
+        "rebuilt_a3b_independent_trigger": None,
+        "rebuilt_a3b_tighten_gate": None,
+        "rebuilt_a3b_gate_candidate_min": None,
+        "rebuilt_a3b_gate_edge_min": None,
+        "rebuilt_a3b_gate_edge_max": None,
+        "rebuilt_a3b_gate_border_contrast_min": None,
+        "rebuilt_a3b_soft_gate_candidate_tolerance": None,
+        "rebuilt_a3b_soft_gate_aspect_ratio_min": None,
+        "rebuilt_a3b_soft_gate_aspect_ratio_max": None,
+        "rebuilt_a3b_media_run_floor": None,
+        "rebuilt_a3b_media_run_gap_tol": None,
+        "flow_requested_device": None,
+        "flow_effective_device": None,
+        "flow_backend": None,
+        "flow_fallback_reason": None,
+        "a4_classifier_configured": None,
+        "a4_classifier_loaded": None,
+        "a4_classifier_error": None,
+        "a4_classifier_fallback_reason": None,
+        "a4_classifier_alarm_window": None,
+        "a4_classifier_alarm_required_hits": None,
+    }
 
 
 def normalize_source_text(source: str) -> str:
@@ -130,19 +555,57 @@ def resolve_source_path(source: str) -> Path:
     return fallback
 
 
-def validate_file_source(source: str) -> Path:
+def _decoder_zero_frame_message(
+    decoder: VideoDecoder,
+    source: str | Path,
+) -> str:
+    try:
+        snapshot = dict(decoder.status_snapshot())
+    except Exception as exc:
+        return (
+            "decoder_zero_frame_eof:"
+            f"source={source}:status_error={type(exc).__name__}:{exc}"
+        )
+    return (
+        "decoder_zero_frame_eof:"
+        f"source={source}:"
+        f"backend={snapshot.get('effective_backend') or snapshot.get('backend')}:"
+        f"codec={snapshot.get('codec')}:"
+        f"frames_decoded={int(snapshot.get('frames_decoded') or 0)}:"
+        f"derived_cache_used={bool(snapshot.get('derived_cache_used', False))}:"
+        f"derived_cache_validation={snapshot.get('derived_cache_validation')}:"
+        f"fallback_count={int(snapshot.get('fallback_count') or 0)}:"
+        f"fallback_reason={snapshot.get('fallback_reason') or 'none'}"
+    )
+
+
+def validate_file_source(
+    source: str,
+    *,
+    preference: str = "nvdec",
+    allow_cpu_fallback: bool = True,
+    gpu_id: int = 0,
+) -> Path:
     path = resolve_source_path(source)
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"视频文件不存在或不可访问: {path}")
-    cap = None
+    decoder: VideoDecoder | None = None
+    lease = None
     try:
-        cap = open_capture("file", str(path))
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            raise RuntimeError(f"视频文件可打开但读不到有效帧: {path}")
+        decoder = create_video_decoder(
+            path,
+            preference=str(preference or "nvdec"),
+            allow_cpu_fallback=bool(allow_cpu_fallback),
+            gpu_id=max(0, int(gpu_id)),
+        )
+        lease = decoder.read()
+        if lease is None:
+            raise RuntimeError(_decoder_zero_frame_message(decoder, path))
     finally:
-        if cap is not None:
-            cap.release()
+        if lease is not None:
+            lease.release()
+        if decoder is not None:
+            decoder.close()
     return path
 
 
@@ -324,6 +787,164 @@ def _is_preview_scene_cut(previous_frame: Any, frame: Any) -> bool:
     return bool(float(diff.mean()) >= 45.0 and float((diff >= 25).mean()) >= 0.65)
 
 
+def _file_realtime_wait_s(
+    *,
+    playback_anchor_wall: float,
+    playback_anchor_frame: float,
+    next_frame: float,
+    fps: float,
+    speed: float,
+    now: float | None = None,
+) -> float:
+    """Return absolute-clock wait time for the next realtime file frame.
+
+    Per-iteration sleeps permanently accumulate any GIL/decoder scheduling
+    delay. Anchoring each frame to the source clock lets a delayed capture
+    iteration catch up on the next frame without skipping source frames.
+    """
+
+    current = time.perf_counter() if now is None else float(now)
+    frame_delta = max(0.0, float(next_frame) - float(playback_anchor_frame))
+    target_wall = float(playback_anchor_wall) + frame_delta / (
+        max(1.0, float(fps)) * max(0.1, float(speed))
+    )
+    return max(0.0, target_wall - current)
+
+
+def _detector_completion_fps(completion_times: deque[float]) -> float:
+    if len(completion_times) < 2:
+        return 0.0
+    elapsed = completion_times[-1] - completion_times[0]
+    if elapsed <= 1e-6:
+        return 0.0
+    return (len(completion_times) - 1) / elapsed
+
+
+def _detector_can_follow_file_source(
+    detector_process_fps_cap: float,
+    effective_capture_fps: float,
+) -> bool:
+    source_fps = max(0.0, float(effective_capture_fps or 0.0))
+    detector_cap = max(0.0, float(detector_process_fps_cap or 0.0))
+    if source_fps <= 0.0 or detector_cap <= 0.0:
+        return False
+    # Nominal 60 FPS files often report 60.49/60.50. A cap within one percent
+    # is the same intended cadence; strict comparison otherwise alternates
+    # submissions and incorrectly collapses coverage to roughly 50 percent.
+    return detector_cap >= source_fps * 0.99
+
+
+def _adaptive_file_overlay_bridge_s(
+    status: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> float:
+    """Return a bounded causal hold window for asynchronous file preview.
+
+    The configured detector cap is only an admission ceiling, not measured
+    throughput.  Using it as the overlay cadence made a nominal 60 FPS cap
+    collapse the bridge to the fixed 200 ms minimum even when an expensive
+    detector/A3b cycle took longer.  Derive the live bridge from completed
+    detector cadence and recent source-time gaps, while keeping the configured
+    bridge and ``overlay_max_age_ms`` as lower/hard upper bounds.
+    """
+
+    detector_cap = max(
+        1.0,
+        float(status.get("detector_process_fps_cap") or 15.0),
+    )
+    bridge_frames = max(
+        1.0,
+        float(status.get("file_realtime_overlay_bridge_frames") or 3.2),
+    )
+    bridge_min_s = max(
+        0.0,
+        float(status.get("file_realtime_overlay_bridge_min_s") or 0.20),
+    )
+    configured_max_s = max(
+        bridge_min_s,
+        float(status.get("file_realtime_overlay_bridge_max_s") or 0.36),
+    )
+    max_age_s = max(
+        bridge_min_s,
+        float(status.get("overlay_max_age_ms") or 950.0) / 1000.0,
+    )
+    configured_bridge_s = min(
+        configured_max_s,
+        max(bridge_min_s, bridge_frames / detector_cap),
+    )
+
+    playback_speed = max(0.1, float(status.get("playback_speed") or 1.0))
+    preview_fps = max(
+        1.0,
+        float(status.get("preview_render_fps") or 25.0),
+    )
+    observed_periods_s: list[float] = []
+
+    measured_fps = float(status.get("fps") or 0.0)
+    if math.isfinite(measured_fps) and measured_fps > 0.0:
+        observed_periods_s.append(playback_speed / measured_fps)
+
+    cycle_distribution = status.get("detector_cycle_ms_distribution")
+    if isinstance(cycle_distribution, dict):
+        cycle_p95_ms = float(cycle_distribution.get("p95") or 0.0)
+        if math.isfinite(cycle_p95_ms) and cycle_p95_ms > 0.0:
+            observed_periods_s.append(
+                playback_speed * cycle_p95_ms / 1000.0
+            )
+
+    recent_times = [
+        float(item.get("video_time_s") or 0.0)
+        for item in records[-33:]
+    ]
+    recent_gaps = [
+        right - left
+        for left, right in zip(recent_times, recent_times[1:])
+        if math.isfinite(left)
+        and math.isfinite(right)
+        and 0.0 < right - left <= max_age_s
+    ]
+    if recent_gaps:
+        ordered_gaps = sorted(recent_gaps)
+        p95_index = int(math.ceil(0.95 * len(ordered_gaps))) - 1
+        observed_periods_s.append(
+            ordered_gaps[max(0, min(p95_index, len(ordered_gaps) - 1))]
+        )
+
+    if not observed_periods_s:
+        return min(max_age_s, configured_bridge_s)
+
+    preview_period_s = playback_speed / preview_fps
+    adaptive_bridge_s = (
+        max(observed_periods_s) * bridge_frames + preview_period_s
+    )
+    return min(
+        max_age_s,
+        max(configured_bridge_s, adaptive_bridge_s),
+    )
+
+
+def _causal_interpolated_overlay(
+    previous: dict[str, Any],
+    interpolated: dict[str, Any],
+    source_time_s: float,
+) -> dict[str, Any]:
+    """Interpolate geometry without applying a future discrete alarm state."""
+
+    causal = dict(previous)
+    causal.update(
+        {
+            "video_time_s": float(source_time_s),
+            "source_time_s": float(source_time_s),
+            "ppe_tracks": [
+                dict(track)
+                for track in interpolated.get("ppe_tracks", []) or []
+            ],
+            "interpolated": True,
+        }
+    )
+    return causal
+
+
 class MonitorEngine:
     """Runtime service boundary for capture, clocking, inference and evidence.
 
@@ -356,8 +977,20 @@ class MonitorEngine:
         self.run_id = 0
         self.latest_jpeg: bytes | None = None
         self.latest_jpeg_seq = 0
+        self.latest_jpeg_meta: dict[str, Any] = {}
         self.preview_publish_times: deque[float] = deque(maxlen=60)
-        self.detect_times: deque[float] = deque(maxlen=60)  # 检测(YOLO+模块A)完成时刻, 算实测检测fps
+        # A paced 25 FPS file can only complete at roughly 25 FPS. Keep the
+        # completion-rate horizon aligned with cycle distributions so a single
+        # end-of-file scheduling outlier cannot turn full zero-drop coverage
+        # into a false 24.8/24.9 FPS failure.
+        self.detect_times: deque[float] = deque(
+            maxlen=_DETECTOR_FPS_WINDOW_FRAMES
+        )
+        self.detector_cycle_samples: deque[float] = deque(maxlen=240)
+        self.evidence_update_samples: deque[float] = deque(maxlen=240)
+        self.overlay_publish_samples: deque[float] = deque(maxlen=240)
+        self.process_done_event = threading.Event()
+        self.detector_drain_timeout_s = 10.0
         self.overlay_timeline: deque[dict[str, Any]] = deque(maxlen=self._overlay_timeline_maxlen())
         self.overlay_seq = 0
         self.status: dict[str, Any] = self._empty_status()
@@ -379,9 +1012,117 @@ class MonitorEngine:
         self._playback_paused = False
         self._playback_speed = 1.0
         self._preview_last_overlay: dict[str, Any] | None = None
+        self._release_pipeline_cache_when_stopped = False
+        self._active_file_decoder: VideoDecoder | None = None
+        self._hydrate_idle_production_status()
+
+    def _hydrate_idle_production_status(self) -> None:
+        """Expose static production bindings before the first video starts."""
+
+        if not isinstance(self.cache, PipelineCache):
+            return
+        idle_errors: list[str] = []
+        try:
+            config_path = getattr(self.cache, "config_path", None)
+            root = getattr(self.cache, "root", project_root())
+            config = load_runtime_config(
+                config_path=config_path,
+                profile="default",
+            )
+            inference = (
+                config.get("inference", {})
+                if isinstance(config.get("inference"), dict)
+                else {}
+            )
+            runtime = (
+                config.get("runtime", {})
+                if isinstance(config.get("runtime"), dict)
+                else {}
+            )
+            authoritative = validate_artifact_binding(config, root)
+            authoritative_status = _authoritative_status_contract(
+                authoritative,
+                fallback_backend=str(
+                    inference.get("backend") or "tensorrt"
+                ),
+            )
+            engine = authoritative_status.get("engine")
+            artifact_path = (
+                str(engine.get("path"))
+                if isinstance(engine, dict) and engine.get("path")
+                else None
+            )
+            decoder_requested = str(
+                runtime.get("video_decoder_preference", "nvdec")
+                or "nvdec"
+            )
+            decoder_status = _empty_decoder_status(decoder_requested)
+            decoder_status["gpu_device"] = (
+                f"cuda:{int(runtime.get('video_decoder_gpu_id', 0) or 0)}"
+            )
+            self.status.update(
+                {
+                    "backend": str(
+                        inference.get("backend") or "tensorrt"
+                    ),
+                    "model_family": str(
+                        inference.get("model_family") or "ultralytics"
+                    ),
+                    "artifact": artifact_path,
+                    "authoritative_model": authoritative_status,
+                    "decoder": decoder_status,
+                }
+            )
+        except Exception as exc:
+            idle_errors.append(
+                "idle_production_binding_failed:"
+                f"{type(exc).__name__}:{exc}"
+            )
+
+        try:
+            from defense.module_a.native_bridge import status as native_status
+
+            self.status["native"] = _native_status_contract(native_status())
+        except Exception as exc:
+            idle_errors.append(
+                "idle_native_status_failed:"
+                f"{type(exc).__name__}:{exc}"
+            )
+            self.status["native"] = {
+                "available": False,
+                "version": "unknown",
+                "binary_sha256": None,
+                "enabled_stages": [],
+                "fallback_reason": (
+                    f"{type(exc).__name__}:{exc}"
+                ),
+            }
+
+        if idle_errors:
+            self.status["idle_status_errors"] = idle_errors
+        self.status["branch_cards"] = build_branch_cards(self.status)
+
+    @staticmethod
+    def _normalize_start_feature_options(
+        feature_options: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return only options explicitly supplied by the caller."""
+        if feature_options is None:
+            return {}, {}
+        normalized: dict[str, Any] = {}
+        if "static_image_enabled" in feature_options:
+            normalized["static_image_enabled"] = bool(
+                feature_options.get("static_image_enabled")
+            )
+        if "a3b_sensitivity" in feature_options:
+            normalized["a3b_sensitivity"] = str(
+                feature_options.get("a3b_sensitivity") or "balanced"
+            )
+        return dict(normalized), dict(normalized)
 
     @staticmethod
     def _empty_status() -> dict[str, Any]:
+        a3b_health = _empty_a3b_health()
         status = {
             "run_id": 0,
             "running": False,
@@ -391,6 +1132,18 @@ class MonitorEngine:
             "backend": None,
             "model_family": None,
             "artifact": None,
+            "authoritative_model": {
+                "model_id": "mask_bd_v4_clean_baseline",
+                "locked": True,
+                "metadata_valid": False,
+                "source": None,
+                "engine": None,
+                "onnx": None,
+                "class_names": ["helmet", "head"],
+                "image_size": 640,
+                "backend": "tensorrt",
+            },
+            "decoder": _empty_decoder_status(),
             "frame_idx": 0,
             "fps": 0.0,
             "preview_fps": 0.0,
@@ -401,8 +1154,24 @@ class MonitorEngine:
             "dropped_frames": 0,
             "timing_ms": 0.0,
             "processing_ms": 0.0,
+            "detector_cycle_ms": 0.0,
+            "detector_compute_fps": 0.0,
+            "evidence_update_ms": 0.0,
+            "overlay_status_publish_ms": 0.0,
+            "detector_cycle_ms_distribution": _timing_distribution(deque()),
+            "evidence_update_ms_distribution": _timing_distribution(deque()),
+            "overlay_status_publish_ms_distribution": _timing_distribution(
+                deque()
+            ),
             "detector_inference_ms": 0.0,
+            "detector_preprocess_ms": 0.0,
+            "detector_input_device": "not_started",
+            "detector_input_format": "not_started",
+            "frame_materialization_ms": 0.0,
+            "previous_frame_materialization_ms": 0.0,
             "module_a_timing_ms": 0.0,
+            "timing_frame_idx": 0,
+            "latency_frame_idx": 0,
             "a3b_static_media_ms": 0.0,
             "target_frame_budget_ms": 0.0,
             "processing_budget_ok": True,
@@ -410,8 +1179,15 @@ class MonitorEngine:
             "p_adv_display": 0.0,
             "p_adv_missing_reason": "not_started",
             "alert_confirmed": False,
+            "physical_alert_confirmed": False,
+            "module_a_alert_confirmed": False,
+            "module_a_alert_channel": "none",
             "attack_detected": False,
+            "physical_attack_detected": False,
+            "module_a_attack_detected": False,
             "attack_state_active": False,
+            "physical_attack_state_active": False,
+            "module_a_attack_state_active": False,
             "reason": "",
             "a3b_score": 0.0,
             "a3b_confidence": 0.0,
@@ -421,9 +1197,12 @@ class MonitorEngine:
             "a3b_event_score": 0.0,
             "a3b_state": "normal",
             "a3b_triggered": False,
+            "a3b_confirmed_alert": False,
             "a3b_triggered_source": "none",
             "a3b_reason": "",
-            "a3b_debug": {},
+            "a3b_debug": dict(a3b_health),
+            **a3b_health,
+            "module_a_effective_config": _empty_module_a_effective_config(),
             "ppe_warning": False,
             "ppe_candidate": False,
             "ppe_confirmed": False,
@@ -466,12 +1245,17 @@ class MonitorEngine:
             "evidence_session_dir": None,
             "evidence_manifest_path": None,
             "evidence_saved_event_count": 0,
+            **_evidence_writer_status_contract(),
             "recent_events": [],
             "recent_ppe_events": [],
             "recent_source_auth_events": [],
             "started_at": None,
             "stopped_at": None,
             "error": "",
+            "secondary_errors": [],
+            "restart_blocked_reason": "",
+            "stop_threads_pending": [],
+            "pipeline_cache_release_deferred": False,
             "preview_mode": "idle",
             "initializing": False,
             "prewarming": False,
@@ -481,6 +1265,19 @@ class MonitorEngine:
             "preview_started": False,
             "preview_seekable": False,
             "source_ended": False,
+            "source_eof_reached": False,
+            "process_done": False,
+            "detector_drain_active": False,
+            "detector_drain_completed": False,
+            "detector_drain_timed_out": False,
+            "detector_drain_timeout_s": 0.0,
+            "detector_drain_ms": 0.0,
+            "detector_drain_failed_reason": "",
+            "evidence_drain_active": False,
+            "evidence_drain_completed": False,
+            "evidence_drain_failed": False,
+            "evidence_drain_ms": 0.0,
+            "evidence_drain_error": "",
             "stream_reconnects": 0,
             "stream_last_frame_age_ms": 0.0,
             "source_decode_recoveries": 0,
@@ -493,6 +1290,8 @@ class MonitorEngine:
             "capture_max_side": 1280,
             "file_source_fps_cap": 0.0,
             "source_frame_step": 1.0,
+            "source_frame_skip_enabled": False,
+            "detector_submit_every_file_frame": False,
             "source_frame_width": 0,
             "source_frame_height": 0,
             "capture_frame_width": 0,
@@ -534,6 +1333,11 @@ class MonitorEngine:
             "detector_queue_policy": "latest_only",
             "detector_process_fps_cap": 0.0,
             "dropped_detection_frames": 0,
+            "source_frames_skipped_for_realtime": 0,
+            "capture_frames_published": 0,
+            "detector_submission_count": 0,
+            "processed_detection_frames": 0,
+            "detection_source_coverage_ratio": 0.0,
             "backend_source_pipeline": True,
             "playback_paused": False,
             "playback_speed": 1.0,
@@ -561,6 +1365,7 @@ class MonitorEngine:
         realtime: bool = True,
         feature_options: dict[str, Any] | None = None,
         custom_model: dict[str, Any] | None = None,
+        allow_test_custom_model: bool = False,
     ) -> int:
         source_type = str(source_type or "file").lower()
         # File preview is always clock-locked native playback. The old checkbox
@@ -569,26 +1374,75 @@ class MonitorEngine:
             realtime = True
             # Validate the new file before stopping the current session, so a
             # bad pasted path cannot kill a running monitor.
-            source = str(validate_file_source(source))
+            probe_config = load_runtime_config(
+                config_path=getattr(self.cache, "config_path", None),
+                profile=profile,
+            )
+            probe_runtime = (
+                probe_config.get("runtime", {})
+                if isinstance(probe_config.get("runtime"), dict)
+                else {}
+            )
+            source = str(
+                validate_file_source(
+                    source,
+                    preference=str(
+                        probe_runtime.get(
+                            "video_decoder_preference",
+                            "nvdec",
+                        )
+                        or "nvdec"
+                    ),
+                    allow_cpu_fallback=bool(
+                        probe_runtime.get(
+                            "video_decoder_allow_cpu_fallback",
+                            True,
+                        )
+                    ),
+                    gpu_id=int(
+                        probe_runtime.get("video_decoder_gpu_id", 0)
+                        or 0
+                    ),
+                )
+            )
         elif source_type == "camera":
             camera_text = normalize_source_text(source)
             source = camera_text.split(":", 1)[1].strip() if camera_text.lower().startswith("camera:") else camera_text
         self.stop(release_pipeline_cache=False)
-        feature_options = {
-            "static_image_enabled": bool((feature_options or {}).get("static_image_enabled", True)),
-            "a3b_sensitivity": str((feature_options or {}).get("a3b_sensitivity") or "balanced"),
-        }
+        pending_threads = [
+            thread.name
+            for thread in (self.capture_thread, self.process_thread, self.preview_thread)
+            if thread is not None and thread.is_alive()
+        ]
+        if pending_threads:
+            message = (
+                "monitor start blocked: previous worker threads are still running: "
+                + ", ".join(pending_threads)
+            )
+            with self.condition:
+                self.status["restart_blocked_reason"] = message
+                self.status["warning"] = "restart_blocked_by_pending_threads"
+                if not str(self.status.get("error") or "").strip():
+                    self.status["error"] = message
+                self.condition.notify_all()
+            raise RuntimeError(message)
+        cache_feature_options, feature_options = self._normalize_start_feature_options(feature_options)
         custom_model_options = normalize_custom_model_options(custom_model)
         self.stop_event.clear()
+        self.process_done_event.clear()
         with self.condition:
             self.run_id += 1
             run_id = self.run_id
             self.latest_jpeg = None
             self.latest_jpeg_seq = 0
+            self.latest_jpeg_meta = {}
             self.overlay_timeline.clear()
             self.overlay_seq = 0
             self.preview_publish_times.clear()
             self.detect_times.clear()
+            self.detector_cycle_samples.clear()
+            self.evidence_update_samples.clear()
+            self.overlay_publish_samples.clear()
             self.recent_events.clear()
             self.recent_ppe_events.clear()
             self.recent_source_events.clear()
@@ -606,6 +1460,7 @@ class MonitorEngine:
                     "realtime": bool(realtime),
                     "feature_options": dict(feature_options),
                     "custom_model": dict(custom_model_options),
+                    "test_custom_model_bypass": bool(allow_test_custom_model),
                     "display_options": dict(self.display_options),
                     "started_at": datetime.now().isoformat(timespec="seconds"),
                     "preview_mode": "initializing_detector",
@@ -627,17 +1482,50 @@ class MonitorEngine:
         try:
             preload_bundle = self.cache.get(
                 profile=profile,
-                feature_options=feature_options,
+                feature_options=cache_feature_options,
                 custom_model=custom_model_options,
+                allow_test_custom_model=bool(allow_test_custom_model),
             )
             init_ms = (time.perf_counter() - init_started) * 1000.0
             with self.condition:
                 if run_id == self.run_id:
+                    authoritative = (
+                        preload_bundle.config.get("runtime", {}).get(
+                            "authoritative_model", {}
+                        )
+                        if isinstance(preload_bundle.config.get("runtime"), dict)
+                        else {}
+                    )
+                    try:
+                        from defense.module_a.native_bridge import (
+                            status as native_status,
+                        )
+
+                        native_runtime_status = _native_status_contract(
+                            native_status()
+                        )
+                    except Exception as exc:
+                        native_runtime_status = {
+                            "available": False,
+                            "version": "unknown",
+                            "binary_sha256": None,
+                            "enabled_stages": [],
+                            "fallback_reason": (
+                                f"{type(exc).__name__}:{exc}"
+                            ),
+                        }
                     self.status.update(
                         {
                             "backend": preload_bundle.backend,
                             "model_family": preload_bundle.model_family,
                             "artifact": preload_bundle.artifact_path,
+                            "authoritative_model": (
+                                _authoritative_status_contract(
+                                    authoritative,
+                                    fallback_backend=preload_bundle.backend,
+                                )
+                            ),
+                            "native": native_runtime_status,
                             "custom_model": dict(
                                 preload_bundle.config.get("runtime", {}).get(
                                     "custom_model", custom_model_options
@@ -665,6 +1553,13 @@ class MonitorEngine:
             raise
 
         runtime_config = preload_bundle.config.get("runtime", {}) if isinstance(preload_bundle.config.get("runtime"), dict) else {}
+        self.detector_drain_timeout_s = max(
+            0.1,
+            float(
+                runtime_config.get("detector_drain_timeout_s", 10.0)
+                or 10.0
+            ),
+        )
         preview_render_fps = float(
             runtime_config.get("preview_render_fps", runtime_config.get("preview_fps", 25)) or 25
         )
@@ -685,9 +1580,18 @@ class MonitorEngine:
         file_source_fps_cap = float(
             runtime_config.get(
                 "file_source_fps_cap",
-                preview_render_fps if source_type == "file" else 0.0,
+                0.0,
             )
             or 0.0
+        )
+        video_decoder_preference = str(
+            runtime_config.get("video_decoder_preference", "nvdec") or "nvdec"
+        )
+        video_decoder_allow_cpu_fallback = bool(
+            runtime_config.get("video_decoder_allow_cpu_fallback", True)
+        )
+        video_decoder_gpu_id = int(
+            runtime_config.get("video_decoder_gpu_id", 0) or 0
         )
         preview_bus = PreviewBus()
         detection_bus = DetectionBus()
@@ -707,6 +1611,9 @@ class MonitorEngine:
                         "detector_pipeline_mode": "backend_latest_only",
                         "detector_queue_policy": "latest_only",
                         "detector_process_fps_cap": detector_process_fps_cap,
+                        "detector_drain_timeout_s": float(
+                            self.detector_drain_timeout_s
+                        ),
                         "file_realtime_overlay_bridge_frames": file_realtime_overlay_bridge_frames,
                         "file_realtime_overlay_bridge_min_s": file_realtime_overlay_bridge_min_s,
                         "file_realtime_overlay_bridge_max_s": file_realtime_overlay_bridge_max_s,
@@ -714,6 +1621,9 @@ class MonitorEngine:
                         "preview_max_side": preview_max_side,
                         "capture_max_side": capture_max_side,
                         "file_source_fps_cap": file_source_fps_cap,
+                        "decoder": _empty_decoder_status(
+                            video_decoder_preference
+                        ),
                         "preview_never_wait_for_detection": True,
                         "ready_for_preview": False,
                         "first_detection_ready": False,
@@ -736,15 +1646,27 @@ class MonitorEngine:
             source,
             profile,
             bool(realtime),
+            cache_feature_options,
             feature_options,
             custom_model_options,
         )
         capture_args = (
-            *process_args,
+            run_id,
+            preview_bus,
+            detection_bus,
+            source_type,
+            source,
+            profile,
+            bool(realtime),
+            feature_options,
+            custom_model_options,
             float(preview_render_fps),
             float(detector_process_fps_cap),
             int(capture_max_side),
             float(file_source_fps_cap),
+            video_decoder_preference,
+            video_decoder_allow_cpu_fallback,
+            video_decoder_gpu_id,
         )
         self.process_thread = threading.Thread(target=self._backend_process_loop, args=process_args, name="module-a-detector", daemon=True)
         self.preview_thread = threading.Thread(
@@ -755,6 +1677,7 @@ class MonitorEngine:
         )
         self.process_thread.start()
         detector_ready_deadline = time.perf_counter() + float(runtime_config.get("detector_thread_warmup_timeout_s", 30.0) or 30.0)
+        start_error = ""
         with self.condition:
             while (
                 run_id == self.run_id
@@ -764,18 +1687,15 @@ class MonitorEngine:
                 and time.perf_counter() < detector_ready_deadline
             ):
                 self.condition.wait(timeout=0.05)
-            if run_id != self.run_id or self.stop_event.is_set():
-                raise RuntimeError("monitor start was interrupted")
             if self.status.get("error"):
-                raise RuntimeError(str(self.status.get("error")))
-            if bool(self.status.get("prewarming", False)):
-                self.status["error"] = "detector thread warmup timed out"
-                self.status["running"] = False
-                self.status["initializing"] = False
-                self.status["prewarming"] = False
-                self.status["stopped_at"] = datetime.now().isoformat(timespec="seconds")
-                self.condition.notify_all()
-                raise RuntimeError("detector thread warmup timed out")
+                start_error = str(self.status.get("error"))
+            elif run_id != self.run_id or self.stop_event.is_set():
+                start_error = "monitor start was interrupted"
+            elif bool(self.status.get("prewarming", False)):
+                start_error = "detector thread warmup timed out"
+        if start_error:
+            self._set_error(start_error, run_id)
+            raise RuntimeError(start_error)
 
         self.capture_thread = threading.Thread(target=self._backend_capture_loop, args=capture_args, name="module-a-source", daemon=True)
         self.capture_thread.start()
@@ -819,28 +1739,67 @@ class MonitorEngine:
             return dict(self.display_options)
 
     def stop(self, *, release_pipeline_cache: bool = True) -> None:
-        threads = [thread for thread in (self.capture_thread, self.process_thread, self.preview_thread) if thread is not None]
+        thread_items = [
+            ("capture_thread", self.capture_thread),
+            ("process_thread", self.process_thread),
+            ("preview_thread", self.preview_thread),
+        ]
         self.stop_event.set()
+        active_decoder = self._active_file_decoder
+        request_decoder_cancel = getattr(
+            active_decoder,
+            "request_cancel",
+            None,
+        )
+        if callable(request_decoder_cancel):
+            try:
+                request_decoder_cancel()
+            except Exception as exc:
+                with self.condition:
+                    errors = list(
+                        self.status.get("secondary_errors") or []
+                    )
+                    errors.append(
+                        "decoder_cancel_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    self.status["secondary_errors"] = errors
         if self.preview_bus is not None:
             self.preview_bus.close()
         if self.detection_bus is not None:
             self.detection_bus.close()
         current = threading.current_thread()
-        alive_after_join: list[str] = []
-        for thread in threads:
+        for _, thread in thread_items:
+            if thread is None:
+                continue
             if thread is current:
                 continue
             if thread.ident is None:
                 continue
             thread.join(timeout=self.thread_join_timeout_s)
-            if thread.is_alive():
-                alive_after_join.append(thread.name)
-        self.capture_thread = None
-        self.process_thread = None
-        self.preview_thread = None
-        self.preview_bus = None
-        self.detection_bus = None
-        if release_pipeline_cache:
+        alive_after_join: list[str] = []
+        with self.condition:
+            for attr_name, thread in thread_items:
+                if thread is None:
+                    continue
+                if thread.is_alive():
+                    alive_after_join.append(thread.name)
+                elif getattr(self, attr_name) is thread:
+                    setattr(self, attr_name, None)
+            if alive_after_join:
+                self._release_pipeline_cache_when_stopped = bool(
+                    self._release_pipeline_cache_when_stopped or release_pipeline_cache
+                )
+                release_cache = False
+            else:
+                self.capture_thread = None
+                self.process_thread = None
+                self.preview_thread = None
+                self.preview_bus = None
+                self.detection_bus = None
+                release_cache = bool(release_pipeline_cache or self._release_pipeline_cache_when_stopped)
+                self._release_pipeline_cache_when_stopped = False
+        if release_cache:
             self._release_pipeline_cache()
         with self.condition:
             if self.status.get("running"):
@@ -855,8 +1814,18 @@ class MonitorEngine:
             self.status["preview_mode"] = "stopped"
             self.status["detector_pipeline_mode"] = "idle"
             self.status["stop_threads_pending"] = alive_after_join
+            self.status["pipeline_cache_release_deferred"] = bool(
+                self._release_pipeline_cache_when_stopped
+            )
             if alive_after_join:
                 self.status["warning"] = "worker_threads_did_not_stop"
+            else:
+                self.status["restart_blocked_reason"] = ""
+                if self.status.get("warning") in {
+                    "worker_threads_did_not_stop",
+                    "restart_blocked_by_pending_threads",
+                }:
+                    self.status.pop("warning", None)
             self.condition.notify_all()
 
     def _release_pipeline_cache(self) -> None:
@@ -874,7 +1843,13 @@ class MonitorEngine:
         return bool(
             int(run_id) == int(self.run_id)
             and str(source_type or "").lower() == "file"
-            and bool(self.status.get("source_ended"))
+            and bool(
+                self.status.get("source_ended")
+                or (
+                    self.status.get("source_eof_reached")
+                    and self.status.get("process_done")
+                )
+            )
             and bool(runtime_config.get("release_pipeline_cache_on_file_end", False))
             and not self.stop_event.is_set()
         )
@@ -901,27 +1876,10 @@ class MonitorEngine:
                 if duration > 0:
                     target = min(target, max(0.0, duration - 0.001))
                 self._seek_request_s = target
-                self._source_epoch = max(
-                    int(self._source_epoch),
-                    int(self.status.get("source_epoch") or self._source_epoch or 0),
-                ) + 1
-                self.overlay_timeline.clear()
-                self.latest_jpeg = None
-                self.preview_publish_times.clear()
-                self.detect_times.clear()
-                self._preview_last_overlay = None
-                if self.detection_bus is not None:
-                    self.detection_bus.clear()
+                self._reset_source_epoch_state_locked(source_time_s=target)
                 self.status.update(
                     {
-                        "source_epoch": self._source_epoch,
-                        "source_time_s": target,
-                        "video_time_s": target,
                         "overlay_seq": int(self.overlay_seq),
-                        "first_detection_ready": False,
-                        "source_ended": False,
-                        "preview_seq": int(self.latest_jpeg_seq),
-                        "preview_fps": 0.0,
                     }
                 )
             elif action == "set_speed":
@@ -933,9 +1891,83 @@ class MonitorEngine:
             self.condition.notify_all()
         return self.get_status()
 
+    def _reset_source_epoch_state_locked(self, *, source_time_s: float | None = None) -> int:
+        """Advance source epoch and discard source-scoped buffered state.
+
+        The caller must hold ``self.condition``.  Sequence counters stay
+        monotonic; only buffered frames and temporal/display state are cleared.
+        """
+        self._source_epoch = max(
+            int(self._source_epoch),
+            int(self.status.get("source_epoch") or self._source_epoch or 0),
+        ) + 1
+        self.overlay_timeline.clear()
+        self.latest_jpeg = None
+        self.latest_jpeg_meta = {}
+        self.preview_publish_times.clear()
+        self.detect_times.clear()
+        self._preview_last_overlay = None
+        if self.preview_bus is not None:
+            self.preview_bus.clear()
+        if self.detection_bus is not None:
+            self.detection_bus.clear()
+        status_update: dict[str, Any] = {
+            "source_epoch": self._source_epoch,
+            "first_detection_ready": False,
+            "source_ended": False,
+            "preview_seq": int(self.latest_jpeg_seq),
+            "preview_fps": 0.0,
+        }
+        if source_time_s is not None:
+            status_update["source_time_s"] = float(source_time_s)
+            status_update["video_time_s"] = float(source_time_s)
+        self.status.update(status_update)
+        return self._source_epoch
+
     def get_status(self) -> dict[str, Any]:
         with self.lock:
             payload = dict(self.status)
+            processed_detection_frames = int(self.overlay_seq)
+            source_fps = float(payload.get("source_fps") or 0.0)
+            source_time_s = float(
+                payload.get(
+                    "source_time_s",
+                    payload.get("video_time_s", 0.0),
+                )
+                or 0.0
+            )
+            source_frame_idx = int(payload.get("frame_idx") or 0)
+            # Detector status is asynchronous and may describe an older source
+            # frame than the JPEG currently being displayed.  Coverage must use
+            # the furthest observed preview/source clock rather than silently
+            # treating detector progress as source progress.
+            preview_source_time_s = float(
+                self.latest_jpeg_meta.get("source_time_s") or 0.0
+            )
+            preview_frame_idx = int(
+                self.latest_jpeg_meta.get("frame_idx") or 0
+            )
+            source_time_s = max(source_time_s, preview_source_time_s)
+            source_frame_idx = max(source_frame_idx, preview_frame_idx)
+            observed_source_frames = max(
+                source_frame_idx + 1 if processed_detection_frames > 0 else 0,
+                (
+                    int(round(source_time_s * source_fps)) + 1
+                    if source_fps > 0.0 and source_time_s > 0.0
+                    else 0
+                ),
+            )
+            if bool(payload.get("source_ended")):
+                observed_source_frames = max(
+                    observed_source_frames,
+                    int(payload.get("source_frame_count") or 0),
+                )
+            payload["processed_detection_frames"] = processed_detection_frames
+            payload["detection_source_coverage_ratio"] = (
+                float(processed_detection_frames / observed_source_frames)
+                if observed_source_frames > 0
+                else 0.0
+            )
             payload["display_options"] = dict(self.display_options)
             payload["recent_events"] = list(self.recent_events)
             payload["recent_ppe_events"] = list(self.recent_ppe_events)
@@ -968,6 +2000,37 @@ class MonitorEngine:
             if self.latest_jpeg_seq <= last_seq:
                 return self.latest_jpeg_seq, None, True
             return self.latest_jpeg_seq, self.latest_jpeg, bool(self.status.get("running"))
+
+    def wait_latest_jpeg_snapshot(
+        self,
+        last_seq: int,
+        timeout: float = 0.5,
+    ) -> tuple[int, bytes | None, bool, dict[str, Any]]:
+        deadline = time.perf_counter() + max(0.0, timeout)
+        with self.condition:
+            if not self.status.get("running"):
+                return self.latest_jpeg_seq, None, False, {}
+            while (
+                self.latest_jpeg_seq == last_seq
+                and self.status.get("running")
+                and time.perf_counter() < deadline
+            ):
+                self.condition.wait(
+                    timeout=min(
+                        0.05,
+                        max(0.0, deadline - time.perf_counter()),
+                    )
+                )
+            if not self.status.get("running"):
+                return self.latest_jpeg_seq, None, False, {}
+            if self.latest_jpeg_seq <= last_seq:
+                return self.latest_jpeg_seq, None, True, {}
+            return (
+                self.latest_jpeg_seq,
+                self.latest_jpeg,
+                bool(self.status.get("running")),
+                dict(self.latest_jpeg_meta),
+            )
 
     @staticmethod
     def _read_capture_meta(cap: cv2.VideoCapture) -> tuple[float, float, int]:
@@ -1042,6 +2105,667 @@ class MonitorEngine:
                 return frame
         return None
 
+    def _refresh_active_decoder_status(self, run_id: int) -> None:
+        decoder = self._active_file_decoder
+        if decoder is None:
+            return
+        try:
+            decoder_status = _decoder_status_contract(decoder.status_snapshot())
+        except Exception as exc:
+            decoder_status = {
+                **_empty_decoder_status(),
+                "fallback_reason": (
+                    "decoder_status_snapshot_failed:"
+                    f"{type(exc).__name__}:{exc}"
+                ),
+            }
+        with self.condition:
+            if run_id == self.run_id:
+                self.status["decoder"] = decoder_status
+                self.condition.notify_all()
+
+    def _record_detector_cycle_metrics(
+        self,
+        *,
+        run_id: int,
+        source_epoch: int,
+        frame_idx: int,
+        detector_cycle_ms: float,
+        evidence_update_ms: float,
+        overlay_status_publish_ms: float,
+    ) -> None:
+        detector_cycle_ms = max(0.0, float(detector_cycle_ms))
+        evidence_update_ms = max(0.0, float(evidence_update_ms))
+        overlay_status_publish_ms = max(
+            0.0,
+            float(overlay_status_publish_ms),
+        )
+        self.detector_cycle_samples.append(detector_cycle_ms)
+        self.evidence_update_samples.append(evidence_update_ms)
+        self.overlay_publish_samples.append(overlay_status_publish_ms)
+        cycle_distribution = _timing_distribution(
+            self.detector_cycle_samples
+        )
+        cycle_mean_ms = float(cycle_distribution.get("mean") or 0.0)
+        detector_compute_fps = (
+            1000.0 / cycle_mean_ms if cycle_mean_ms > 1e-6 else 0.0
+        )
+        evidence_distribution = _timing_distribution(
+            self.evidence_update_samples
+        )
+        overlay_distribution = _timing_distribution(
+            self.overlay_publish_samples
+        )
+        with self.condition:
+            if run_id != self.run_id:
+                return
+            if int(self.status.get("source_epoch") or 0) != int(source_epoch):
+                return
+            metrics = {
+                "detector_cycle_ms": detector_cycle_ms,
+                "detector_compute_fps": detector_compute_fps,
+                "evidence_update_ms": evidence_update_ms,
+                "overlay_status_publish_ms": overlay_status_publish_ms,
+                "detector_cycle_ms_distribution": cycle_distribution,
+                "evidence_update_ms_distribution": evidence_distribution,
+                "overlay_status_publish_ms_distribution": (
+                    overlay_distribution
+                ),
+            }
+            self.status.update(metrics)
+            if self.overlay_timeline:
+                latest_overlay = self.overlay_timeline[-1]
+                if (
+                    int(latest_overlay.get("source_epoch") or 0)
+                    == int(source_epoch)
+                    and int(latest_overlay.get("frame_idx") or 0)
+                    == int(frame_idx)
+                ):
+                    latest_overlay.update(metrics)
+            self.condition.notify_all()
+
+    def _finalize_capture_run(
+        self,
+        *,
+        run_id: int,
+        preview_bus: PreviewBus,
+        detection_bus: DetectionBus,
+        source_type: str,
+        source_ended_candidate: bool,
+        final_status_updates: dict[str, Any] | None = None,
+    ) -> None:
+        """Close source buses, drain detector/evidence, then publish EOF.
+
+        ``source_ended`` is a completion guarantee, not merely a decoder EOF
+        marker.  It becomes true only after the process thread consumed its
+        final packet and completed ``EvidenceSession.close()``.
+        """
+
+        drain_started = time.perf_counter()
+        candidate = bool(
+            source_type == "file"
+            and source_ended_candidate
+            and not self.stop_event.is_set()
+        )
+        with self.condition:
+            self._capture_done = True
+            if run_id == self.run_id:
+                if final_status_updates:
+                    self.status.update(final_status_updates)
+                self.status.update(
+                    {
+                        "source_eof_reached": candidate,
+                        "source_ended": False,
+                        "detector_drain_active": candidate,
+                        "detector_drain_completed": False,
+                        "detector_drain_timed_out": False,
+                        "detector_drain_ms": 0.0,
+                        "detector_drain_failed_reason": "",
+                        "process_done": self.process_done_event.is_set(),
+                        "preview_started": False,
+                        "ready_for_preview": False,
+                    }
+                )
+                self.latest_jpeg = None
+                self.latest_jpeg_meta = {}
+                if candidate:
+                    self.status["preview_mode"] = "source_eof_drain"
+                    self.status["detector_pipeline_mode"] = "draining"
+                else:
+                    self.status["running"] = False
+            self.condition.notify_all()
+
+        preview_bus.close()
+        detection_bus.close()
+
+        process_done = self.process_done_event.is_set()
+        timed_out = False
+        if candidate and not process_done:
+            deadline = drain_started + max(
+                0.1,
+                float(self.detector_drain_timeout_s),
+            )
+            while not process_done and not self.stop_event.is_set():
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    timed_out = True
+                    break
+                process_done = self.process_done_event.wait(
+                    timeout=min(0.05, remaining)
+                )
+
+        if candidate:
+            preview_bus.clear()
+            detection_bus.clear()
+        drain_ms = (time.perf_counter() - drain_started) * 1000.0
+        with self.condition:
+            if run_id != self.run_id:
+                return
+            process_done = self.process_done_event.is_set()
+            error_text = str(self.status.get("error") or "").strip()
+            source_ended = bool(
+                candidate
+                and process_done
+                and not timed_out
+                and not self.stop_event.is_set()
+                and not error_text
+            )
+            failed_reason = ""
+            if timed_out:
+                failed_reason = (
+                    "detector_drain_timeout:"
+                    f"{float(self.detector_drain_timeout_s):.3f}s"
+                )
+                errors = list(self.status.get("secondary_errors") or [])
+                if failed_reason not in errors:
+                    errors.append(failed_reason)
+                self.status["secondary_errors"] = errors
+                self.status["warning"] = "detector_drain_timeout"
+            elif candidate and not process_done:
+                failed_reason = (
+                    "stopped_during_detector_drain"
+                    if self.stop_event.is_set()
+                    else "detector_drain_incomplete"
+                )
+            elif error_text:
+                failed_reason = error_text
+
+            self.status.update(
+                {
+                    "running": False,
+                    "source_ended": source_ended,
+                    "process_done": process_done,
+                    "detector_drain_active": False,
+                    "detector_drain_completed": process_done,
+                    "detector_drain_timed_out": timed_out,
+                    "detector_drain_ms": drain_ms,
+                    "detector_drain_failed_reason": failed_reason,
+                    "preview_fps": 0.0,
+                    "ready_for_preview": False,
+                    "preview_started": False,
+                    "stopped_at": datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                }
+            )
+            if source_ended:
+                final_time_s = float(
+                    self.status.get("source_time_s") or 0.0
+                )
+                if self._source_duration_s > 0:
+                    final_time_s = min(
+                        max(final_time_s, 0.0),
+                        float(self._source_duration_s),
+                    )
+                self.status.update(
+                    {
+                        "source_time_s": final_time_s,
+                        "video_time_s": final_time_s,
+                        "preview_mode": "source_ended",
+                        "detector_pipeline_mode": "ended",
+                    }
+                )
+            elif candidate:
+                self.status["preview_mode"] = "source_drain_failed"
+                self.status["detector_pipeline_mode"] = "drain_failed"
+            self.condition.notify_all()
+
+    def _backend_file_decoder_loop(
+        self,
+        *,
+        run_id: int,
+        preview_bus: PreviewBus,
+        detection_bus: DetectionBus,
+        source: str,
+        realtime: bool,
+        preview_render_fps: float,
+        detector_process_fps_cap: float,
+        capture_max_side: int,
+        file_source_fps_cap: float,
+        decoder_preference: str,
+        allow_cpu_fallback: bool,
+        gpu_id: int,
+    ) -> None:
+        """Production file-source loop backed by the unified decoder adapter.
+
+        File frames remain in the decoder-owned representation until preview or
+        detection explicitly materializes the size it needs. NVDEC therefore
+        does not immediately download a full-resolution BGR frame.
+        """
+
+        decoder: VideoDecoder | None = None
+        packet_seq = 0
+        last_detection_push = 0.0
+        source_frames_skipped_for_realtime = 0
+        capture_frames_published = 0
+        detector_submission_count = 0
+        next_read_frame = 0.0
+        playback_anchor_wall = time.perf_counter()
+        playback_anchor_frame = 0.0
+        playback_clock_speed = 1.0
+        playback_was_paused = False
+        temporal_previous_lease = None
+        temporal_previous_owner: SharedFrameLease | None = None
+        temporal_previous_frame_idx: int | None = None
+        temporal_previous_source_time_s: float | None = None
+        pending_owner: SharedFrameLease | None = None
+        source_ended_normally = False
+
+        try:
+            decoder = create_video_decoder(
+                source,
+                preference=decoder_preference,
+                allow_cpu_fallback=allow_cpu_fallback,
+                gpu_id=gpu_id,
+            )
+            self._active_file_decoder = decoder
+            stream_info = decoder.info
+            fps = float(stream_info.fps or 0.0)
+            if not math.isfinite(fps) or fps < 1.0 or fps > 120.0:
+                fps = 25.0
+            frame_count = max(0, int(stream_info.frame_count or 0))
+            duration_s = float(stream_info.duration_s or 0.0)
+            if duration_s <= 0.0 and frame_count > 0:
+                duration_s = frame_count / fps
+            self._source_fps = fps
+            self._source_duration_s = duration_s
+            self._source_frame_count = frame_count
+            frame_step = self._file_frame_step(
+                fps,
+                file_source_fps_cap,
+                preview_render_fps,
+                detector_process_fps_cap,
+            )
+            source_frame_skip_enabled = frame_step > 1.0
+            detect_interval = 1.0 / max(
+                1.0,
+                min(detector_process_fps_cap, fps),
+            )
+            effective_capture_fps = fps / max(1.0, frame_step)
+            detector_submit_every_file_frame = (
+                _detector_can_follow_file_source(
+                    detector_process_fps_cap,
+                    effective_capture_fps,
+                )
+            )
+            decoder_status = _decoder_status_contract(decoder.status_snapshot())
+            with self.condition:
+                if run_id == self.run_id:
+                    self.status.update(
+                        {
+                            "source_fps": fps,
+                            "source_duration_s": duration_s,
+                            "source_frame_count": frame_count,
+                            "ready_for_preview": True,
+                            "preview_started": True,
+                            "preview_seekable": True,
+                            "preview_mode": "backend_source_pipeline",
+                            "detector_pipeline_mode": "backend_latest_only",
+                            "capture_max_side": int(capture_max_side),
+                            "file_source_fps_cap": float(
+                                file_source_fps_cap or 0.0
+                            ),
+                            "source_frame_step": float(frame_step),
+                            "source_frame_skip_enabled": bool(
+                                source_frame_skip_enabled
+                            ),
+                            "detector_submit_every_file_frame": (
+                                detector_submit_every_file_frame
+                            ),
+                            "decoder": decoder_status,
+                        }
+                    )
+                    self.condition.notify_all()
+
+            playback_anchor_wall = time.perf_counter()
+            playback_anchor_frame = 0.0
+            while run_id == self.run_id and not self.stop_event.is_set():
+                _loop_started = time.perf_counter()
+                with self.condition:
+                    paused = bool(self._playback_paused)
+                    speed = max(0.1, float(self._playback_speed or 1.0))
+                    seek_request = self._seek_request_s
+                    if seek_request is not None:
+                        self._seek_request_s = None
+                    current_epoch = int(self._source_epoch)
+
+                if seek_request is not None:
+                    if temporal_previous_owner is not None:
+                        temporal_previous_owner.release()
+                        temporal_previous_owner = None
+                    temporal_previous_lease = None
+                    temporal_previous_frame_idx = None
+                    temporal_previous_source_time_s = None
+                    old_decoder = decoder
+                    try:
+                        old_decoder.close()
+                    except Exception as exc:
+                        with self.condition:
+                            if run_id == self.run_id:
+                                errors = list(
+                                    self.status.get("secondary_errors") or []
+                                )
+                                errors.append(
+                                    "decoder_seek_close_failed:"
+                                    f"{type(exc).__name__}:{exc}"
+                                )
+                                self.status["secondary_errors"] = errors
+                    decoder = create_video_decoder(
+                        source,
+                        preference=decoder_preference,
+                        allow_cpu_fallback=allow_cpu_fallback,
+                        gpu_id=gpu_id,
+                    )
+                    self._active_file_decoder = decoder
+                    decoder.seek_time(max(0.0, float(seek_request)))
+                    next_read_frame = max(0.0, float(seek_request) * fps)
+                    playback_anchor_wall = time.perf_counter()
+                    playback_anchor_frame = next_read_frame
+                    playback_clock_speed = speed
+                    playback_was_paused = False
+                    with self.condition:
+                        if run_id == self.run_id:
+                            self.status["source_epoch"] = current_epoch
+                            self.status["decoder"] = _decoder_status_contract(
+                                decoder.status_snapshot()
+                            )
+                            self.condition.notify_all()
+                    continue
+
+                if paused:
+                    playback_was_paused = True
+                    if self.stop_event.wait(timeout=0.03):
+                        break
+                    continue
+
+                if realtime and (
+                    playback_was_paused
+                    or abs(float(speed) - float(playback_clock_speed)) > 1e-3
+                ):
+                    playback_anchor_wall = time.perf_counter()
+                    playback_anchor_frame = float(next_read_frame)
+                    playback_clock_speed = float(speed)
+                    playback_was_paused = False
+
+                lease = decoder.read()
+                if lease is None:
+                    if capture_frames_published == 0:
+                        raise RuntimeError(
+                            _decoder_zero_frame_message(decoder, source)
+                        )
+                    source_ended_normally = True
+                    break
+                pending_owner = SharedFrameLease(lease)
+                pending_owner.acquire()
+
+                original_w = int(lease.width)
+                original_h = int(lease.height)
+                current_frame_idx = max(0, int(lease.frame_idx))
+                source_time_s = max(0.0, float(lease.pts_s))
+                if source_time_s <= 0.0 and current_frame_idx > 0:
+                    source_time_s = current_frame_idx / fps
+                temporal_predecessor_valid = bool(
+                    temporal_previous_lease is not None
+                    and temporal_previous_frame_idx is not None
+                    and current_frame_idx == temporal_previous_frame_idx + 1
+                    and int(temporal_previous_lease.width) == original_w
+                    and int(temporal_previous_lease.height) == original_h
+                )
+                packet_seq += 1
+                capture_frames_published += 1
+                packet = FramePacket(
+                    seq=packet_seq,
+                    frame_idx=current_frame_idx,
+                    source_time_s=source_time_s,
+                    wall_time_ms=time.time() * 1000.0,
+                    epoch=current_epoch,
+                    frame=None,
+                    width=original_w,
+                    height=original_h,
+                    fps=fps,
+                    flags={
+                        "original_width": original_w,
+                        "original_height": original_h,
+                        "capture_resized": False,
+                        "temporal_predecessor_available": (
+                            temporal_predecessor_valid
+                        ),
+                        "decoder_backend": decoder_status.get(
+                            "effective_backend"
+                        ),
+                        "frame_device": lease.storage,
+                        "pixel_format": lease.pixel_format,
+                    },
+                    previous_frame_idx=(
+                        temporal_previous_frame_idx
+                        if temporal_predecessor_valid
+                        else None
+                    ),
+                    previous_source_time_s=(
+                        temporal_previous_source_time_s
+                        if temporal_predecessor_valid
+                        else None
+                    ),
+                    decoder_lease=lease,
+                    previous_decoder_lease=(
+                        temporal_previous_lease
+                        if temporal_predecessor_valid
+                        else None
+                    ),
+                    decoder_lease_owner=pending_owner,
+                    previous_decoder_lease_owner=(
+                        temporal_previous_owner
+                        if temporal_predecessor_valid
+                        else None
+                    ),
+                )
+                now = time.perf_counter()
+                decoder_status = _decoder_status_contract(
+                    decoder.status_snapshot()
+                )
+                should_submit_detection = bool(
+                    detector_submit_every_file_frame
+                    or now - last_detection_push >= detect_interval
+                )
+                with self.condition:
+                    if run_id != self.run_id or self.stop_event.is_set():
+                        pending_owner.release()
+                        pending_owner = None
+                        break
+                    if (
+                        int(current_epoch) != int(self._source_epoch)
+                        or self._seek_request_s is not None
+                    ):
+                        pending_owner.release()
+                        pending_owner = None
+                        continue
+                    old_temporal_owner = temporal_previous_owner
+                    temporal_previous_lease = lease
+                    temporal_previous_owner = pending_owner
+                    pending_owner = None
+                    temporal_previous_frame_idx = current_frame_idx
+                    temporal_previous_source_time_s = source_time_s
+                    preview_bus.publish(packet)
+                    if should_submit_detection:
+                        last_detection_push = now
+                        detection_bus.push(packet)
+                        detector_submission_count += 1
+                    self.status.update(
+                        {
+                            "source_time_s": source_time_s,
+                            "video_time_s": source_time_s,
+                            "source_epoch": current_epoch,
+                            "preview_started": True,
+                            "ready_for_preview": True,
+                            "source_frame_width": original_w,
+                            "source_frame_height": original_h,
+                            "capture_frame_width": original_w,
+                            "capture_frame_height": original_h,
+                            "capture_resized": False,
+                            "dropped_detection_frames": int(
+                                detection_bus.dropped
+                            ),
+                            "source_frames_skipped_for_realtime": int(
+                                source_frames_skipped_for_realtime
+                            ),
+                            "capture_frames_published": int(
+                                capture_frames_published
+                            ),
+                            "detector_submission_count": int(
+                                detector_submission_count
+                            ),
+                            "stream_last_frame_age_ms": 0.0,
+                            "decoder": decoder_status,
+                        }
+                    )
+                    self.condition.notify_all()
+                if old_temporal_owner is not None:
+                    old_temporal_owner.release()
+
+                if realtime and source_frame_skip_enabled:
+                    clock_target = playback_anchor_frame + max(
+                        0.0,
+                        time.perf_counter() - playback_anchor_wall,
+                    ) * float(speed) * max(1.0, fps)
+                    next_read_frame = max(
+                        float(packet.frame_idx) + frame_step,
+                        clock_target,
+                    )
+                    next_index = int(round(next_read_frame))
+                    skip_count = max(
+                        0,
+                        next_index - (int(packet.frame_idx) + 1),
+                    )
+                    skipped = 0
+                    latest_skipped_lease = None
+                    for _ in range(min(skip_count, 120)):
+                        if self.stop_event.is_set():
+                            break
+                        candidate = decoder.read()
+                        if candidate is None:
+                            source_ended_normally = True
+                            break
+                        if latest_skipped_lease is not None:
+                            latest_skipped_lease.release()
+                        latest_skipped_lease = candidate
+                        skipped += 1
+                    source_frames_skipped_for_realtime += skipped
+                    if latest_skipped_lease is not None:
+                        if temporal_previous_owner is not None:
+                            temporal_previous_owner.release()
+                        temporal_previous_owner = SharedFrameLease(
+                            latest_skipped_lease
+                        )
+                        temporal_previous_owner.acquire()
+                        temporal_previous_lease = latest_skipped_lease
+                        temporal_previous_frame_idx = int(
+                            latest_skipped_lease.frame_idx
+                        )
+                        temporal_previous_source_time_s = max(
+                            0.0,
+                            float(latest_skipped_lease.pts_s),
+                        )
+                    if source_ended_normally:
+                        break
+                    if skipped > 0:
+                        with self.condition:
+                            if run_id == self.run_id:
+                                self.status[
+                                    "source_frames_skipped_for_realtime"
+                                ] = int(source_frames_skipped_for_realtime)
+                                self.status["decoder"] = (
+                                    _decoder_status_contract(
+                                        decoder.status_snapshot()
+                                    )
+                                )
+                                self.condition.notify_all()
+
+                if realtime:
+                    next_scheduled_frame = float(packet.frame_idx) + frame_step
+                    if source_frame_skip_enabled:
+                        next_scheduled_frame = max(
+                            next_scheduled_frame,
+                            float(next_read_frame),
+                        )
+                    wait_s = _file_realtime_wait_s(
+                        playback_anchor_wall=playback_anchor_wall,
+                        playback_anchor_frame=playback_anchor_frame,
+                        next_frame=next_scheduled_frame,
+                        fps=fps,
+                        speed=speed,
+                    )
+                    if wait_s > 0 and self.stop_event.wait(timeout=wait_s):
+                        break
+        except BaseException as exc:
+            if not self.stop_event.is_set():
+                self._set_error(str(exc), run_id)
+        finally:
+            if pending_owner is not None:
+                pending_owner.release()
+                pending_owner = None
+            if temporal_previous_owner is not None:
+                temporal_previous_owner.release()
+                temporal_previous_owner = None
+            final_decoder_status = _empty_decoder_status(
+                decoder_preference
+            )
+            if decoder is not None:
+                try:
+                    decoder.close()
+                except Exception as exc:
+                    with self.condition:
+                        if run_id == self.run_id:
+                            errors = list(
+                                self.status.get("secondary_errors") or []
+                            )
+                            errors.append(
+                                "decoder_close_failed:"
+                                f"{type(exc).__name__}:{exc}"
+                            )
+                            self.status["secondary_errors"] = errors
+                try:
+                    final_decoder_status = _decoder_status_contract(
+                        decoder.status_snapshot()
+                    )
+                except Exception as exc:
+                    final_decoder_status = {
+                        **_empty_decoder_status(decoder_preference),
+                        "close_error": (
+                            "decoder_status_after_close_failed:"
+                            f"{type(exc).__name__}:{exc}"
+                        ),
+                    }
+            if self._active_file_decoder is decoder:
+                self._active_file_decoder = None
+            self._finalize_capture_run(
+                run_id=run_id,
+                preview_bus=preview_bus,
+                detection_bus=detection_bus,
+                source_type="file",
+                source_ended_candidate=source_ended_normally,
+                final_status_updates={"decoder": final_decoder_status},
+            )
+
     def _backend_capture_loop(
         self,
         run_id: int,
@@ -1057,10 +2781,32 @@ class MonitorEngine:
         detector_process_fps_cap: float,
         capture_max_side: int,
         file_source_fps_cap: float,
+        video_decoder_preference: str | None = None,
+        video_decoder_allow_cpu_fallback: bool = True,
+        video_decoder_gpu_id: int = 0,
     ) -> None:
+        if source_type == "file" and video_decoder_preference is not None:
+            self._backend_file_decoder_loop(
+                run_id=run_id,
+                preview_bus=preview_bus,
+                detection_bus=detection_bus,
+                source=source,
+                realtime=realtime,
+                preview_render_fps=preview_render_fps,
+                detector_process_fps_cap=detector_process_fps_cap,
+                capture_max_side=capture_max_side,
+                file_source_fps_cap=file_source_fps_cap,
+                decoder_preference=video_decoder_preference,
+                allow_cpu_fallback=video_decoder_allow_cpu_fallback,
+                gpu_id=video_decoder_gpu_id,
+            )
+            return
         cap = None
         packet_seq = 0
         last_detection_push = 0.0
+        source_frames_skipped_for_realtime = 0
+        capture_frames_published = 0
+        detector_submission_count = 0
         last_frame_seen = time.perf_counter()
         reconnects = 0
         next_read_frame = 0.0
@@ -1082,8 +2828,61 @@ class MonitorEngine:
                 if source_type == "file"
                 else 1.0
             )
-            frame_period = frame_step / max(1.0, fps)
+            source_frame_skip_enabled = (
+                source_type == "file" and frame_step > 1.0
+            )
             detect_interval = 1.0 / max(1.0, min(detector_process_fps_cap, fps if source_type == "file" else detector_process_fps_cap))
+            effective_capture_fps = fps / max(1.0, frame_step)
+            detector_submit_every_file_frame = bool(
+                source_type == "file"
+                and _detector_can_follow_file_source(
+                    detector_process_fps_cap,
+                    effective_capture_fps,
+                )
+            )
+            requested_live_decoder = str(
+                video_decoder_preference or "opencv"
+            )
+            live_decoder_status = _empty_decoder_status(
+                requested_live_decoder
+            )
+            live_decoder_status.update(
+                {
+                    "backend": "opencv",
+                    "effective_backend": "opencv",
+                    "codec": "capture_backend_managed",
+                    "gpu_device": "cpu",
+                    "output_format": "bgr24",
+                    "frame_device": "host",
+                    "fallback_count": (
+                        0
+                        if requested_live_decoder.strip().lower()
+                        in {"opencv", "cpu"}
+                        else 1
+                    ),
+                    "fallback_reason": (
+                        "none"
+                        if requested_live_decoder.strip().lower()
+                        in {"opencv", "cpu"}
+                        else (
+                            f"{source_type}_nvdec_adapter_unavailable:"
+                            "using_opencv_capture"
+                        )
+                    ),
+                    "fallback_reasons": (
+                        []
+                        if requested_live_decoder.strip().lower()
+                        in {"opencv", "cpu"}
+                        else [
+                            (
+                                f"{source_type}_nvdec_adapter_unavailable:"
+                                "using_opencv_capture"
+                            )
+                        ]
+                    ),
+                    "closed": False,
+                }
+            )
             with self.condition:
                 if run_id == self.run_id:
                     preview_can_start = True
@@ -1100,12 +2899,19 @@ class MonitorEngine:
                             "capture_max_side": int(capture_max_side),
                             "file_source_fps_cap": float(file_source_fps_cap or 0.0),
                             "source_frame_step": float(frame_step),
+                            "source_frame_skip_enabled": bool(
+                                source_frame_skip_enabled
+                            ),
+                            "detector_submit_every_file_frame": (
+                                detector_submit_every_file_frame
+                            ),
+                            "decoder": live_decoder_status,
                         }
                     )
                     self.condition.notify_all()
 
             while run_id == self.run_id and not self.stop_event.is_set():
-                loop_started = time.perf_counter()
+                _loop_started = time.perf_counter()
                 with self.condition:
                     paused = bool(self._playback_paused)
                     speed = max(0.1, float(self._playback_speed or 1.0))
@@ -1131,9 +2937,14 @@ class MonitorEngine:
                     continue
                 if paused and source_type == "file":
                     playback_was_paused = True
-                    time.sleep(0.03)
+                    if self.stop_event.wait(timeout=0.03):
+                        break
                     continue
-                if source_type == "file" and realtime:
+                if (
+                    source_type == "file"
+                    and realtime
+                    and source_frame_skip_enabled
+                ):
                     current_index_for_anchor = float(cap.get(cv2.CAP_PROP_POS_FRAMES) or next_read_frame)
                     if playback_was_paused or abs(float(speed) - float(playback_clock_speed)) > 1e-3:
                         playback_anchor_wall = time.perf_counter()
@@ -1162,11 +2973,20 @@ class MonitorEngine:
                         except Exception:
                             pass
                         cap = open_capture(source_type, source)
+                        with self.condition:
+                            if run_id != self.run_id or self.stop_event.is_set():
+                                break
+                            current_epoch = self._reset_source_epoch_state_locked()
+                            self.status["stream_reconnects"] = reconnects
+                            self.status["preview_mode"] = "source_reconnected"
+                            self.condition.notify_all()
                         last_frame_seen = time.perf_counter()
+                        last_detection_push = 0.0
                         temporal_previous_frame = None
                         temporal_previous_frame_idx = None
                         temporal_previous_source_time_s = None
-                    time.sleep(0.03)
+                    if self.stop_event.wait(timeout=0.03):
+                        break
                     if source_type != "file":
                         continue
 
@@ -1193,6 +3013,7 @@ class MonitorEngine:
                     and temporal_previous_frame.shape[:2] == frame.shape[:2]
                 )
                 packet_seq += 1
+                capture_frames_published += 1
                 packet = FramePacket(
                     seq=packet_seq,
                     frame_idx=current_frame_idx,
@@ -1217,34 +3038,57 @@ class MonitorEngine:
                         temporal_previous_source_time_s if temporal_predecessor_valid else None
                     ),
                 )
-                temporal_previous_frame = frame
-                temporal_previous_frame_idx = current_frame_idx
-                temporal_previous_source_time_s = max(0.0, source_time_s)
-                preview_bus.publish(packet)
                 now = time.perf_counter()
-                if now - last_detection_push >= detect_interval:
-                    last_detection_push = now
-                    detection_bus.push(packet)
+                should_submit_detection = bool(
+                    detector_submit_every_file_frame
+                    or now - last_detection_push >= detect_interval
+                )
                 with self.condition:
-                    if run_id == self.run_id:
-                        preview_can_start = True
-                        self.status.update(
-                            {
-                                "source_time_s": packet.source_time_s,
-                                "video_time_s": packet.source_time_s,
-                                "source_epoch": packet.epoch,
-                                "preview_started": preview_can_start,
-                                "ready_for_preview": preview_can_start,
-                                "source_frame_width": int(original_w),
-                                "source_frame_height": int(original_h),
-                                "capture_frame_width": int(w),
-                                "capture_frame_height": int(h),
-                                "capture_resized": bool(capture_resized),
-                                "dropped_detection_frames": int(detection_bus.dropped),
-                                "stream_last_frame_age_ms": 0.0,
-                            }
-                        )
-                        self.condition.notify_all()
+                    if run_id != self.run_id or self.stop_event.is_set():
+                        break
+                    if (
+                        int(current_epoch) != int(self._source_epoch)
+                        or self._seek_request_s is not None
+                    ):
+                        # A seek/source reset may occur while cap.read() is
+                        # blocked. Never let that in-flight old frame republish
+                        # after the epoch was advanced and buffers were cleared.
+                        continue
+                    temporal_previous_frame = frame
+                    temporal_previous_frame_idx = current_frame_idx
+                    temporal_previous_source_time_s = max(0.0, source_time_s)
+                    preview_bus.publish(packet)
+                    if should_submit_detection:
+                        last_detection_push = now
+                        detection_bus.push(packet)
+                        detector_submission_count += 1
+                    preview_can_start = True
+                    self.status.update(
+                        {
+                            "source_time_s": packet.source_time_s,
+                            "video_time_s": packet.source_time_s,
+                            "source_epoch": packet.epoch,
+                            "preview_started": preview_can_start,
+                            "ready_for_preview": preview_can_start,
+                            "source_frame_width": int(original_w),
+                            "source_frame_height": int(original_h),
+                            "capture_frame_width": int(w),
+                            "capture_frame_height": int(h),
+                            "capture_resized": bool(capture_resized),
+                            "dropped_detection_frames": int(detection_bus.dropped),
+                            "source_frames_skipped_for_realtime": int(
+                                source_frames_skipped_for_realtime
+                            ),
+                            "capture_frames_published": int(
+                                capture_frames_published
+                            ),
+                            "detector_submission_count": int(
+                                detector_submission_count
+                            ),
+                            "stream_last_frame_age_ms": 0.0,
+                        }
+                    )
+                    self.condition.notify_all()
                 if source_type == "file" and realtime:
                     clock_target = playback_anchor_frame + max(0.0, time.perf_counter() - playback_anchor_wall) * float(speed) * max(1.0, fps)
                     next_read_frame = max(float(packet.frame_idx) + frame_step, clock_target)
@@ -1256,6 +3100,7 @@ class MonitorEngine:
                         if not cap.grab():
                             break
                         grabbed += 1
+                    source_frames_skipped_for_realtime += grabbed
                     if grabbed > 0:
                         retrieved, skipped_frame = cap.retrieve()
                         if retrieved and skipped_frame is not None:
@@ -1277,44 +3122,42 @@ class MonitorEngine:
                             temporal_previous_frame = None
                             temporal_previous_frame_idx = None
                             temporal_previous_source_time_s = None
+                        with self.condition:
+                            if run_id == self.run_id:
+                                self.status[
+                                    "source_frames_skipped_for_realtime"
+                                ] = int(source_frames_skipped_for_realtime)
                 if source_type == "file" and realtime:
-                    elapsed = time.perf_counter() - loop_started
-                    wait_s = max(0.0, (frame_period / speed) - elapsed)
-                    if wait_s > 0:
-                        time.sleep(wait_s)
+                    next_scheduled_frame = float(packet.frame_idx) + frame_step
+                    if source_frame_skip_enabled:
+                        next_scheduled_frame = max(
+                            next_scheduled_frame,
+                            float(next_read_frame),
+                        )
+                    wait_s = _file_realtime_wait_s(
+                        playback_anchor_wall=playback_anchor_wall,
+                        playback_anchor_frame=playback_anchor_frame,
+                        next_frame=next_scheduled_frame,
+                        fps=fps,
+                        speed=speed,
+                    )
+                    if wait_s > 0 and self.stop_event.wait(timeout=wait_s):
+                        break
         except BaseException as exc:
             self._set_error(str(exc), run_id)
         finally:
             if cap is not None:
                 cap.release()
-            with self.condition:
-                self._capture_done = True
-                if run_id == self.run_id:
-                    self.status["running"] = False
-                    source_ended = source_type == "file" and not self.stop_event.is_set()
-                    self.status["source_ended"] = source_ended
-                    self.status["preview_started"] = False
-                    self.status["ready_for_preview"] = False
-                    self.latest_jpeg = None
-                    if source_ended:
-                        final_time_s = float(self.status.get("source_time_s") or 0.0)
-                        if self._source_duration_s > 0:
-                            final_time_s = min(max(final_time_s, 0.0), float(self._source_duration_s))
-                        self.status.update(
-                            {
-                                "source_time_s": final_time_s,
-                                "video_time_s": final_time_s,
-                                "preview_fps": 0.0,
-                                "preview_mode": "source_ended",
-                                "detector_pipeline_mode": "ended",
-                                "ready_for_preview": False,
-                                "preview_started": False,
-                            }
-                        )
-                    self.status["stopped_at"] = datetime.now().isoformat(timespec="seconds")
-                self.condition.notify_all()
-            preview_bus.close()
-            detection_bus.close()
+            self._finalize_capture_run(
+                run_id=run_id,
+                preview_bus=preview_bus,
+                detection_bus=detection_bus,
+                source_type=source_type,
+                source_ended_candidate=(
+                    source_type == "file"
+                    and not self.stop_event.is_set()
+                ),
+            )
 
     def _backend_process_loop(
         self,
@@ -1325,14 +3168,23 @@ class MonitorEngine:
         source: str,
         profile: str,
         realtime: bool,
+        cache_feature_options: dict[str, Any],
         feature_options: dict[str, Any],
         custom_model: dict[str, Any],
     ) -> None:
         evidence: EvidenceSession | None = None
+        runtime_config: dict[str, Any] = {}
+        target_frame_budget_ms: float | None = None
+        effective_source_fps = 0.0
         last_seq = 0
         last_epoch: int | None = None
+        active_packet: FramePacket | None = None
         try:
-            bundle = self.cache.get(profile=profile, feature_options=feature_options, custom_model=custom_model)
+            bundle = self.cache.get(
+                profile=profile,
+                feature_options=cache_feature_options,
+                custom_model=custom_model,
+            )
             runtime_config = bundle.config.get("runtime", {}) if isinstance(bundle.config.get("runtime"), dict) else {}
             thread_warmup_frames = int(
                 runtime_config.get(
@@ -1354,21 +3206,7 @@ class MonitorEngine:
                     thread_warmup_error = thread_warmup_error or f"{type(exc).__name__}: {exc}"
                 thread_warmup_ms = (time.perf_counter() - thread_warmup_started) * 1000.0
             processor = FrameProcessor(bundle, jpeg_quality=int(runtime_config.get("jpeg_quality", 82)))
-            evidence = EvidenceSession(
-                source_type=source_type,
-                source=source,
-                profile=profile,
-                enabled=bool(runtime_config.get("evidence_enabled", True)),
-                pre_frames=int(runtime_config.get("evidence_pre_frames", 12)),
-                post_frames=int(runtime_config.get("evidence_post_frames", 18)),
-                sample_every=max(1, int(max(1, self._source_fps) / max(1, int(runtime_config.get("evidence_fps", 15))))),
-                max_frames_per_event=int(runtime_config.get("evidence_max_frames_per_event", 40)),
-                clip_fps=int(runtime_config.get("evidence_clip_fps", 6)),
-            )
-            # Write config snapshot to evidence session dir (2026-06-11)
-            _cfg_snap_path = write_config_snapshot(runtime_config, evidence.session_dir)
             process_fps_cap = float(runtime_config.get("detector_process_fps_cap", runtime_config.get("process_fps_cap", 15)) or 15)
-            target_frame_budget_ms = 1000.0 / max(1.0, min(self._source_fps, process_fps_cap))
             with self.condition:
                 if run_id == self.run_id:
                     self.status.update(
@@ -1379,8 +3217,8 @@ class MonitorEngine:
                             "custom_model": dict(
                                 bundle.config.get("runtime", {}).get("custom_model", custom_model)
                             ),
-                            "evidence_session_dir": str(evidence.session_dir),
-                            "evidence_manifest_path": str(evidence.manifest_path),
+                            "evidence_session_dir": None,
+                            "evidence_manifest_path": None,
                             "detector_ready": True,
                             "initializing": False,
                             "prewarming": False,
@@ -1405,13 +3243,106 @@ class MonitorEngine:
                     if detection_bus.closed:
                         break
                     continue
+                active_packet = packet
+                detector_cycle_started = time.perf_counter()
                 last_seq = packet.seq
                 if last_epoch is None:
                     last_epoch = int(packet.epoch)
                 elif int(packet.epoch) != last_epoch:
-                    processor.reset()
+                    if evidence is None:
+                        raise RuntimeError(
+                            "evidence session is unavailable during source epoch reset"
+                        )
+                    self._reset_process_epoch_state(
+                        run_id=run_id,
+                        processor=processor,
+                        evidence=evidence,
+                        source_epoch=int(packet.epoch),
+                    )
                     last_epoch = int(packet.epoch)
-                display_options = self.get_status().get("display_options", dict(self.display_options))
+                if evidence is None:
+                    packet_fps = float(packet.fps or 0.0)
+                    if not math.isfinite(packet_fps) or packet_fps <= 0.0:
+                        packet_fps = float(self._source_fps or 0.0)
+                    effective_source_fps = max(1.0, packet_fps)
+                    evidence_fps = max(
+                        1,
+                        int(runtime_config.get("evidence_fps", 15) or 15),
+                    )
+                    evidence = EvidenceSession(
+                        source_type=source_type,
+                        source=source,
+                        profile=profile,
+                        run_id=run_id,
+                        source_epoch=int(packet.epoch),
+                        enabled=bool(runtime_config.get("evidence_enabled", True)),
+                        pre_frames=int(runtime_config.get("evidence_pre_frames", 12)),
+                        post_frames=int(runtime_config.get("evidence_post_frames", 18)),
+                        sample_every=max(
+                            1,
+                            int(effective_source_fps / evidence_fps),
+                        ),
+                        max_frames_per_event=int(
+                            runtime_config.get("evidence_max_frames_per_event", 40)
+                        ),
+                        clip_fps=int(runtime_config.get("evidence_clip_fps", 6)),
+                        writer_queue_capacity=int(
+                            runtime_config.get(
+                                "evidence_writer_queue_capacity",
+                                256,
+                            )
+                            or 256
+                        ),
+                        writer_enqueue_timeout_s=float(
+                            runtime_config.get(
+                                "evidence_writer_enqueue_timeout_s",
+                                0.02,
+                            )
+                            or 0.0
+                        ),
+                        writer_drain_timeout_s=float(
+                            runtime_config.get(
+                                "evidence_writer_drain_timeout_s",
+                                10.0,
+                            )
+                            or 10.0
+                        ),
+                    )
+                    if evidence.enabled and evidence.session_dir is not None:
+                        snapshot_config = dict(bundle.config)
+                        snapshot_config["_runtime_context"] = {
+                            "run_id": int(run_id),
+                            "source_epoch": int(packet.epoch),
+                        }
+                        write_config_snapshot(snapshot_config, evidence.session_dir)
+                    target_frame_budget_ms = 1000.0 / max(
+                        1.0,
+                        min(effective_source_fps, process_fps_cap),
+                    )
+                    with self.condition:
+                        if run_id == self.run_id:
+                            self.status.update(
+                                {
+                                    "evidence_session_dir": (
+                                        str(evidence.session_dir)
+                                        if evidence.session_dir is not None
+                                        else None
+                                    ),
+                                    "evidence_manifest_path": (
+                                        str(evidence.manifest_path)
+                                        if evidence.manifest_path is not None
+                                        else None
+                                    ),
+                                    **_evidence_writer_status_contract(
+                                        evidence
+                                    ),
+                                    "source_fps": effective_source_fps,
+                                    "target_frame_budget_ms": target_frame_budget_ms,
+                                }
+                            )
+                            self.condition.notify_all()
+                with self.lock:
+                    display_options = dict(self.display_options)
                 processed = processor.process(
                     packet.frame,
                     frame_idx=packet.frame_idx,
@@ -1420,31 +3351,33 @@ class MonitorEngine:
                     profile=profile,
                     realtime=realtime,
                     video_time_s=packet.source_time_s,
-                    source_fps=self._source_fps,
+                    source_fps=effective_source_fps,
                     dropped_frames=detection_bus.dropped,
                     display_options=display_options,
                     feature_options=feature_options,
                     custom_model=custom_model,
-                    target_frame_budget_ms=target_frame_budget_ms,
+                    target_frame_budget_ms=float(target_frame_budget_ms),
                     temporal_previous_frame=packet.previous_frame,
                     temporal_previous_frame_idx=packet.previous_frame_idx,
                     temporal_previous_source_time_s=packet.previous_source_time_s,
+                    decoded_frame_lease=packet.decoder_lease,
+                    temporal_previous_decoded_frame=(
+                        packet.previous_decoder_lease
+                    ),
                 )
+                if packet.decoder_lease is not None:
+                    self._refresh_active_decoder_status(run_id)
                 # 实测检测帧率(YOLO+模块A 全链路, 与 demo detect_fps 同口径)。
                 self.detect_times.append(time.perf_counter())
-                detect_fps = 0.0
-                if len(self.detect_times) >= 2:
-                    _elapsed = self.detect_times[-1] - self.detect_times[0]
-                    if _elapsed > 1e-6:
-                        detect_fps = (len(self.detect_times) - 1) / _elapsed
-                self._after_processed(
+                detect_fps = _detector_completion_fps(self.detect_times)
+                after_processed_timings = self._after_processed(
                     run_id,
                     processed,
                     evidence,
                     preview_mode="backend_source_pipeline",
                     extra_status={
                         "fps": round(float(detect_fps), 1),
-                        "source_fps": self._source_fps,
+                        "source_fps": effective_source_fps,
                         "source_duration_s": self._source_duration_s,
                         "source_frame_count": self._source_frame_count,
                         "source_time_s": packet.source_time_s,
@@ -1456,15 +3389,141 @@ class MonitorEngine:
                     },
                     publish_jpeg=False,
                 )
+                packet.release_lease_refs()
+                active_packet = None
+                detector_cycle_ms = (
+                    time.perf_counter() - detector_cycle_started
+                ) * 1000.0
+                self._record_detector_cycle_metrics(
+                    run_id=run_id,
+                    source_epoch=int(packet.epoch),
+                    frame_idx=int(packet.frame_idx),
+                    detector_cycle_ms=detector_cycle_ms,
+                    evidence_update_ms=float(
+                        after_processed_timings.get(
+                            "evidence_update_ms",
+                            0.0,
+                        )
+                    ),
+                    overlay_status_publish_ms=float(
+                        after_processed_timings.get(
+                            "overlay_status_publish_ms",
+                            0.0,
+                        )
+                    ),
+                )
         except BaseException as exc:
             self._set_error(str(exc), run_id)
             detection_bus.close()
         finally:
+            if active_packet is not None:
+                active_packet.release_lease_refs()
+                active_packet = None
+            evidence_drain_started = time.perf_counter()
+            evidence_drain_error = ""
+            evidence_writer_status = _evidence_writer_status_contract(
+                evidence
+            )
+            with self.condition:
+                if run_id == self.run_id:
+                    self.status.update(
+                        {
+                            "evidence_drain_active": evidence is not None,
+                            "evidence_drain_completed": False,
+                            "evidence_drain_failed": False,
+                            "evidence_drain_error": "",
+                            **evidence_writer_status,
+                        }
+                    )
+                    self.condition.notify_all()
             if evidence is not None:
                 try:
-                    self._merge_completed_events(evidence.close())
+                    self._merge_completed_events(
+                        evidence.close(),
+                        run_id=run_id,
+                    )
                 except Exception as exc:
-                    self._set_error(f"evidence close failed: {exc}", run_id)
+                    evidence_drain_error = (
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    self._set_error(
+                        f"evidence close failed: {exc}",
+                        run_id,
+                    )
+                evidence_writer_status = (
+                    _evidence_writer_status_contract(evidence)
+                )
+                writer_failed = int(
+                    evidence_writer_status.get(
+                        "evidence_writer_failed",
+                        0,
+                    )
+                    or 0
+                )
+                writer_pending = int(
+                    evidence_writer_status.get(
+                        "evidence_writer_pending",
+                        0,
+                    )
+                    or 0
+                )
+                writer_last_error = str(
+                    evidence_writer_status.get(
+                        "evidence_writer_last_error",
+                        "",
+                    )
+                    or ""
+                )
+                writer_alive = bool(
+                    evidence_writer_status.get(
+                        "evidence_writer_alive",
+                        False,
+                    )
+                )
+                if (
+                    not evidence_drain_error
+                    and (
+                        writer_failed > 0
+                        or writer_pending > 0
+                        or writer_alive
+                        or writer_last_error
+                    )
+                ):
+                    evidence_drain_error = (
+                        "evidence_writer_unhealthy_after_drain:"
+                        f"failed={writer_failed},"
+                        f"pending={writer_pending},"
+                        f"alive={str(writer_alive).lower()},"
+                        f"last_error={writer_last_error or 'none'}"
+                    )
+                    self._set_error(
+                        f"evidence writer drain failed: {evidence_drain_error}",
+                        run_id,
+                    )
+            evidence_drain_ms = (
+                time.perf_counter() - evidence_drain_started
+            ) * 1000.0
+            with self.condition:
+                if run_id == self.run_id:
+                    self.status.update(
+                        {
+                            "evidence_drain_active": False,
+                            "evidence_drain_completed": (
+                                not evidence_drain_error
+                            ),
+                            "evidence_drain_failed": bool(
+                                evidence_drain_error
+                            ),
+                            "evidence_drain_ms": evidence_drain_ms,
+                            "evidence_drain_error": (
+                                evidence_drain_error
+                            ),
+                            **evidence_writer_status,
+                            "process_done": True,
+                        }
+                    )
+                    self.condition.notify_all()
+            self.process_done_event.set()
             with self.condition:
                 release_finished_file_pipeline = self._should_release_finished_file_pipeline(
                     run_id=run_id,
@@ -1473,6 +3532,62 @@ class MonitorEngine:
                 )
             if release_finished_file_pipeline:
                 self._release_pipeline_cache()
+
+    def _reset_process_epoch_state(
+        self,
+        *,
+        run_id: int,
+        processor: FrameProcessor,
+        evidence: EvidenceSession,
+        source_epoch: int,
+    ) -> None:
+        reset_evidence = getattr(evidence, "reset", None)
+        if callable(reset_evidence):
+            completed = reset_evidence(
+                reason="source_epoch_changed",
+                source_epoch=int(source_epoch),
+            )
+            self._merge_completed_events(completed, run_id=run_id)
+        processor.reset()
+
+    @staticmethod
+    def _preview_target_size(
+        width: int,
+        height: int,
+        max_side: int,
+    ) -> tuple[int, int]:
+        width = max(1, int(width))
+        height = max(1, int(height))
+        if max_side <= 0 or max(width, height) <= max_side:
+            return width, height
+        scale = float(max_side) / float(max(width, height))
+        return (
+            max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))),
+        )
+
+    def _materialize_preview_frame(
+        self,
+        packet: FramePacket,
+        *,
+        max_side: int,
+    ) -> Any:
+        target_size = self._preview_target_size(
+            packet.width,
+            packet.height,
+            max_side,
+        )
+        if packet.decoder_lease is not None:
+            return packet.decoder_lease.materialize_host_bgr(
+                size=target_size
+            )
+        frame = packet.frame
+        if frame is None:
+            raise RuntimeError("frame_packet_has_no_preview_materializer")
+        src_height, src_width = frame.shape[:2]
+        if (int(src_width), int(src_height)) == target_size:
+            return frame
+        return cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
 
     def _preview_render_loop(self, run_id: int, preview_bus: PreviewBus, preview_render_fps: float) -> None:
         interval = 1.0 / max(1.0, float(preview_render_fps or 25.0))
@@ -1488,15 +3603,20 @@ class MonitorEngine:
                     break
                 continue
             if packet.seq <= last_seq:
+                packet.release_lease_refs()
                 continue
             last_seq = packet.seq
+            with self.condition:
+                if run_id != self.run_id:
+                    packet.release_lease_refs()
+                    break
+                if int(self.status.get("source_epoch") or 0) != int(packet.epoch):
+                    packet.release_lease_refs()
+                    continue
             if scene_cut_epoch != packet.epoch:
                 scene_cut_epoch = packet.epoch
                 scene_cut_frame_idx = None
                 previous_display_frame = None
-            if _is_preview_scene_cut(previous_display_frame, packet.frame):
-                scene_cut_frame_idx = packet.frame_idx
-            previous_display_frame = packet.frame
             with self.condition:
                 waiting_for_first_file_detection = (
                     str(self.status.get("source_type") or "").lower() == "file"
@@ -1505,23 +3625,52 @@ class MonitorEngine:
                     and not bool(self.status.get("first_detection_ready"))
                 )
             if waiting_for_first_file_detection:
-                time.sleep(min(interval, 0.03))
+                packet.release_lease_refs()
+                if self.stop_event.wait(timeout=min(interval, 0.03)):
+                    break
                 continue
             try:
+                max_side = int(
+                    self.get_status().get("preview_max_side") or 960
+                )
+                display_frame = self._materialize_preview_frame(
+                    packet,
+                    max_side=max_side,
+                )
+                if _is_preview_scene_cut(
+                    previous_display_frame,
+                    display_frame,
+                ):
+                    scene_cut_frame_idx = packet.frame_idx
+                previous_display_frame = display_frame
                 overlay = self._select_preview_overlay(
                     packet.source_time_s,
                     packet.epoch,
                     display_frame_idx=packet.frame_idx,
                     display_scene_cut_frame_idx=scene_cut_frame_idx,
                 )
-                rendered = self._render_backend_preview(packet, overlay)
-                self._publish_preview(encode_jpeg(rendered, quality=82), run_id)
+                rendered = self._render_backend_preview(
+                    packet,
+                    overlay,
+                    display_frame=display_frame,
+                )
+                self._publish_preview(
+                    encode_jpeg(rendered, quality=82),
+                    run_id,
+                    source_epoch=packet.epoch,
+                    source_time_s=packet.source_time_s,
+                    frame_idx=packet.frame_idx,
+                )
+                if packet.decoder_lease is not None:
+                    self._refresh_active_decoder_status(run_id)
+                packet.release_lease_refs()
             except BaseException as exc:
+                packet.release_lease_refs()
                 self._set_error(str(exc), run_id)
                 break
             elapsed = time.perf_counter() - started
-            if elapsed < interval:
-                time.sleep(interval - elapsed)
+            if elapsed < interval and self.stop_event.wait(timeout=interval - elapsed):
+                break
 
     def _select_preview_overlay(
         self,
@@ -1545,27 +3694,20 @@ class MonitorEngine:
                 self.status.get("realtime", True)
             )
             if file_realtime_preview:
-                # File preview follows the video clock. A long held overlay makes
-                # stale boxes trail moving content, but a too-short bridge drops
-                # boxes whenever detection falls slightly below the target FPS.
-                detector_fps = max(1.0, float(self.status.get("detector_process_fps_cap") or 15.0))
-                bridge_frames = max(
-                    1.0,
-                    float(self.status.get("file_realtime_overlay_bridge_frames") or 3.2),
+                # File preview follows the native source clock while detection
+                # completes asynchronously.  Bridge from measured cadence, not
+                # the configured FPS ceiling; otherwise a slow A3b cycle creates
+                # a periodic empty-overlay frame even though inference is alive.
+                bridge_s = _adaptive_file_overlay_bridge_s(
+                    self.status,
+                    records,
                 )
-                bridge_min_s = max(
-                    0.0,
-                    float(self.status.get("file_realtime_overlay_bridge_min_s") or 0.20),
-                )
-                bridge_max_s = max(
-                    bridge_min_s,
-                    float(self.status.get("file_realtime_overlay_bridge_max_s") or 0.36),
-                )
-                bridge_s = min(bridge_max_s, max(bridge_min_s, bridge_frames / detector_fps))
                 match_s = min(match_s, bridge_s)
-                hold_s = min(hold_s, bridge_s)
-                max_age_s = min(max_age_s, max(bridge_s, 0.32))
-                interp_s = min(interp_s, max(bridge_s * 2.0, 0.28))
+                hold_s = min(max_age_s, bridge_s)
+                interp_s = min(
+                    max_age_s,
+                    max(interp_s, bridge_s * 2.0),
+                )
         if not records:
             return None
         records.sort(key=lambda item: float(item.get("video_time_s") or 0.0))
@@ -1580,13 +3722,29 @@ class MonitorEngine:
                 break
         if prev is not None and next_item is not None:
             if float(next_item.get("video_time_s") or 0.0) - float(prev.get("video_time_s") or 0.0) <= interp_s:
+                next_suppresses_tracks = bool(
+                    next_item.get("ppe_source_auth_media_suppressed")
+                    or next_item.get("ppe_source_auth_temporal_reset")
+                )
                 mixed = interpolate_overlay(
                     prev,
                     next_item,
                     source_time_s,
-                    keep_unmatched_tracks=not file_realtime_preview,
+                    keep_unmatched_tracks=(
+                        not file_realtime_preview
+                        or not next_suppresses_tracks
+                    ),
                 )
                 if mixed is not None:
+                    # Box coordinates may be interpolated, but alarm/A3b/PPE
+                    # state is discrete and must remain causal until the next
+                    # detector timestamp.  Midpoint state switching made HUD
+                    # messages clear half an interval early (and appear early).
+                    mixed = _causal_interpolated_overlay(
+                        prev,
+                        mixed,
+                        source_time_s,
+                    )
                     mixed["overlay_display_source"] = "interpolated"
                     mixed = annotate_alert_display_context(
                         mixed,
@@ -1616,7 +3774,17 @@ class MonitorEngine:
                 out["held"] = True
                 out["overlay_display_source"] = "held"
                 tracks = []
+                crosses_scene_cut = bool(
+                    display_frame_idx is not None
+                    and display_scene_cut_frame_idx is not None
+                    and held.get("frame_idx") is not None
+                    and int(held.get("frame_idx") or 0)
+                    < int(display_scene_cut_frame_idx)
+                    <= int(display_frame_idx)
+                )
                 for track in out.get("ppe_tracks", []) or []:
+                    if crosses_scene_cut:
+                        continue
                     if not bool(track.get("hold_eligible", True)):
                         continue
                     clone = dict(track)
@@ -1624,6 +3792,10 @@ class MonitorEngine:
                     clone["source"] = "held"
                     tracks.append(clone)
                 out["ppe_tracks"] = tracks
+                if crosses_scene_cut:
+                    # Keep the event/HUD timing context, but never drag a media
+                    # or PPE box across an observed scene boundary.
+                    out["a3b_bbox"] = None
                 return annotate_alert_display_context(
                     out,
                     records,
@@ -1632,20 +3804,22 @@ class MonitorEngine:
                 )
         return None
 
-    def _render_backend_preview(self, packet: FramePacket, overlay: dict[str, Any] | None) -> Any:
-        frame = packet.frame
+    def _render_backend_preview(
+        self,
+        packet: FramePacket,
+        overlay: dict[str, Any] | None,
+        *,
+        display_frame: Any | None = None,
+    ) -> Any:
         status = self.get_status()
         display_options = status.get("display_options", dict(self.display_options))
         max_side = int(status.get("preview_max_side") or 960)
-        src_height, src_width = frame.shape[:2]
-        if max_side > 0 and max(src_width, src_height) > max_side:
-            scale = float(max_side) / float(max(src_width, src_height))
-            width = max(1, int(round(src_width * scale)))
-            height = max(1, int(round(src_height * scale)))
-            display_frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-        else:
-            display_frame = frame
-            height, width = src_height, src_width
+        if display_frame is None:
+            display_frame = self._materialize_preview_frame(
+                packet,
+                max_side=max_side,
+            )
+        height, width = display_frame.shape[:2]
         with self.condition:
             if packet.epoch == self.status.get("source_epoch"):
                 self.status["preview_width"] = int(width)
@@ -1712,8 +3886,13 @@ class MonitorEngine:
         preview_mode: str,
         extra_status: dict[str, Any] | None = None,
         publish_jpeg: bool,
-    ) -> None:
-        display_options = self.get_status().get("display_options", dict(self.display_options))
+    ) -> dict[str, float]:
+        empty_timings = {
+            "evidence_update_ms": 0.0,
+            "overlay_status_publish_ms": 0.0,
+        }
+        with self.lock:
+            display_options = dict(self.display_options)
         if publish_jpeg:
             # For MJPEG output the boxes are baked into the JPEG, so re-render
             # with the latest display options.
@@ -1740,18 +3919,37 @@ class MonitorEngine:
                 processed_epoch = None
         with self.condition:
             if run_id != self.run_id or self.stop_event.is_set():
-                return
+                return empty_timings
             current_epoch = int(self.status.get("source_epoch") or 0)
             if processed_epoch is not None and processed_epoch != current_epoch:
-                return
+                return empty_timings
+        processed.status["timing_frame_idx"] = int(processed.frame_idx)
+        processed.status["latency_frame_idx"] = int(processed.frame_idx)
+        evidence_status = dict(processed.status)
+        if extra_status:
+            evidence_status.update(extra_status)
+        evidence_status["run_id"] = int(run_id)
+        evidence_started = time.perf_counter()
         completed = evidence.update(
             frame_idx=processed.frame_idx,
             frame=processed.frame_640,
             info=processed.info,
             ppe=processed.ppe,
-            status=processed.status,
+            status=evidence_status,
         )
-        self._merge_completed_events(completed)
+        self._merge_completed_events(
+            completed,
+            run_id=run_id,
+            source_epoch=processed_epoch,
+        )
+        evidence_update_ms = (
+            time.perf_counter() - evidence_started
+        ) * 1000.0
+        processed.status["evidence_update_ms"] = evidence_update_ms
+        processed.status.update(
+            _evidence_writer_status_contract(evidence)
+        )
+        overlay_publish_started = time.perf_counter()
         record_status = dict(processed.status)
         if extra_status:
             record_status.update(extra_status)
@@ -1766,8 +3964,16 @@ class MonitorEngine:
             overlay_record["overlay_seq"] = self.overlay_seq
             self.overlay_timeline.append(overlay_record)
             processed.status["overlay_seq"] = self.overlay_seq
-            processed.status["evidence_session_dir"] = str(evidence.session_dir)
-            processed.status["evidence_manifest_path"] = str(evidence.manifest_path)
+            processed.status["evidence_session_dir"] = (
+                str(evidence.session_dir)
+                if evidence.session_dir is not None
+                else None
+            )
+            processed.status["evidence_manifest_path"] = (
+                str(evidence.manifest_path)
+                if evidence.manifest_path is not None
+                else None
+            )
             processed.status["evidence_saved_event_count"] = evidence.saved_event_count
             processed.status["recent_events"] = list(self.recent_events)
             processed.status["recent_ppe_events"] = list(self.recent_ppe_events)
@@ -1794,6 +4000,9 @@ class MonitorEngine:
                 )
             was_running = bool(self.status.get("running"))
             source_ended = bool(self.status.get("source_ended"))
+            source_eof_reached = bool(
+                self.status.get("source_eof_reached")
+            )
             ended_status = {
                 "running": False,
                 "source_ended": True,
@@ -1804,39 +4013,33 @@ class MonitorEngine:
                 "detector_pipeline_mode": "ended",
                 "ready_for_preview": False,
                 "preview_started": False,
-                "timing_ms": self.status.get("timing_ms", processed.status.get("timing_ms", 0.0)),
-                "processing_ms": self.status.get("processing_ms", processed.status.get("processing_ms", 0.0)),
-                "detector_inference_ms": self.status.get(
-                    "detector_inference_ms", processed.status.get("detector_inference_ms", 0.0)
-                ),
-                "module_a_timing_ms": self.status.get(
-                    "module_a_timing_ms", processed.status.get("module_a_timing_ms", 0.0)
-                ),
             }
             self.status.update(processed.status)
             self.status["run_id"] = run_id
             self.status["running"] = was_running
             if source_ended:
                 self.status.update(ended_status)
-                self.status["timing_ms"] = float(ended_status.get("timing_ms", self.status.get("timing_ms") or 0.0))
-                self.status["processing_ms"] = float(
-                    ended_status.get("processing_ms", self.status.get("processing_ms") or 0.0)
-                )
-                self.status["detector_inference_ms"] = float(
-                    ended_status.get("detector_inference_ms", self.status.get("detector_inference_ms") or 0.0)
-                )
-                self.status["module_a_timing_ms"] = float(
-                    ended_status.get("module_a_timing_ms", self.status.get("module_a_timing_ms") or 0.0)
-                )
             self.status["initializing"] = False
             self.status["prewarming"] = False
             self.status["detector_ready"] = True
             self.status["first_detection_ready"] = True
-            if was_running:
+            if was_running and not source_eof_reached:
                 self.status["ready_for_preview"] = True
+            elif source_eof_reached:
+                self.status["ready_for_preview"] = False
+                self.status["preview_started"] = False
+                self.status["preview_mode"] = "source_eof_drain"
+                self.status["detector_pipeline_mode"] = "draining"
             if "preview_seekable" not in processed.status:
                 self.status["preview_seekable"] = str(processed.status.get("source_type") or "").lower() == "file"
             self.condition.notify_all()
+        return {
+            "evidence_update_ms": evidence_update_ms,
+            "overlay_status_publish_ms": (
+                time.perf_counter() - overlay_publish_started
+            )
+            * 1000.0,
+        }
 
     def _build_overlay_record(self, status: dict[str, Any], ppe_tracks: list[dict[str, Any]]) -> dict[str, Any]:
         return build_overlay_record(
@@ -1846,7 +4049,15 @@ class MonitorEngine:
             display_options=self.display_options,
         )
 
-    def _publish_preview(self, jpeg: bytes, run_id: int, *, source_epoch: int | None = None) -> None:
+    def _publish_preview(
+        self,
+        jpeg: bytes,
+        run_id: int,
+        *,
+        source_epoch: int | None = None,
+        source_time_s: float | None = None,
+        frame_idx: int | None = None,
+    ) -> None:
         now = time.perf_counter()
         with self.condition:
             if run_id != self.run_id:
@@ -1855,6 +4066,7 @@ class MonitorEngine:
                 return
             if self.status.get("source_ended"):
                 self.latest_jpeg = None
+                self.latest_jpeg_meta = {}
                 self.status["preview_fps"] = 0.0
                 self.status["preview_started"] = False
                 self.status["ready_for_preview"] = False
@@ -1863,6 +4075,24 @@ class MonitorEngine:
                 return
             self.latest_jpeg = jpeg
             self.latest_jpeg_seq += 1
+            self.latest_jpeg_meta = {
+                "preview_seq": int(self.latest_jpeg_seq),
+                "source_epoch": (
+                    int(source_epoch)
+                    if source_epoch is not None
+                    else int(self.status.get("source_epoch") or 0)
+                ),
+                "source_time_s": (
+                    float(source_time_s)
+                    if source_time_s is not None
+                    else float(self.status.get("source_time_s") or 0.0)
+                ),
+                "frame_idx": (
+                    int(frame_idx)
+                    if frame_idx is not None
+                    else int(self.status.get("frame_idx") or 0)
+                ),
+            }
             self.preview_publish_times.append(now)
             preview_fps = 0.0
             if len(self.preview_publish_times) >= 2:
@@ -1873,12 +4103,24 @@ class MonitorEngine:
             self.status["preview_fps"] = preview_fps
             self.condition.notify_all()
 
-    def _merge_completed_events(self, events: list[dict[str, Any]] | dict[str, Any]) -> None:
+    def _merge_completed_events(
+        self,
+        events: list[dict[str, Any]] | dict[str, Any],
+        *,
+        run_id: int | None = None,
+        source_epoch: int | None = None,
+    ) -> None:
         if isinstance(events, dict):
             events = [events]
         if not events:
             return
         with self.condition:
+            if run_id is not None and int(run_id) != int(self.run_id):
+                return
+            if source_epoch is not None and int(source_epoch) != int(
+                self.status.get("source_epoch") or 0
+            ):
+                return
             for event in events:
                 channel = str(event.get("channel", ""))
                 if channel == "ppe":
@@ -1890,10 +4132,22 @@ class MonitorEngine:
             self.condition.notify_all()
 
     def _set_error(self, message: str, run_id: int) -> None:
-        if run_id != self.run_id:
-            return
+        preview_bus: PreviewBus | None = None
+        detection_bus: DetectionBus | None = None
         with self.condition:
-            self.status["error"] = message
+            if run_id != self.run_id:
+                return
+            first_error = str(self.status.get("error") or "").strip()
+            if not first_error:
+                self.status["error"] = message
+            elif message and message != first_error:
+                secondary_errors = list(self.status.get("secondary_errors") or [])
+                if message not in secondary_errors:
+                    secondary_errors.append(message)
+                self.status["secondary_errors"] = secondary_errors
+            self.stop_event.set()
+            preview_bus = self.preview_bus
+            detection_bus = self.detection_bus
             self.status["running"] = False
             self.status["initializing"] = False
             self.status["prewarming"] = False
@@ -1903,5 +4157,10 @@ class MonitorEngine:
             self.status["preview_mode"] = "error"
             self.status["detector_pipeline_mode"] = "error"
             self.latest_jpeg = None
+            self.latest_jpeg_meta = {}
             self.status["stopped_at"] = datetime.now().isoformat(timespec="seconds")
             self.condition.notify_all()
+        if preview_bus is not None:
+            preview_bus.close()
+        if detection_bus is not None:
+            detection_bus.close()

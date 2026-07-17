@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from defense.module_a.backends.detector_backend import DetectionFrameResult
+from defense.module_a.ppe_postprocess import PPE_LABEL_ALIASES, canonical_ppe_label
 
 try:  # scipy is available in the project pixi env; keep a fallback for portability.
     from scipy.optimize import linear_sum_assignment
@@ -14,20 +15,8 @@ except Exception:  # pragma: no cover
     linear_sum_assignment = None
 
 
-LABEL_ALIASES = {
-    "helmet": "helmet",
-    "hardhat": "helmet",
-    "hard_hat": "helmet",
-    "safety_helmet": "helmet",
-    "safety helmet": "helmet",
-    "head": "head",
-    "bare_head": "head",
-    "no_helmet": "head",
-    "person": "person",
-    "worker": "person",
-    "human": "person",
-    "pedestrian": "person",
-}
+LABEL_ALIASES = dict(PPE_LABEL_ALIASES)
+LABEL_ALIASES["safety helmet"] = "helmet"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +56,7 @@ class StableTrack:
 
 
 def canonical_label(label: str) -> str | None:
-    normalized = str(label or "").strip().lower().replace("-", "_")
-    return LABEL_ALIASES.get(normalized)
+    return canonical_ppe_label(label)
 
 
 def bbox_area(box: list[int] | tuple[float, float, float, float]) -> float:

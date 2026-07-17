@@ -13,6 +13,7 @@ from defense.runtime.config import DEFAULT_CONFIG_PATH
 
 
 NO_REUSE_ENV = "MODULE_A_WEB_NO_REUSE"
+ALLOW_TEST_CONFIG_ENV = "MODULE_A_ALLOW_TEST_CONFIG"
 
 
 def open_browser_later(url: str) -> None:
@@ -124,6 +125,18 @@ def select_port(host: str, port: int, auto_port: bool) -> int:
     return int(port)
 
 
+def resolve_web_config(raw_path: str | Path) -> Path:
+    requested = Path(raw_path).expanduser().resolve(strict=False)
+    production = DEFAULT_CONFIG_PATH.expanduser().resolve(strict=False)
+    if requested != production and os.environ.get(ALLOW_TEST_CONFIG_ENV) != "1":
+        raise RuntimeError(
+            "Module A production Web is locked to the authoritative runtime "
+            f"config: {production}. Alternate configs are test-only; set "
+            f"{ALLOW_TEST_CONFIG_ENV}=1 explicitly in an isolated test process."
+        )
+    return requested
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -136,7 +149,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Stopped existing Module A web process tree on port {args.port}: {', '.join(str(pid) for pid in stopped)}")
     port = select_port(str(args.host), int(args.port), bool(args.auto_port))
     warn_if_public_host(str(args.host))
-    app = create_app(config_path=Path(args.config), bind_host=str(args.host))
+    app = create_app(
+        config_path=resolve_web_config(args.config),
+        bind_host=str(args.host),
+    )
     url = f"http://{args.host}:{port}/"
     print(f"Module A monitor running at {url}")
     if args.open_browser:

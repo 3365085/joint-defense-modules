@@ -121,8 +121,10 @@ def _rounded_panel(
     *, radius: int = 14, color: tuple[int, int, int] = (24, 22, 20), alpha: float = 0.62,
 ) -> None:
     """深色半透明矩形面板(卡片底)。就地混合到 frame。radius 参数保留但不再画圆角。"""
-    x1 = max(0, x1); y1 = max(0, y1)
-    x2 = min(frame.shape[1], x2); y2 = min(frame.shape[0], y2)
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(frame.shape[1], x2)
+    y2 = min(frame.shape[0], y2)
     if x2 <= x1 or y2 <= y1:
         return
     overlay = frame.copy()
@@ -142,11 +144,33 @@ _STATE_STYLE = {
 def draw_hud(frame: np.ndarray, info: dict[str, Any], frame_idx: int, *, effective: bool = False) -> np.ndarray:
     h, w = frame.shape[:2]
     s = _ui_scale(h, w)
-    p_adv = info.get("p_adv")
-    p_adv_text = "--" if p_adv is None else f"{float(p_adv):.2f}"
+    primary_channel = str(
+        info.get("module_a_primary_channel") or "none"
+    )
+    if primary_channel == "blind":
+        score_name = "p_blind"
+        score_value = info.get("p_blind")
+    else:
+        score_name = "p_adv"
+        score_value = info.get("p_adv")
+    score_text = (
+        "--"
+        if score_value is None
+        else f"{float(score_value):.2f}"
+    )
     detect_fps = info.get("detect_fps")
-    alert = bool(info.get("alert_confirmed", False))
-    attack = bool(info.get("attack_detected", info.get("is_attack", False)))
+    alert = bool(
+        info.get(
+            "module_a_alert_confirmed",
+            info.get("alert_confirmed", False),
+        )
+    )
+    attack = bool(
+        info.get(
+            "module_a_attack_detected",
+            info.get("attack_detected", info.get("is_attack", False)),
+        )
+    )
     held = bool(info.get("alert_display_held", False))
 
     key = "held" if (held and not alert) else ("alert" if alert else ("suspect" if attack else "clear"))
@@ -168,7 +192,7 @@ def draw_hud(frame: np.ndarray, info: dict[str, Any], frame_idx: int, *, effecti
     elif reason_codes and (alert or attack or held):
         reason_line = f"原因 · {_reason_text(reason_codes)}"
 
-    metrics = f"p_adv {p_adv_text}"
+    metrics = f"{score_name} {score_text}"
     if detect_fps is not None:
         metrics += f"    检测 {float(detect_fps):.0f} fps"
     metrics += f"    帧 {frame_idx:05d}"

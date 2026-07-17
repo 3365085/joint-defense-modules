@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from defense.web.fastapi_app import create_app
@@ -46,8 +47,17 @@ def test_control_route_surfaces_inactive_run_conflict() -> None:
 
 
 class FakeModelSecurity:
+    def ensure_admitted(self, *, profile: str, custom_model: dict) -> dict:
+        return {
+            "enabled": True,
+            "allowed": True,
+            "status": "trusted",
+            "admission_status": "trusted",
+            "whitelist_hit": True,
+        }
+
     def status(self, *, profile: str, custom_model: dict) -> dict:
-        return {"enabled": True, "allowed": True, "admission_status": "bypassed_for_test"}
+        return self.ensure_admitted(profile=profile, custom_model=custom_model)
 
     def _log_event(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         return None
@@ -72,8 +82,7 @@ class StartEngine(DummyEngine):
         return {"run_id": self.run_id, "running": False, "display_options": {}}
 
 
-def test_start_route_surfaces_async_runtime_error(monkeypatch) -> None:
-    monkeypatch.setenv("MODULE_A_ALLOW_MODEL_SECURITY_TEST_BYPASS", "1")
+def test_start_route_surfaces_async_runtime_error_with_injected_engine() -> None:
     engine = StartEngine(
         {
             "running": False,
@@ -89,7 +98,6 @@ def test_start_route_surfaces_async_runtime_error(monkeypatch) -> None:
         json={
             "source_type": "camera",
             "source": "camera:99",
-            "test_bypass_model_security": True,
         },
     )
 
@@ -98,10 +106,10 @@ def test_start_route_surfaces_async_runtime_error(monkeypatch) -> None:
     assert payload["ok"] is False
     assert payload["error"] == "runtime_start_failed"
     assert payload["message"] == "capture open failed"
+    assert engine.start_calls[0]["custom_model"] == {}
 
 
-def test_start_route_surfaces_preview_ready_timeout(monkeypatch) -> None:
-    monkeypatch.setenv("MODULE_A_ALLOW_MODEL_SECURITY_TEST_BYPASS", "1")
+def test_start_route_surfaces_preview_ready_timeout_with_injected_engine() -> None:
     engine = StartEngine(
         {
             "running": True,
@@ -120,7 +128,6 @@ def test_start_route_surfaces_preview_ready_timeout(monkeypatch) -> None:
             "source_type": "camera",
             "source": "camera:0",
             "ready_timeout_s": 0.01,
-            "test_bypass_model_security": True,
         },
     )
 
@@ -129,4 +136,34 @@ def test_start_route_surfaces_preview_ready_timeout(monkeypatch) -> None:
     assert payload["ok"] is False
     assert payload["error"] == "runtime_start_timeout"
     assert payload["message"] == "preview did not become ready"
+    assert engine.start_calls[0]["custom_model"] == {}
+
+
+@pytest.mark.parametrize(
+    "bypass_field",
+    [
+        "test_bypass_model_security",
+        "bypass_model_security_for_test",
+        "bypass_model_security",
+    ],
+)
+def test_production_start_rejects_model_security_test_bypass(bypass_field: str) -> None:
+    engine = StartEngine({"ready_for_preview": True})
+    app = create_app(engine=engine, model_security=FakeModelSecurity(), bind_host="127.0.0.1")
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    response = client.post(
+        "/api/start",
+        json={
+            "source_type": "camera",
+            "source": "camera:0",
+            bypass_field: True,
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "production_security_bypass_forbidden"
+    assert engine.start_calls == []
 

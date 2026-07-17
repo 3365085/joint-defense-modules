@@ -8,19 +8,34 @@ inference:
   image_size: 640
   warmup_frames: 4
   class_names: [helmet, head]
+  authoritative_model:
+    source_pt: 'D:/联合防御模块/素材/model/yolov8/mask_bd_v4_clean_baseline.pt'
+    source_sha256: 4D7A23D3866AC2D9DB6E59AE537DA1274D988BD53CA6C7D519297FCBB96626F8
+    source_size: 5347205
+    metadata: runtime/artifacts/yolo/4d7a23d3866ac2d9db6e59ae537da1274d988bd53ca6c7d519297fcbb96626f8/metadata.json
   artifacts:
     engine:
-      - baseline_training/runs/classmate_maskbd_v4/best.engine
+      - runtime/artifacts/yolo/4d7a23d3866ac2d9db6e59ae537da1274d988bd53ca6c7d519297fcbb96626f8/mask_bd_v4_clean_baseline.engine
     onnx:
-      - baseline_training/runs/classmate_maskbd_v4/best.onnx
+      - runtime/artifacts/yolo/4d7a23d3866ac2d9db6e59ae537da1274d988bd53ca6c7d519297fcbb96626f8/mask_bd_v4_clean_baseline.onnx
     pytorch:
-      - baseline_training/runs/classmate_maskbd_v4/best.pt
+      - 'D:/联合防御模块/素材/model/yolov8/mask_bd_v4_clean_baseline.pt'
 
 module_a:
+  # Production default is explicit so profile/config audits do not rely on a
+  # Python fallback hidden in VideoDefensePipeline.
+  detector_impl: rebuilt
   require_gpu: true
   device: cuda:0
   frame_size: 640
-  a4_classifier_path: "D:/联合防御模块/rebuilt_demo/data/a4_classifier.pkl"
+  # A4 is a Module A auxiliary artifact managed by the main project. Missing
+  # metadata/model must be visible as a degraded state; no demo fallback.
+  a4_classifier_path: runtime/artifacts/module_a/a4/a4_classifier.pkl
+  a4_classifier_sha256: c4f9fc5a2ee835ae4d73de08a29bd46e02e0e63d9402924f246452b798428bfb
+  rebuilt_a4_patch_feature_interval: 2
+  rebuilt_a4_classifier_rescue_underexposed_max: 0.55
+  raft_engine_path: runtime/artifacts/module_a/raft_small_fp16_256.engine
+  raft_engine_sha256: A7A338A8ACDBE718D54DD673C40D8B55FBD6A9898257B12A6471C4628FCD7739
   grid_roi_count: 4
   emit_roi_details: true
   emit_roi_texture_details: true
@@ -34,14 +49,48 @@ module_a:
   temporal_adaptive_baseline: true
   temporal_adaptive_multiplier: 2.0
   keyframe_interval: 3
+  # Sources at or below the 30 FPS calibration rate are analyzed frame-for-
+  # frame. Higher-FPS inputs still run the runtime/detector path on every source
+  # frame, while heavy Module A work is capped in source time and held between
+  # analyses. A 25 Hz ceiling maps 59.94/60 FPS inputs to every third frame.
+  analysis_max_hz: 25.0
   light_flow_enabled: true
-  light_flow_interval: 3
+  # Flow is a per-frame A3/A2 signal. Skipping samples currently removes the
+  # evidence rather than safely integrating a longer time span, so production
+  # profiles keep interval=1 and control cost through detector FPS caps.
+  light_flow_interval: 1
   light_flow_temporal_candidate: 0.025
   light_flow_local_temporal_candidate: 0.18
   static_image_enabled: true
   static_image_interval: 6
+  # Lifecycle-only safeguards: a hung background A3b worker loses its result
+  # worker slot after 3s; successful results have an independent 5s lease.
+  # At most two A3b workers may remain alive process-wide, including workers
+  # owned by closed/replaced pipelines. These do not change media thresholds.
+  static_image_worker_timeout_s: 3.0
+  static_image_result_lease_s: 5.0
+  static_image_max_retired_workers: 2
+  static_image_global_worker_limit: 2
   static_image_temporal_candidate: 0.015
   static_image_local_temporal_candidate: 0.10
+  # Rebuilt A3b effective values. These mirror the current detector defaults;
+  # changing them is behavior tuning and requires heldout + target-video gates.
+  rebuilt_theta_media: 0.55
+  rebuilt_theta_media_raw: 0.50
+  rebuilt_a3b_independent_trigger: true
+  rebuilt_a3b_tighten_gate: true
+  rebuilt_a3b_gate_candidate_min: 0.70
+  rebuilt_a3b_gate_edge_min: 0.45
+  rebuilt_a3b_gate_edge_max: 0.58
+  rebuilt_a3b_gate_border_contrast_min: 0.80
+  # Runtime soft confirmation must honor the rebuilt tighten gate. The
+  # candidate tolerance only absorbs floating-point boundary noise, while the
+  # aspect range rejects scene-wide strips that are not plausible media planes.
+  rebuilt_a3b_soft_gate_candidate_tolerance: 0.001
+  rebuilt_a3b_soft_gate_aspect_ratio_min: 0.40
+  rebuilt_a3b_soft_gate_aspect_ratio_max: 2.50
+  rebuilt_a3b_media_run_floor: 15
+  rebuilt_a3b_media_run_gap_tol: 3
 
   roi_min_confidence: 0.24
   roi_margin: 10
@@ -51,7 +100,12 @@ module_a:
   roi_stabilize_head_helmet_iou: 0.18
   roi_stabilize_head_helmet_center_distance: 0.055
   temporal_detector_reuse_threshold: 0.008
-  temporal_detector_reuse_max_gap: 1
+  # Reuse may span two 60 FPS source frames, but the source-time ceiling below
+  # keeps 30 FPS and slower inputs at effectively one-frame reuse.
+  temporal_detector_reuse_max_gap: 2
+  temporal_detector_reuse_max_source_time_gap_s: 0.04
+  a3b_suppression_hold_s: 6.0
+  a3b_suppression_stale_bridge_s: 0.5
 
   natural_exposure_suppression_enabled: true
   natural_exposure_max_ratio: 0.40
@@ -74,16 +128,53 @@ module_a:
   a3b_display_alpha: 0.28
   alert_window: 5
   alert_trigger_count: 3
+  # rebuilt 总 Module A 的真实生效策略必须显式配置并进入 effective status，
+  # 禁止依赖 detector.py 隐藏默认值。
+  rebuilt_theta_adv: 0.65
+  rebuilt_theta_blind: 0.55
+  # latest-only 会按性能预算稀疏采样；blind 候选按 50% 的 N-of-M
+  # 确认，使确认时长而非绝对采样帧数在 20～30 FPS 间更稳定。
+  rebuilt_blind_confirm_ratio: 0.50
+  rebuilt_alert_hold_frames: 12
+  # A3b 后台物理屏幕证据会因异步重检短暂空档；仅对已确认 media 通道
+  # 维持 90 个检测周期（30FPS视频约3秒），ADV/blind 仍使用上面的12帧窗口。
+  rebuilt_a3b_alert_hold_frames: 90
+  # 兼容旧键名；当前语义已收紧为“仅由原确认通道的有效 candidate 刷新”，
+  # 不再允许 raw p_adv 单独或跨通道无限续命。
+  rebuilt_alert_hold_refresh_on_padv: true
+  rebuilt_scene_baseline: true
+  rebuilt_sustained_adv_escalation: true
+  rebuilt_sustained_adv_seconds: 2.0
+  rebuilt_sustained_adv_run_mult: 1.6
+  rebuilt_sustained_adv_benign_decay: 0.9
+  rebuilt_sustained_adv_require_target: false
+  rebuilt_sustained_adv_require_physical_support: false
+  rebuilt_sustained_adv_exclude_static_bg: true
+  rebuilt_sustained_adv_recent_target_min: 3
+  rebuilt_blind_sustained_escalation: true
+  rebuilt_blind_sustained_floor: 12
+  rebuilt_blind_sustained_degrade_min: 0.30
+  rebuilt_blind_sustained_established_min: 3
   # rebuilt 候选连续性桥接(2026-06-30 修 adv_patch 漏报): 高 p_adv 段桥接被抑制门偶发翻假打散的候选。
   # K 扫描定 K=4(留出集召回 90.5%、误报回落 7.4%,优于 K=6 的 11.1%)。验证中,双口径通过前不提交。
   rebuilt_adv_candidate_bridge_frames: 4
 
 runtime:
+  production_unique_model: true
   capture_queue_size: 1
   result_queue_size: 1
   preview_fps: 25
   preview_render_fps: 25
   preview_max_side: 960
+  capture_max_side: 1920
+  # Production file sources explicitly request NVDEC. CPU fallback remains
+  # available for unsupported codecs but is always exposed in status/logs.
+  video_decoder_preference: nvdec
+  video_decoder_allow_cpu_fallback: true
+  video_decoder_gpu_id: 0
+  # File playback must not discard source frames merely to match preview FPS.
+  # latest-only remains the pressure valve when detection actually falls behind.
+  file_source_fps_cap: 0
   preview_never_wait_for_detection: true
   backend_source_pipeline: true
   process_fps_cap: 60
@@ -102,6 +193,9 @@ runtime:
   evidence_fps: 6
   evidence_clip_fps: 6
   evidence_max_frames_per_event: 40
+  evidence_writer_queue_capacity: 256
+  evidence_writer_enqueue_timeout_s: 0.02
+  evidence_writer_drain_timeout_s: 10.0
   jpeg_quality: 82
 
 ppe_tracking:
@@ -140,10 +234,10 @@ a3b:
   strong_single_frame_threshold: 0.78
   observed_only_warning_threshold: 0.50
   observed_only_track_threshold: 0.50
-  observed_only_source_keywords:
-    - 视频中出现干扰视频
-  trigger_source_keywords:
-    - 视频中出现干扰视频
+  # Source labels are diagnostic metadata only. Detection decisions must be
+  # invariant to file names, directories, camera IDs and RTSP URLs.
+  observed_only_source_keywords: []
+  trigger_source_keywords: []
   window_size: 12
   min_window_hits: 3
   observed_only_min_window_hits: 3
@@ -184,154 +278,32 @@ model_security:
 
 profiles:
   desktop_rtx:
-    inference:
-      backend: tensorrt
-      device: cuda:0
-      half: true
-      confidence: 0.25
     module_a:
       require_gpu: true
       device: cuda:0
-      light_flow_interval: 3
+      light_flow_interval: 1
       static_image_interval: 3
     runtime:
       preview_fps: 25
+      preview_render_fps: 25
+      # Do not create a deterministic 50% coverage ceiling on 60 FPS files.
+      # latest-only may drop only when the real detector is behind.
       process_fps_cap: 60
+      detector_process_fps_cap: 60
       overlay_match_window_ms: 180
       overlay_hold_ms: 550
       overlay_interpolate_ms: 400
       overlay_max_age_ms: 950
       overlay_lookahead_s: 0.35
 
-  desktop_debug_onnx:
-    inference:
-      backend: onnx
-      device: cuda:0
-      half: true
-      confidence: 0.25
-    module_a:
-      require_gpu: true
-      device: cuda:0
-      light_flow_interval: 3
-      static_image_interval: 4
-    runtime:
-      preview_fps: 20
-      process_fps_cap: 12
-      overlay_lookahead_s: 0.35
-
-  edge_fast:
-    inference:
-      backend: onnx
-      device: cuda:0
-      half: true
-      confidence: 0.30
-    module_a:
-      require_gpu: true
-      device: cuda:0
-      emit_roi_details: false
-      light_flow_interval: 5
-      static_image_interval: 5
-      temporal_detector_reuse_threshold: 0.012
-      temporal_detector_reuse_max_gap: 2
-    runtime:
-      preview_fps: 15
-      process_fps_cap: 8
-      overlay_lookahead_s: 0.45
-      capture_queue_size: 1
-
-  cpu_smoke:
-    inference:
-      backend: onnx
-      device: cpu
-      half: false
-      confidence: 0.35
-    module_a:
-      require_gpu: false
-      device: cpu
-      light_flow_enabled: false
-      static_image_enabled: false
-    runtime:
-      preview_fps: 8
-      process_fps_cap: 8
-      overlay_lookahead_s: 0.45
-
-  empty_smoke:
-    inference:
-      backend: onnx
-      device: cpu
-      half: false
-      confidence: 0.35
-    module_a:
-      require_gpu: false
-      device: cpu
-      light_flow_enabled: false
-      static_image_enabled: false
-    runtime:
-      allow_empty_backend: true
-      evidence_enabled: false
-      preview_fps: 5
-      process_fps_cap: 5
-      overlay_lookahead_s: 0.45
-
   high_quality:
-    inference:
-      backend: tensorrt
-      model_family: yolov8
-      device: cuda:0
-      half: true
-      confidence: 0.25
-      image_size: 640
     module_a:
       require_gpu: true
       device: cuda:0
-      light_flow_interval: 2
+      light_flow_interval: 1
       static_image_interval: 3
     runtime:
       preview_fps: 25
       preview_render_fps: 25
       process_fps_cap: 60
       detector_process_fps_cap: 60
-
-  balanced:
-    inference:
-      backend: onnx
-      device: cuda:0
-      half: true
-      confidence: 0.28
-      image_size: 640
-    module_a:
-      require_gpu: true
-      device: cuda:0
-      light_flow_interval: 3
-      static_image_interval: 4
-    runtime:
-      preview_fps: 25
-      preview_render_fps: 25
-      process_fps_cap: 30
-      detector_process_fps_cap: 30
-
-  low_power:
-    inference:
-      backend: onnx
-      device: cuda:0
-      half: true
-      confidence: 0.30
-      image_size: 512
-    module_a:
-      require_gpu: true
-      device: cuda:0
-      emit_roi_details: false
-      emit_roi_texture_details: false
-      emit_roi_temporal_details: false
-      emit_roi_motion_details: false
-      light_flow_interval: 6
-      static_image_interval: 8
-      temporal_detector_reuse_threshold: 0.015
-      temporal_detector_reuse_max_gap: 3
-    runtime:
-      preview_fps: 25
-      preview_render_fps: 20
-      process_fps_cap: 6
-      detector_process_fps_cap: 6
-      detector_queue_policy: latest_only
-      overlay_lookahead_s: 0.45

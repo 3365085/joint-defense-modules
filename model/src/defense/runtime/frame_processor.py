@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from defense.pipelines.video_decoder import DecodedFrameLease
 from defense.module_a.ppe_postprocess import (
     PPEPostprocessConfig,
     is_bare_head_label,
@@ -15,14 +17,17 @@ from defense.module_a.ppe_postprocess import (
     is_person_label,
 )
 from defense.module_a.postprocess import PPEDisplayTracker, merge_roi_detections
-from .a3b_soft_trigger import A3BSoftTriggerState
+from defense.module_a.result_contract import adapt_a3b_result
+from .a3b_soft_trigger import A3BSoftTriggerConfig, A3BSoftTriggerState
+from .config import A3B_SENSITIVITY_PRESETS
 from .pipeline_factory import PipelineBundle
 from .ppe_business import evaluate_ppe_business
 from .ppe_state import SafetyHelmetState
 
-
 import json as _json
 import os as _os
+
+logger = logging.getLogger(__name__)
 
 # 只读诊断探针: 环境变量 DEFENSE_FEATURE_PROBE 指向一个 JSONL 路径时, 每帧把 A1/运动/adv/
 # 抑制门等关键数值追加一行。默认关闭, 全程 try/except 吞异常, 绝不影响检测主链路。
@@ -64,18 +69,338 @@ def _feature_probe(info: dict[str, Any], frame_idx: int, detections: Any = None)
         a1 = details.get("a1", {}) if isinstance(details.get("a1"), dict) else {}
         a2 = details.get("a2", {}) if isinstance(details.get("a2"), dict) else {}
         a3 = details.get("a3", {}) if isinstance(details.get("a3"), dict) else {}
+        blinding = (
+            details.get("blinding", {})
+            if isinstance(details.get("blinding"), dict)
+            else {}
+        )
+        timing = (
+            details.get("timing", {})
+            if isinstance(details.get("timing"), dict)
+            else {}
+        )
+        latency = (
+            info.get("latency_breakdown", {})
+            if isinstance(info.get("latency_breakdown"), dict)
+            else {}
+        )
         row = {
             "frame": int(frame_idx),
             "frame_diff_global": round(float(scene.get("frame_diff_global", 0.0)), 4),
             "exposure_delta": round(float(scene.get("exposure_delta", 0.0)), 4),
             "overexp": round(float(scene.get("overexposure_ratio", 0.0)), 4),
+            "underexp": round(float(scene.get("underexposed_ratio", 0.0)), 4),
             "global_motion_weight": round(float(flow.get("global_motion_weight", 0.0)), 4),
             "a1": round(float(a1.get("a1_feature_score", 0.0)), 4),
+            "a1_target_related": bool(a1.get("target_related", False)),
+            "a1_delta_h_global": round(float(a1.get("delta_h_global", 0.0)), 4),
+            "a1_delta_h_local_max": round(float(a1.get("delta_h_local_max", 0.0)), 4),
+            "a1_delta_h_roi_max": round(float(a1.get("delta_h_roi_max", 0.0)), 4),
+            "a1_delta_h_roi_patch_max": round(
+                float(a1.get("delta_h_roi_patch_max", 0.0)),
+                4,
+            ),
+            "a1_delta_h_target_contrast": round(
+                float(a1.get("delta_h_target_contrast", 0.0)),
+                4,
+            ),
+            "a1_delta_h_spatial_concentration": round(
+                float(a1.get("delta_h_spatial_concentration", 0.0)),
+                4,
+            ),
+            "a1_delta_h_patch_concentration": round(
+                float(a1.get("delta_h_patch_concentration", 0.0)),
+                4,
+            ),
+            "a1_visibility_hold_active": bool(
+                a1.get("a1_visibility_hold_active", False)
+            ),
             "a2": round(float(a2.get("a2_feature_score", 0.0)), 4),
+            "a2_target_related": bool(a2.get("target_related", False)),
+            "a2_change_t_global": round(float(a2.get("change_t_global", 0.0)), 4),
+            "a2_change_t_local_max": round(
+                float(a2.get("change_t_local_max", 0.0)),
+                4,
+            ),
+            "a2_change_t_roi_max": round(float(a2.get("change_t_roi_max", 0.0)), 4),
+            "a2_change_t_context_mean": round(
+                float(a2.get("change_t_context_mean", 0.0)),
+                4,
+            ),
+            "a2_change_t_local_contrast": round(
+                float(a2.get("change_t_local_contrast", 0.0)),
+                4,
+            ),
+            "a2_change_t_without_motion_target": round(
+                float(a2.get("change_t_without_motion_target", 0.0)),
+                4,
+            ),
+            "a2_change_t_motion_aligned": round(
+                float(a2.get("change_t_motion_aligned", 0.0)),
+                4,
+            ),
+            "a2_change_t_motion_explain_score": round(
+                float(a2.get("change_t_motion_explain_score", 0.0)),
+                4,
+            ),
+            "a2_change_t_unexplained": round(
+                float(a2.get("change_t_unexplained", 0.0)),
+                4,
+            ),
+            "a2_change_t_burst": round(float(a2.get("change_t_burst", 0.0)), 4),
+            "a2_flash_like": bool(a2.get("flash_like", False)),
             "a3": round(float(a3.get("a3_feature_score", 0.0)), 4),
+            "a3_target_related": bool(a3.get("target_related", False)),
+            "a3_flow_local_anomaly_ratio": round(
+                float(a3.get("flow_local_anomaly_ratio", 0.0)),
+                4,
+            ),
+            "a3_flow_max_magnitude_norm": round(
+                float(a3.get("flow_max_magnitude_norm", 0.0)),
+                4,
+            ),
+            "a3_flow_residual": round(float(a3.get("flow_residual", 0.0)), 4),
+            "a3_flow_roi_residual": round(
+                float(a3.get("flow_roi_residual", 0.0)),
+                4,
+            ),
+            "a3_flow_context_residual": round(
+                float(a3.get("flow_context_residual", 0.0)),
+                4,
+            ),
+            "a3_flow_residual_contrast": round(
+                float(a3.get("flow_residual_contrast", 0.0)),
+                4,
+            ),
+            "a3_flow_roi_motion_gap": round(
+                float(a3.get("flow_roi_motion_gap", 0.0)),
+                4,
+            ),
+            "a3_flow_background_explain_score": round(
+                float(a3.get("flow_background_explain_score", 0.0)),
+                4,
+            ),
+            "a3_flow_shape_score": round(
+                float(a3.get("flow_shape_score", 0.0)),
+                4,
+            ),
+            "a3_flow_target_relation": round(
+                float(a3.get("flow_target_relation", 0.0)),
+                4,
+            ),
+            "a3_flow_background_coherence": round(
+                float(a3.get("flow_background_coherence", 0.0)),
+                4,
+            ),
+            "a3_flow_roi_coverage_ratio": round(
+                float(a3.get("flow_roi_coverage_ratio", 0.0)),
+                4,
+            ),
+            "a3_residual_hold_active": bool(
+                a3.get("a3_residual_hold_active", False)
+            ),
+            "p_blind": round(float(blinding.get("p_blind", 0.0)), 4),
+            "p_blind_triggered": bool(
+                blinding.get("p_blind_triggered", False)
+            ),
+            "blind_ready": bool(blinding.get("blind_ready", False)),
+            "blind_type": str(blinding.get("blind_type", "none")),
+            "blind_sharpness": round(
+                float(blinding.get("sharpness", 0.0)),
+                4,
+            ),
+            "blind_ref_sharpness": round(
+                float(blinding.get("ref_sharpness", 0.0)),
+                4,
+            ),
+            "blind_contrast": round(
+                float(blinding.get("contrast", 0.0)),
+                4,
+            ),
+            "blind_ref_contrast": round(
+                float(blinding.get("ref_contrast", 0.0)),
+                4,
+            ),
+            "blind_det_strength": round(
+                float(blinding.get("det_strength", 0.0)),
+                4,
+            ),
+            "blind_ref_det": round(
+                float(blinding.get("ref_det", 0.0)),
+                4,
+            ),
+            "blind_sharp_drop": round(
+                float(blinding.get("sharp_drop", 0.0)),
+                4,
+            ),
+            "blind_sharp_drop_short": round(
+                float(blinding.get("sharp_drop_short", 0.0)),
+                4,
+            ),
+            "blind_contrast_drop": round(
+                float(blinding.get("contrast_drop", 0.0)),
+                4,
+            ),
+            "blind_det_drop": round(
+                float(blinding.get("det_drop", 0.0)),
+                4,
+            ),
+            "blind_glare": round(
+                float(blinding.get("glare_blind", 0.0)),
+                4,
+            ),
+            "blind_target_loss": round(
+                float(blinding.get("target_loss", 0.0)),
+                4,
+            ),
+            "blind_blur_detail_ratio": round(
+                float(blinding.get("blur_detail_ratio", 0.0)),
+                4,
+            ),
+            "blind_low_motion_target_loss_support": bool(
+                blinding.get("low_motion_target_loss_support", False)
+            ),
+            "blind_motion_blur_scene_degradation_support": bool(
+                blinding.get(
+                    "motion_blur_scene_degradation_support",
+                    False,
+                )
+            ),
+            "blind_independent_support": bool(
+                blinding.get("blind_independent_support", False)
+            ),
+            "runtime_frame_materialization_ms": round(
+                float(latency.get("frame_materialization_ms", 0.0)),
+                4,
+            ),
+            "runtime_previous_frame_materialization_ms": round(
+                float(
+                    latency.get("previous_frame_materialization_ms", 0.0)
+                ),
+                4,
+            ),
+            "runtime_detector_ms": round(
+                float(latency.get("detector_ms", 0.0)),
+                4,
+            ),
+            "runtime_module_a_total_ms": round(
+                float(latency.get("module_a_total_ms", 0.0)),
+                4,
+            ),
+            "runtime_module_a_reuse_hit": bool(
+                latency.get("module_a_reuse_hit", False)
+            ),
+            "runtime_e2e_ms": round(
+                float(latency.get("e2e_ms", info.get("timing_ms", 0.0))),
+                4,
+            ),
+            "runtime_detector_reuse_hit": bool(
+                latency.get("detector_reuse_hit", False)
+            ),
+            **{
+                f"module_a_stage_{name}_ms": round(
+                    float(timing.get(name, 0.0)),
+                    4,
+                )
+                for name in (
+                    "scene_context",
+                    "lbp",
+                    "flow",
+                    "a1",
+                    "a2",
+                    "a3",
+                    "a3b_schedule",
+                    "a4",
+                    "blinding",
+                    "target_anchored",
+                    "joint",
+                    "result_build",
+                    "state_update",
+                    "total",
+                )
+            },
             "p_adv": round(float(info.get("p_adv") or 0.0), 4),
             "dominant": str(joint.get("dominant_input", "")),
-            "adv_allowed": bool(joint.get("adv_single_frame_candidate", joint.get("adv_candidate_allowed", False))),
+            "adv_candidate_allowed": bool(
+                joint.get("adv_candidate_allowed", False)
+            ),
+            "adv_allowed": bool(
+                joint.get(
+                    "adv_single_frame_candidate",
+                    joint.get("adv_candidate_allowed", False),
+                )
+            ),
+            "adv_physical_support": bool(
+                joint.get("adv_physical_support", False)
+            ),
+            "a3_independent_attack_support": bool(
+                joint.get("a3_independent_attack_support", False)
+            ),
+            "normal_target_motion_exclusion": bool(
+                joint.get("normal_target_motion_exclusion", False)
+            ),
+            "normal_articulated_target_motion": bool(
+                joint.get("normal_articulated_target_motion", False)
+            ),
+            "normal_high_contrast_target_texture_motion": bool(
+                joint.get(
+                    "normal_high_contrast_target_texture_motion",
+                    False,
+                )
+            ),
+            "normal_roi_flow_target_motion": bool(
+                joint.get("normal_roi_flow_target_motion", False)
+            ),
+            "localized_a1_attack_support": bool(
+                joint.get("localized_a1_attack_support", False)
+            ),
+            "photometric_attack_support": bool(
+                joint.get("photometric_attack_support", False)
+            ),
+            "adv_explicit_suppression_reason": str(
+                joint.get("adv_explicit_suppression_reason", "none")
+            ),
+            "joint_suppressed_reason": str(
+                joint.get("suppressed_reason", "none")
+            ),
+            "adv_confirmed": bool(joint.get("adv_confirmed", False)),
+            "alert_confirmation_source": str(
+                joint.get("alert_confirmation_source", "none")
+            ),
+            "confirm_adv_count": int(
+                (joint.get("confirm_window") or {}).get("adv_count", 0)
+            ),
+            "confirm_adv_required": int(
+                (joint.get("confirm_window") or {}).get(
+                    "adv_hit_required",
+                    0,
+                )
+            ),
+            "confirm_adv_support_count": int(
+                (joint.get("confirm_window") or {}).get(
+                    "adv_support_count",
+                    0,
+                )
+            ),
+            "blind_single_frame_candidate": bool(
+                joint.get("blind_single_frame_candidate", False)
+            ),
+            "blind_confirmed": bool(joint.get("blind_confirmed", False)),
+            "blind_explicitly_suppressed": bool(
+                joint.get("blind_explicitly_suppressed", False)
+            ),
+            "blind_sustained_escalated": bool(
+                joint.get("blind_sustained_escalated", False)
+            ),
+            "confirm_blind_count": int(
+                (joint.get("confirm_window") or {}).get("blind_count", 0)
+            ),
+            "confirm_blind_required": int(
+                (joint.get("confirm_window") or {}).get(
+                    "blind_hit_required",
+                    0,
+                )
+            ),
             "alert": bool(info.get("alert_confirmed", False)),
             "reasons": list(info.get("reason_codes") or joint.get("reason_codes") or []),
             # 抑制门(True=该门在抑制): 看晃动时是否失守
@@ -161,31 +486,161 @@ def info_reason(info: dict[str, Any]) -> str:
 
 
 def _static_media_details(info: dict[str, Any]) -> dict[str, Any]:
-    details = info.get("details", {})
-    if not isinstance(details, dict):
-        return {}
-    legacy = details.get("module_a_features", {}).get("static_media", {})
-    if isinstance(legacy, dict) and legacy:
-        return legacy
-    # rebuilt 内核把 A3b 静态媒体结果写在 details['a3b'](非 legacy 的 module_a_features.static_media)。
-    # 映射到 a3b_soft/面板期望的字段, 修"A3b面板一直0 + 翻拍区域框不显示"(移植接线遗漏, 非检测问题)。
-    a3b = details.get("a3b", {})
-    if not isinstance(a3b, dict) or not a3b:
-        return {}
-    bbox = a3b.get("p_media_bbox")
+    return adapt_a3b_result(info)
+
+
+def _authoritative_a3b_confirmation(
+    static_media: dict[str, Any],
+) -> tuple[bool, float, Any, str]:
+    """Return backend-confirmed A3b state without applying soft-trigger policy."""
+
+    is_rebuilt = static_media.get("result_contract_source") == "rebuilt"
+    confirmed = bool(
+        static_media.get("media_confirmed")
+        if is_rebuilt
+        else (
+            static_media.get("triggered")
+            or static_media.get("static_image_triggered")
+        )
+    )
+    if not confirmed:
+        return False, 0.0, None, "none"
+
+    legacy_static = (
+        static_media.get("legacy_static_image")
+        if isinstance(static_media.get("legacy_static_image"), dict)
+        else {}
+    )
+    if is_rebuilt:
+        score = max(
+            _float(static_media.get("score")),
+            _float(static_media.get("p_media_confirmed_score")),
+        )
+    else:
+        score = max(
+            _float(static_media.get("score")),
+            _float(static_media.get("static_image_score")),
+            _float(legacy_static.get("score")),
+            _float(legacy_static.get("static_image_score")),
+        )
+        if score <= 0.0:
+            score = max(
+                _float(static_media.get("p_media")),
+                _float(legacy_static.get("p_media")),
+            )
+    bbox = (
+        static_media.get("p_media_bbox")
+        or static_media.get("bbox")
+        or static_media.get("candidate_bbox")
+        or legacy_static.get("p_media_bbox")
+        or legacy_static.get("bbox")
+    )
+    source = str(
+        static_media.get("triggered_source")
+        or static_media.get("static_image_triggered_source")
+        or legacy_static.get("triggered_source")
+        or legacy_static.get("static_image_triggered_source")
+        or ("rebuilt_media_confirmed" if is_rebuilt else "legacy_static_media_triggered")
+    )
+    if source.strip().lower() in {"", "none"}:
+        source = "rebuilt_media_confirmed" if is_rebuilt else "legacy_static_media_triggered"
+    return True, float(score), bbox, source
+
+
+def _a3b_backend_health(static_media: dict[str, Any]) -> dict[str, Any]:
     return {
-        "score": float(a3b.get("p_media_confirmed_score", 0.0) or 0.0),
-        "live_score": float(a3b.get("p_media", 0.0) or 0.0),
-        "live_score_display": float(a3b.get("p_media", 0.0) or 0.0),
-        "p_media": float(a3b.get("p_media", 0.0) or 0.0),
-        "p_media_triggered": bool(a3b.get("p_media_triggered", False)),
-        "triggered": bool(a3b.get("media_confirmed", False)),
-        "p_media_type": a3b.get("p_media_type"),
-        "bbox": list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
-        "candidate_bbox": list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
-        "p_media_bbox": list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
-        "media_candidates": a3b.get("media_candidates", []),
-        "state": str(a3b.get("a3b_state") or ("confirmed" if a3b.get("media_confirmed") else "normal")),
+        "a3b_background_enabled": bool(
+            static_media.get("a3b_background_enabled", False)
+        ),
+        "a3b_generation": _int(static_media.get("a3b_generation")),
+        "a3b_active_worker_count": _int(
+            static_media.get("a3b_active_worker_count")
+        ),
+        "a3b_retired_worker_count": _int(
+            static_media.get("a3b_retired_worker_count")
+        ),
+        "a3b_live_worker_count": _int(
+            static_media.get("a3b_live_worker_count")
+        ),
+        "a3b_global_live_worker_count": _int(
+            static_media.get("a3b_global_live_worker_count")
+        ),
+        "a3b_global_worker_limit": _int(
+            static_media.get("a3b_global_worker_limit")
+        ),
+        "a3b_worker_limit_scope": str(
+            static_media.get("a3b_worker_limit_scope") or "process"
+        ),
+        "a3b_worker_timeout_s": _float(
+            static_media.get("a3b_worker_timeout_s")
+        ),
+        "a3b_max_retired_workers": _int(
+            static_media.get("a3b_max_retired_workers")
+        ),
+        "a3b_active_worker_started_at": static_media.get(
+            "a3b_active_worker_started_at"
+        ),
+        "a3b_active_worker_age_s": _float(
+            static_media.get("a3b_active_worker_age_s")
+        ),
+        "a3b_active_worker_frame_idx": static_media.get(
+            "a3b_active_worker_frame_idx"
+        ),
+        "a3b_active_worker_timestamp": static_media.get(
+            "a3b_active_worker_timestamp"
+        ),
+        "a3b_timed_out_worker_count": _int(
+            static_media.get("a3b_timed_out_worker_count")
+        ),
+        "a3b_worker_rejected_count": _int(
+            static_media.get("a3b_worker_rejected_count")
+        ),
+        "a3b_last_worker_rejected_at": static_media.get(
+            "a3b_last_worker_rejected_at"
+        ),
+        "a3b_schedule_blocked": bool(
+            static_media.get("a3b_schedule_blocked", False)
+        ),
+        "a3b_schedule_blocked_reason": str(
+            static_media.get("a3b_schedule_blocked_reason") or "none"
+        ),
+        "a3b_error_count": _int(static_media.get("a3b_error_count")),
+        "a3b_last_error": static_media.get("a3b_last_error"),
+        "a3b_last_error_at": static_media.get("a3b_last_error_at"),
+        "a3b_last_success_at": static_media.get("a3b_last_success_at"),
+        "a3b_source_frame_idx": static_media.get("a3b_source_frame_idx"),
+        "a3b_source_timestamp": static_media.get("a3b_source_timestamp"),
+        "a3b_source_fps": _float(static_media.get("a3b_source_fps")),
+        "a3b_source_interval_frames": _int(
+            static_media.get("a3b_source_interval_frames")
+        ),
+        "media_source_frame_units": _int(
+            static_media.get("media_source_frame_units")
+        ),
+        "media_tighten_aspect_ratio": _float(
+            static_media.get("media_tighten_aspect_ratio")
+        ),
+        "media_tighten_aspect_pass": bool(
+            static_media.get("media_tighten_aspect_pass", False)
+        ),
+        "a3b_last_attempt_frame_idx": static_media.get(
+            "a3b_last_attempt_frame_idx"
+        ),
+        "a3b_last_attempt_timestamp": static_media.get(
+            "a3b_last_attempt_timestamp"
+        ),
+        "a3b_result_published_at": static_media.get(
+            "a3b_result_published_at"
+        ),
+        "a3b_result_age_s": _float(static_media.get("a3b_result_age_s")),
+        "a3b_result_lease_s": _float(static_media.get("a3b_result_lease_s")),
+        "a3b_result_fresh": bool(
+            static_media.get("a3b_result_fresh", False)
+        ),
+        "a3b_result_expired_count": _int(
+            static_media.get("a3b_result_expired_count")
+        ),
+        "a3b_result_seq": _int(static_media.get("a3b_result_seq")),
     }
 
 
@@ -292,21 +747,446 @@ class FrameProcessor:
             None if _stream_misses is None else int(_stream_misses)
         )
         a3b_config = config.get("a3b", {}) if isinstance(config.get("a3b"), dict) else {}
+        module_a_config = (
+            config.get("module_a", {})
+            if isinstance(config.get("module_a"), dict)
+            else {}
+        )
+        soft_trigger_config = dict(a3b_config)
+        soft_trigger_config.update(
+            {
+                "rebuilt_tighten_gate_enabled": bool(
+                    module_a_config.get("rebuilt_a3b_tighten_gate", True)
+                ),
+                "rebuilt_gate_candidate_min": float(
+                    module_a_config.get(
+                        "rebuilt_a3b_gate_candidate_min",
+                        0.70,
+                    )
+                ),
+                "rebuilt_gate_edge_min": float(
+                    module_a_config.get("rebuilt_a3b_gate_edge_min", 0.45)
+                ),
+                "rebuilt_gate_edge_max": float(
+                    module_a_config.get("rebuilt_a3b_gate_edge_max", 0.58)
+                ),
+                "rebuilt_gate_border_contrast_min": float(
+                    module_a_config.get(
+                        "rebuilt_a3b_gate_border_contrast_min",
+                        0.80,
+                    )
+                ),
+                "rebuilt_gate_candidate_tolerance": float(
+                    module_a_config.get(
+                        "rebuilt_a3b_soft_gate_candidate_tolerance",
+                        0.001,
+                    )
+                ),
+                "rebuilt_gate_aspect_ratio_min": float(
+                    module_a_config.get(
+                        "rebuilt_a3b_soft_gate_aspect_ratio_min",
+                        0.40,
+                    )
+                ),
+                "rebuilt_gate_aspect_ratio_max": float(
+                    module_a_config.get(
+                        "rebuilt_a3b_soft_gate_aspect_ratio_max",
+                        2.50,
+                    )
+                ),
+            }
+        )
         self.source_auth_media_suppression_threshold = float(a3b_config.get("observed_threshold", 0.42))
-        self.a3b_soft = A3BSoftTriggerState(a3b_config)
+        self.a3b_soft = A3BSoftTriggerState(soft_trigger_config)
+        self._a3b_authoritative_confirmed_once = False
+        self._a3b_public_alert_hold_frames = max(
+            0,
+            int(module_a_config.get("rebuilt_a3b_alert_hold_frames", 90)),
+        )
+        self._a3b_public_alert_hold_remaining = 0
+        self._a3b_public_alert_hold_bbox: Any = None
+        self._a3b_public_alert_hold_score = 0.0
         self.processing_history: deque[float] = deque(maxlen=30)
         self.jpeg_quality = int(jpeg_quality)
+        self._reported_a3b_error_identity: tuple[Any, ...] | None = None
+        self._reported_a3b_schedule_block_identity: (
+            tuple[Any, ...] | None
+        ) = None
 
     def reset(self) -> None:
         self.pipeline.reset()
         self.ppe_state.reset()
         self.ppe_tracker.reset()
         self.a3b_soft.reset()
+        self._a3b_authoritative_confirmed_once = False
+        self._a3b_public_alert_hold_remaining = 0
+        self._a3b_public_alert_hold_bbox = None
+        self._a3b_public_alert_hold_score = 0.0
         self.processing_history.clear()
+        self._reported_a3b_error_identity = None
+        self._reported_a3b_schedule_block_identity = None
+
+    def _module_a_effective_config(self) -> dict[str, Any]:
+        bundle_config = self.bundle.config if isinstance(self.bundle.config, dict) else {}
+        module_config = (
+            bundle_config.get("module_a", {})
+            if isinstance(bundle_config.get("module_a"), dict)
+            else {}
+        )
+        runtime_config = (
+            bundle_config.get("runtime", {})
+            if isinstance(bundle_config.get("runtime"), dict)
+            else {}
+        )
+        a3b_config = (
+            bundle_config.get("a3b", {})
+            if isinstance(bundle_config.get("a3b"), dict)
+            else {}
+        )
+        soft_state = getattr(self, "a3b_soft", None)
+        soft_config = getattr(soft_state, "config", None)
+        soft_config_is_runtime = isinstance(
+            soft_config,
+            A3BSoftTriggerConfig,
+        )
+        if not isinstance(soft_config, A3BSoftTriggerConfig):
+            soft_config = A3BSoftTriggerConfig.from_mapping(a3b_config)
+        pipeline = getattr(self, "pipeline", None)
+        if pipeline is None:
+            pipeline = getattr(self.bundle, "pipeline", None)
+        detector = getattr(pipeline, "detector", None)
+        missing = object()
+
+        def effective(
+            config_key: str,
+            *attribute_names: str,
+            owner: Any = detector,
+        ) -> Any:
+            for attribute_name in attribute_names:
+                value = getattr(owner, attribute_name, missing)
+                if value is not missing:
+                    return value
+            return module_config.get(config_key)
+
+        def detector_attribute(*attribute_names: str) -> Any:
+            for attribute_name in attribute_names:
+                value = getattr(detector, attribute_name, missing)
+                if value is not missing:
+                    return value
+            return None
+
+        detector_impl = getattr(pipeline, "detector_impl", missing)
+        if detector_impl is missing:
+            detector_impl = module_config.get("detector_impl")
+        static_image_interval = effective(
+            "static_image_interval",
+            "_a3b_interval",
+            "static_image_interval",
+        )
+
+        def infer_a3b_sensitivity() -> str | None:
+            for sensitivity, preset in A3B_SENSITIVITY_PRESETS.items():
+                matches = True
+                for key, expected in preset.items():
+                    if key == "static_image_interval":
+                        actual = static_image_interval
+                    else:
+                        actual = getattr(soft_config, key, missing)
+                        if actual is missing:
+                            actual = a3b_config.get(key, missing)
+                    if actual is missing or actual != expected:
+                        matches = False
+                        break
+                if matches:
+                    return sensitivity
+            return None
+
+        return {
+            "detector_impl": detector_impl,
+            "analysis_max_hz": effective(
+                "analysis_max_hz",
+                "_module_a_analysis_max_hz",
+                owner=pipeline,
+            ),
+            "detector_process_fps_cap": runtime_config.get(
+                "detector_process_fps_cap",
+                runtime_config.get("process_fps_cap"),
+            ),
+            "a3b_sensitivity": infer_a3b_sensitivity(),
+            "a3b_source_keyword_policy": "diagnostic_only",
+            "a3b_source_keyword_match_required": False,
+            "a3b_observed_only_source_keywords": list(
+                soft_config.observed_only_source_keywords
+            ),
+            "a3b_trigger_source_keywords": list(
+                soft_config.trigger_source_keywords
+            ),
+            "static_image_enabled": effective(
+                "static_image_enabled",
+                "static_image_enabled",
+            ),
+            "static_image_interval": static_image_interval,
+            "static_image_worker_timeout_s": effective(
+                "static_image_worker_timeout_s",
+                "_a3b_worker_timeout_s",
+            ),
+            "static_image_result_lease_s": effective(
+                "static_image_result_lease_s",
+                "_a3b_result_lease_s",
+            ),
+            "static_image_max_retired_workers": effective(
+                "static_image_max_retired_workers",
+                "_a3b_max_retired_workers",
+            ),
+            "static_image_global_worker_limit": effective(
+                "static_image_global_worker_limit",
+                "_a3b_global_worker_limit",
+            ),
+            "rebuilt_theta_media_raw": effective(
+                "rebuilt_theta_media_raw",
+                "theta_media_raw",
+            ),
+            "rebuilt_theta_media": effective(
+                "rebuilt_theta_media",
+                "theta_media",
+            ),
+            "rebuilt_theta_adv": effective(
+                "rebuilt_theta_adv",
+                "theta_adv",
+            ),
+            "rebuilt_theta_blind": effective(
+                "rebuilt_theta_blind",
+                "theta_blind",
+            ),
+            "rebuilt_blind_confirm_ratio": effective(
+                "rebuilt_blind_confirm_ratio",
+                "_blind_confirm_ratio",
+            ),
+            "rebuilt_alert_hold_frames": effective(
+                "rebuilt_alert_hold_frames",
+                "_alert_hold_frames",
+            ),
+            "rebuilt_a3b_alert_hold_frames": effective(
+                "rebuilt_a3b_alert_hold_frames",
+                "_a3b_alert_hold_frames",
+            ),
+            "rebuilt_alert_hold_refresh_on_padv": effective(
+                "rebuilt_alert_hold_refresh_on_padv",
+                "_alert_hold_refresh_on_padv",
+            ),
+            "rebuilt_adv_candidate_bridge_frames": effective(
+                "rebuilt_adv_candidate_bridge_frames",
+                "_adv_cand_bridge_frames",
+            ),
+            "rebuilt_a4_classifier_rescue_underexposed_max": effective(
+                "rebuilt_a4_classifier_rescue_underexposed_max",
+                "_a4_classifier_rescue_underexposed_max",
+            ),
+            "rebuilt_sustained_adv_escalation": effective(
+                "rebuilt_sustained_adv_escalation",
+                "_sustained_adv_enabled",
+            ),
+            "rebuilt_sustained_adv_seconds": effective(
+                "rebuilt_sustained_adv_seconds",
+                "_sustained_adv_seconds",
+            ),
+            "rebuilt_sustained_adv_run_mult": effective(
+                "rebuilt_sustained_adv_run_mult",
+                "_sustained_adv_run_mult",
+            ),
+            "rebuilt_sustained_adv_benign_decay": effective(
+                "rebuilt_sustained_adv_benign_decay",
+                "_sustained_adv_benign_decay",
+            ),
+            "rebuilt_sustained_adv_require_target": effective(
+                "rebuilt_sustained_adv_require_target",
+                "_sustained_adv_require_target",
+            ),
+            "rebuilt_sustained_adv_require_physical_support": effective(
+                "rebuilt_sustained_adv_require_physical_support",
+                "_sustained_adv_require_physical_support",
+            ),
+            "rebuilt_sustained_adv_exclude_static_bg": effective(
+                "rebuilt_sustained_adv_exclude_static_bg",
+                "_sustained_adv_exclude_static_bg",
+            ),
+            "rebuilt_sustained_adv_recent_target_min": effective(
+                "rebuilt_sustained_adv_recent_target_min",
+                "_sustained_adv_recent_target_min",
+            ),
+            "rebuilt_blind_sustained_escalation": effective(
+                "rebuilt_blind_sustained_escalation",
+                "_blind_sustained_enabled",
+            ),
+            "rebuilt_blind_sustained_floor": effective(
+                "rebuilt_blind_sustained_floor",
+                "_blind_sustained_floor",
+            ),
+            "rebuilt_blind_sustained_degrade_min": effective(
+                "rebuilt_blind_sustained_degrade_min",
+                "_blind_sustained_degrade_min",
+            ),
+            "rebuilt_blind_sustained_established_min": effective(
+                "rebuilt_blind_sustained_established_min",
+                "_blind_sustained_established_min",
+            ),
+            "rebuilt_a3b_independent_trigger": effective(
+                "rebuilt_a3b_independent_trigger",
+                "_a3b_independent_trigger",
+            ),
+            "rebuilt_a3b_tighten_gate": effective(
+                "rebuilt_a3b_tighten_gate",
+                "_a3b_tighten_gate",
+            ),
+            "rebuilt_a3b_gate_candidate_min": effective(
+                "rebuilt_a3b_gate_candidate_min",
+                "_a3b_gate_candidate_min",
+            ),
+            "rebuilt_a3b_gate_edge_min": effective(
+                "rebuilt_a3b_gate_edge_min",
+                "_a3b_gate_edge_min",
+            ),
+            "rebuilt_a3b_gate_edge_max": effective(
+                "rebuilt_a3b_gate_edge_max",
+                "_a3b_gate_edge_max",
+            ),
+            "rebuilt_a3b_gate_border_contrast_min": effective(
+                "rebuilt_a3b_gate_border_contrast_min",
+                "_a3b_gate_border_contrast_min",
+            ),
+            "rebuilt_a3b_soft_gate_candidate_tolerance": (
+                soft_config.rebuilt_gate_candidate_tolerance
+                if soft_config_is_runtime
+                else module_config.get(
+                    "rebuilt_a3b_soft_gate_candidate_tolerance"
+                )
+            ),
+            "rebuilt_a3b_soft_gate_aspect_ratio_min": (
+                soft_config.rebuilt_gate_aspect_ratio_min
+                if soft_config_is_runtime
+                else module_config.get(
+                    "rebuilt_a3b_soft_gate_aspect_ratio_min"
+                )
+            ),
+            "rebuilt_a3b_soft_gate_aspect_ratio_max": (
+                soft_config.rebuilt_gate_aspect_ratio_max
+                if soft_config_is_runtime
+                else module_config.get(
+                    "rebuilt_a3b_soft_gate_aspect_ratio_max"
+                )
+            ),
+            "rebuilt_a3b_media_run_floor": effective(
+                "rebuilt_a3b_media_run_floor",
+                "_a3b_media_run_floor",
+            ),
+            "rebuilt_a3b_media_run_gap_tol": effective(
+                "rebuilt_a3b_media_run_gap_tol",
+                "_a3b_media_run_gap_tol",
+            ),
+            "flow_requested_device": (
+                detector_attribute("flow_requested_device")
+                or module_config.get("device")
+            ),
+            "flow_effective_device": detector_attribute(
+                "flow_effective_device",
+                "effective_device",
+            ),
+            "flow_backend": detector_attribute(
+                "flow_backend",
+                "backend",
+            ),
+            "flow_fallback_reason": detector_attribute(
+                "flow_fallback_reason",
+                "fallback_reason",
+            ),
+            "flow_artifact_path": detector_attribute(
+                "flow_artifact_path",
+            ),
+            "flow_artifact_sha256": detector_attribute(
+                "flow_artifact_sha256",
+            ),
+            "flow_artifact_expected_sha256": detector_attribute(
+                "flow_artifact_expected_sha256",
+            ),
+            "a4_classifier_configured": detector_attribute(
+                "a4_classifier_configured"
+            ),
+            "a4_classifier_loaded": detector_attribute(
+                "a4_classifier_loaded"
+            ),
+            "a4_classifier_error": detector_attribute(
+                "a4_classifier_error"
+            ),
+            "a4_classifier_fallback_reason": detector_attribute(
+                "a4_classifier_fallback_reason"
+            ),
+            "a4_classifier_alarm_window": detector_attribute(
+                "a4_classifier_alarm_window"
+            ),
+            "a4_classifier_alarm_required_hits": detector_attribute(
+                "a4_classifier_alarm_required_hits"
+            ),
+            "a4_classifier_path": detector_attribute(
+                "a4_classifier_resolved_path"
+            ),
+            "a4_classifier_sha256": detector_attribute(
+                "a4_classifier_sha256"
+            ),
+            "a4_classifier_expected_sha256": detector_attribute(
+                "a4_classifier_expected_sha256"
+            ),
+            "native": detector_attribute("native_status"),
+        }
+
+    def _warn_new_a3b_backend_error(self, health: dict[str, Any]) -> None:
+        error_count = _int(health.get("a3b_error_count"))
+        if error_count > 0:
+            identity = (
+                health.get("a3b_generation"),
+                error_count,
+                health.get("a3b_last_error_at"),
+                health.get("a3b_last_error"),
+            )
+            if identity != getattr(
+                self,
+                "_reported_a3b_error_identity",
+                None,
+            ):
+                self._reported_a3b_error_identity = identity
+                logger.warning(
+                    "A3b background backend error count=%s generation=%s: %s",
+                    error_count,
+                    health.get("a3b_generation"),
+                    health.get("a3b_last_error") or "unknown error",
+                )
+
+        if not bool(health.get("a3b_schedule_blocked", False)):
+            self._reported_a3b_schedule_block_identity = None
+            return
+        blocked_identity = (
+            health.get("a3b_generation"),
+            health.get("a3b_schedule_blocked_reason"),
+        )
+        if blocked_identity == getattr(
+            self,
+            "_reported_a3b_schedule_block_identity",
+            None,
+        ):
+            return
+        self._reported_a3b_schedule_block_identity = blocked_identity
+        logger.warning(
+            "A3b background scheduling blocked generation=%s reason=%s "
+            "local_live=%s global_live=%s global_limit=%s",
+            health.get("a3b_generation"),
+            health.get("a3b_schedule_blocked_reason") or "unknown",
+            health.get("a3b_live_worker_count"),
+            health.get("a3b_global_live_worker_count"),
+            health.get("a3b_global_worker_limit"),
+        )
 
     def process(
         self,
-        frame: np.ndarray,
+        frame: np.ndarray | None,
         *,
         frame_idx: int,
         source_type: str,
@@ -323,23 +1203,86 @@ class FrameProcessor:
         temporal_previous_frame: np.ndarray | None = None,
         temporal_previous_frame_idx: int | None = None,
         temporal_previous_source_time_s: float | None = None,
+        decoded_frame_lease: DecodedFrameLease | None = None,
+        temporal_previous_decoded_frame: DecodedFrameLease | None = None,
     ) -> ProcessedFrame:
         started = time.perf_counter()
-        frame_640 = prepare_frame_640(frame)
+        frame_materialization_started = time.perf_counter()
+        detector_input = None
+        if decoded_frame_lease is not None:
+            frame_640 = decoded_frame_lease.materialize_host_bgr(size=(640, 640))
+            if str(decoded_frame_lease.storage).lower().startswith("cuda"):
+                detector_input = decoded_frame_lease.cuda_tensor
+        else:
+            if frame is None:
+                raise ValueError("frame or decoded_frame_lease is required")
+            frame_640 = prepare_frame_640(frame)
+        current_frame_materialization_ms = (
+            time.perf_counter() - frame_materialization_started
+        ) * 1000.0
+
+        previous_frame_materialization_ms = 0.0
+        effective_temporal_previous = temporal_previous_frame
+        previous_frame_provider = None
+        if (
+            effective_temporal_previous is None
+            and temporal_previous_decoded_frame is not None
+        ):
+            def materialize_temporal_previous() -> np.ndarray:
+                nonlocal previous_frame_materialization_ms
+                previous_materialization_started = time.perf_counter()
+                try:
+                    return temporal_previous_decoded_frame.materialize_host_bgr(
+                        size=(640, 640)
+                    )
+                finally:
+                    previous_frame_materialization_ms = (
+                        time.perf_counter() - previous_materialization_started
+                    ) * 1000.0
+
+            previous_frame_provider = materialize_temporal_previous
+
         process_runtime_frame = getattr(self.pipeline, "process_runtime_frame", None)
         if callable(process_runtime_frame):
             _, detections, info = process_runtime_frame(
                 frame_640,
                 timestamp=float(video_time_s),
-                previous_frame=temporal_previous_frame,
+                previous_frame=effective_temporal_previous,
                 current_source_frame_idx=int(frame_idx),
                 previous_source_frame_idx=temporal_previous_frame_idx,
                 previous_source_time_s=temporal_previous_source_time_s,
+                detector_input=detector_input,
+                previous_frame_provider=previous_frame_provider,
             )
         else:
             _, detections, info = self.pipeline.process_frame(frame_640)
+        latency_breakdown = (
+            info.setdefault("latency_breakdown", {})
+            if isinstance(info, dict)
+            else {}
+        )
+        if isinstance(latency_breakdown, dict):
+            latency_breakdown["frame_materialization_ms"] = float(
+                current_frame_materialization_ms
+            )
+            latency_breakdown["previous_frame_materialization_ms"] = float(
+                previous_frame_materialization_ms
+            )
         _feature_probe(info, frame_idx, detections)
+        # Normalize the backend A3b contract once. PPE suppression and status
+        # consume the same mapping so repeated result adaptation is avoided.
         static_media = dict(_static_media_details(info))
+        static_media["source_path"] = source
+        a3b_soft = self.a3b_soft.update(static_media)
+        a3b_soft_triggered = bool(a3b_soft.get("triggered", False))
+        authoritative_a3b_triggered, _, authoritative_a3b_bbox, _ = (
+            _authoritative_a3b_confirmation(static_media)
+        )
+        effective_a3b_bbox = (
+            a3b_soft.get("effective_bbox")
+            if a3b_soft_triggered
+            else authoritative_a3b_bbox or static_media.get("p_media_bbox")
+        )
         redetect_ms = 0.0
         redetect_count = 0
         avg_processing_ms = (
@@ -386,10 +1329,17 @@ class FrameProcessor:
                 stream_max_misses=self.ppe_stream_max_render_misses,
             ),
             postprocess_config=self.ppe_postprocess_config,
-            source_auth_media_bbox=static_media.get("p_media_bbox"),
+            source_auth_media_bbox=effective_a3b_bbox,
+            # Freshness and policy suppression are frame-visible state, so this
+            # small CPU gate is intentionally evaluated once per processed frame
+            # rather than cached across duplicate result_seq values.
             source_auth_suppression_active=_source_auth_media_suppression_active(
                 static_media,
                 threshold=self.source_auth_media_suppression_threshold,
+                runtime_triggered=bool(
+                    a3b_soft_triggered or authoritative_a3b_triggered
+                ),
+                bbox=effective_a3b_bbox,
             ),
         )
         ppe = ppe_result.ppe
@@ -419,7 +1369,64 @@ class FrameProcessor:
             processing_ms=process_total_s * 1000.0,
             target_frame_budget_ms=target_frame_budget_ms,
             raw_boxes_count=len(getattr(detections, "boxes", []) or []),
+            static_media=static_media,
+            a3b_soft=a3b_soft,
         )
+        status.update(
+            {
+                "detector_input_device": str(
+                    latency_breakdown.get(
+                        "detector_input_device",
+                        getattr(detections, "input_device", "host"),
+                    )
+                    or "host"
+                ),
+                "detector_input_format": str(
+                    latency_breakdown.get(
+                        "detector_input_format",
+                        getattr(detections, "input_format", "bgr24"),
+                    )
+                    or "bgr24"
+                ),
+                "detector_preprocess_ms": float(
+                    latency_breakdown.get(
+                        "detector_preprocess_ms",
+                        getattr(detections, "preprocess_ms", 0.0),
+                    )
+                    or 0.0
+                ),
+                "frame_materialization_ms": float(
+                    current_frame_materialization_ms
+                ),
+                "previous_frame_materialization_ms": float(
+                    previous_frame_materialization_ms
+                ),
+            }
+        )
+        effective_config = status.get("module_a_effective_config")
+        native = (
+            effective_config.get("native")
+            if isinstance(effective_config, dict)
+            and isinstance(effective_config.get("native"), dict)
+            else None
+        )
+        if isinstance(native, dict):
+            status["native"] = {
+                **native,
+                "version": str(
+                    native.get("crate_version")
+                    or native.get("version")
+                    or "unknown"
+                ),
+                "enabled_stages": list(
+                    native.get("enabled_stages") or []
+                ),
+                "fallback_reason": str(
+                    native.get("fallback_reason")
+                    or native.get("load_error")
+                    or "none"
+                ),
+            }
         return ProcessedFrame(
             frame_idx=frame_idx,
             frame_640=frame_640,
@@ -454,14 +1461,90 @@ class FrameProcessor:
         processing_ms: float,
         target_frame_budget_ms: float,
         raw_boxes_count: int,
+        static_media: dict[str, Any] | None = None,
+        a3b_soft: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        static_media = dict(_static_media_details(info))
+        static_media = (
+            dict(static_media)
+            if isinstance(static_media, dict)
+            else dict(_static_media_details(info))
+        )
         static_media["source_path"] = source
         latency = info.get("latency_breakdown", {}) if isinstance(info.get("latency_breakdown"), dict) else {}
         temporal_input = info.get("temporal_input", {}) if isinstance(info.get("temporal_input"), dict) else {}
         module_breakdown = latency.get("module_a_breakdown", {}) if isinstance(latency.get("module_a_breakdown"), dict) else {}
+        module_details = (
+            info.get("details", {})
+            if isinstance(info.get("details"), dict)
+            else {}
+        )
+        runtime_frame_lineage = (
+            module_details.get("runtime_frame_lineage", {})
+            if isinstance(
+                module_details.get("runtime_frame_lineage"),
+                dict,
+            )
+            else {}
+        )
+        joint_decision = (
+            module_details.get("joint_decision", {})
+            if isinstance(module_details.get("joint_decision"), dict)
+            else {}
+        )
+        confirm_window = (
+            joint_decision.get("confirm_window", {})
+            if isinstance(joint_decision.get("confirm_window"), dict)
+            else {}
+        )
+        blinding = (
+            module_details.get("blinding", {})
+            if isinstance(module_details.get("blinding"), dict)
+            else {}
+        )
+        raw_module_a_primary_channel = str(
+            joint_decision.get("primary_channel") or "none"
+        )
+        normalized_primary_channel = (
+            raw_module_a_primary_channel.strip().lower() or "none"
+        )
+        media_primary = normalized_primary_channel in {
+            "media",
+            "p_media",
+            "a3b",
+            "static_media",
+        }
+        module_a_primary_channel = (
+            "a3b" if media_primary else normalized_primary_channel
+        )
+        module_a_alert_held = bool(confirm_window.get("alert_held", False))
+        module_a_alert_hold_remaining = _int(
+            confirm_window.get("alert_hold_remaining")
+        )
+        backend_media_alert_held = bool(
+            media_primary
+            and module_a_alert_held
+            and module_a_alert_hold_remaining > 0
+        )
         p_adv = info.get("p_adv")
-        a3b_soft = self.a3b_soft.update(static_media)
+        # The rebuilt detector's legacy umbrella flags also cover its internal
+        # ``primary_channel=media`` branch.  Runtime/Web legacy fields are a
+        # physical-only contract, so media/A3b confirmations must be removed
+        # from those fields and exposed only through the explicit A3b/Module A
+        # union below.
+        physical_alert_confirmed = bool(
+            info.get("alert_confirmed", False)
+        ) and not media_primary
+        physical_attack_detected = bool(
+            info.get("attack_detected", False)
+        ) and not media_primary
+        physical_attack_state_active = bool(
+            info.get("attack_state_active", False)
+        ) and not media_primary
+        a3b_soft = (
+            dict(a3b_soft)
+            if isinstance(a3b_soft, dict)
+            else self.a3b_soft.update(static_media)
+        )
         a3b_triggered = bool(a3b_soft["triggered"])
         a3b_observed_score = _float(a3b_soft.get("observed_score"))
         a3b_smoothed_score = _float(
@@ -470,21 +1553,155 @@ class FrameProcessor:
         # rebuilt 内核已对 media 做过 N-of-M 确认(media_confirmed), 是权威结果; 面板不应再经 a3b_soft
         # 二次确认导致 confirmed_score 时有时无(面板一直显 0)。已确认时用 rebuilt 的 p_media_confirmed_score
         # 直接回填面板置信度/卡片分数, 并标 confirmed。observed 仍走 a3b_soft(平滑显示)。纯显示, 不改检测。
-        _rebuilt_media_confirmed = bool(static_media.get("triggered"))
-        _rebuilt_media_score = _float(static_media.get("score"))
+        (
+            _authoritative_confirmed,
+            _authoritative_score,
+            _authoritative_bbox,
+            _authoritative_source,
+        ) = _authoritative_a3b_confirmation(static_media)
         a3b_confirmed_score = _float(a3b_soft.get("confirmed_score"))
-        if _rebuilt_media_confirmed and _rebuilt_media_score > a3b_confirmed_score:
-            a3b_confirmed_score = _rebuilt_media_score
+        if _authoritative_confirmed and _authoritative_score > a3b_confirmed_score:
+            a3b_confirmed_score = _authoritative_score
         a3b_confidence = _float(a3b_soft.get("confidence", a3b_confirmed_score))
-        if _rebuilt_media_confirmed and _rebuilt_media_score > a3b_confidence:
-            a3b_confidence = _rebuilt_media_score
+        if _authoritative_confirmed and _authoritative_score > a3b_confidence:
+            a3b_confidence = _authoritative_score
         a3b_display_score = _float(a3b_soft.get("display_score"), a3b_confidence)
+        if _authoritative_confirmed and _authoritative_score > a3b_display_score:
+            a3b_display_score = _authoritative_score
         a3b_card_score = a3b_confidence
         a3b_event_score = a3b_confidence if a3b_confidence > 0 else a3b_observed_score
         a3b_state = str(a3b_soft.get("state") or ("confirmed" if a3b_soft.get("triggered") else "normal"))
-        if _rebuilt_media_confirmed:
+        # Some contract tests and embedders construct FrameProcessor without
+        # calling __init__.  Keep the public hold state backwards compatible.
+        if not hasattr(self, "_a3b_authoritative_confirmed_once"):
+            self._a3b_authoritative_confirmed_once = False
+        if not hasattr(self, "_a3b_public_alert_hold_frames"):
+            self._a3b_public_alert_hold_frames = 90
+        if not hasattr(self, "_a3b_public_alert_hold_remaining"):
+            self._a3b_public_alert_hold_remaining = 0
+        if not hasattr(self, "_a3b_public_alert_hold_bbox"):
+            self._a3b_public_alert_hold_bbox = None
+        if not hasattr(self, "_a3b_public_alert_hold_score"):
+            self._a3b_public_alert_hold_score = 0.0
+        if _authoritative_confirmed:
+            self._a3b_authoritative_confirmed_once = True
+        a3b_soft_debug = dict(a3b_soft.get("debug") or {})
+        a3b_reacquired_after_authoritative = bool(
+            self._a3b_authoritative_confirmed_once
+            and a3b_triggered
+            and a3b_state.strip().lower() == "suspect"
+            and bool(a3b_soft_debug.get("quality_gate_passed", False))
+            and not list(
+                a3b_soft_debug.get("current_explicit_guard_failures")
+                or []
+            )
+            and a3b_soft.get("effective_bbox") is not None
+        )
+        a3b_public_fresh_confirmed = bool(
+            _authoritative_confirmed
+            or a3b_reacquired_after_authoritative
+        )
+        current_a3b_bbox = (
+            _authoritative_bbox
+            or a3b_soft.get("effective_bbox")
+            or static_media.get("p_media_bbox")
+        )
+        current_a3b_score = max(
+            a3b_confirmed_score,
+            a3b_confidence,
+            a3b_observed_score,
+            _authoritative_score,
+        )
+        a3b_public_hold_active = False
+        if a3b_public_fresh_confirmed:
+            self._a3b_public_alert_hold_remaining = (
+                self._a3b_public_alert_hold_frames
+            )
+            self._a3b_public_alert_hold_bbox = current_a3b_bbox
+            self._a3b_public_alert_hold_score = current_a3b_score
+        elif (
+            self._a3b_authoritative_confirmed_once
+            and self._a3b_public_alert_hold_remaining > 0
+        ):
+            self._a3b_public_alert_hold_remaining -= 1
+            a3b_public_hold_active = True
+            a3b_confirmed_score = max(
+                a3b_confirmed_score,
+                self._a3b_public_alert_hold_score * 0.85,
+            )
+            a3b_confidence = max(a3b_confidence, a3b_confirmed_score)
+            a3b_display_score = max(a3b_display_score, a3b_confirmed_score)
+            a3b_card_score = max(a3b_card_score, a3b_confirmed_score)
+            a3b_event_score = max(a3b_event_score, a3b_confirmed_score)
+        if (
+            _authoritative_confirmed
+            or backend_media_alert_held
+            or a3b_reacquired_after_authoritative
+            or a3b_public_hold_active
+        ):
             a3b_state = "confirmed"
             a3b_triggered = True
+        if a3b_public_hold_active:
+            module_a_alert_held = True
+            module_a_alert_hold_remaining = max(
+                module_a_alert_hold_remaining,
+                self._a3b_public_alert_hold_remaining,
+            )
+        a3b_confirmed_alert = bool(
+            a3b_triggered and a3b_state.strip().lower() == "confirmed"
+        )
+        module_a_alert_confirmed = bool(
+            physical_alert_confirmed or a3b_confirmed_alert
+        )
+        module_a_attack_detected = bool(
+            physical_attack_detected or a3b_confirmed_alert
+        )
+        module_a_attack_state_active = bool(
+            physical_attack_state_active or a3b_confirmed_alert
+        )
+        module_a_alert_channel = (
+            module_a_primary_channel
+            if physical_alert_confirmed or physical_attack_state_active
+            else "a3b"
+            if a3b_confirmed_alert
+            else "none"
+        )
+        effective_a3b_bbox = (
+            a3b_soft.get("effective_bbox")
+            if bool(a3b_soft.get("triggered"))
+            else static_media.get("p_media_bbox")
+        )
+        if _authoritative_confirmed and _authoritative_bbox is not None:
+            effective_a3b_bbox = _authoritative_bbox
+        elif a3b_public_hold_active and self._a3b_public_alert_hold_bbox is not None:
+            effective_a3b_bbox = self._a3b_public_alert_hold_bbox
+        if a3b_triggered and effective_a3b_bbox is None:
+            effective_a3b_bbox = static_media.get("p_media_bbox")
+        a3b_triggered_source = str(a3b_soft.get("triggered_source") or "none")
+        if _authoritative_confirmed:
+            a3b_triggered_source = _authoritative_source
+        elif backend_media_alert_held:
+            a3b_triggered_source = "rebuilt_media_hold"
+        elif a3b_reacquired_after_authoritative:
+            a3b_triggered_source = "rebuilt_media_reacquired"
+        elif a3b_public_hold_active:
+            a3b_triggered_source = "rebuilt_media_public_hold"
+        a3b_health = _a3b_backend_health(static_media)
+        self._warn_new_a3b_backend_error(a3b_health)
+        a3b_debug = a3b_soft_debug
+        a3b_debug.update(a3b_health)
+        a3b_debug["rebuilt_backend_media_alert_held"] = bool(
+            backend_media_alert_held
+        )
+        a3b_debug["rebuilt_reacquired_after_authoritative"] = bool(
+            a3b_reacquired_after_authoritative
+        )
+        a3b_debug["rebuilt_public_alert_hold_active"] = bool(
+            a3b_public_hold_active
+        )
+        a3b_debug["rebuilt_public_alert_hold_remaining"] = int(
+            self._a3b_public_alert_hold_remaining
+        )
         ppe_boxes_count = _int(ppe.get("person_count")) + _int(ppe.get("helmet_count")) + _int(ppe.get("head_count"))
         ppe_suppression = ppe.get("helmet_fp_suppression", {})
         ppe_weak_person_count = (
@@ -545,7 +1762,12 @@ class FrameProcessor:
             "processing_ms": float(processing_ms),
             "detector_inference_ms": _float(info.get("detector_inference_ms")),
             "module_a_timing_ms": _float(info.get("module_a_timing_ms")),
-            "a3b_static_media_ms": _float(module_breakdown.get("a3b_static_media_ms")),
+            "a3b_static_media_ms": _float(
+                module_breakdown.get(
+                    "a3b_static_media_ms",
+                    module_breakdown.get("a3b_schedule"),
+                )
+            ),
             "target_frame_budget_ms": float(target_frame_budget_ms),
             "processing_budget_ok": bool(processing_ms <= target_frame_budget_ms),
             "latency_breakdown": latency,
@@ -554,6 +1776,15 @@ class FrameProcessor:
             "source_frame_shape": latency.get("source_frame_shape", []),
             "detector_frame_shape": latency.get("detector_frame_shape", []),
             "temporal_input": dict(temporal_input),
+            "module_a_processed_frame_idx": (
+                runtime_frame_lineage.get("processed_frame_idx")
+            ),
+            "module_a_source_frame_idx": (
+                runtime_frame_lineage.get("source_frame_idx")
+            ),
+            "module_a_input_frame_idx": (
+                runtime_frame_lineage.get("module_a_input_frame_idx")
+            ),
             "temporal_previous_frame_applied": bool(temporal_input.get("previous_frame_applied", False)),
             "temporal_strict_source_predecessor": bool(
                 temporal_input.get("strict_source_predecessor", False)
@@ -562,9 +1793,36 @@ class FrameProcessor:
             "p_adv": None if p_adv is None else _float(p_adv),
             "p_adv_display": _float(info.get("p_adv_display", p_adv or 0.0)),
             "p_adv_missing_reason": str(info.get("p_adv_missing_reason", "")),
-            "alert_confirmed": bool(info.get("alert_confirmed", False)),
-            "attack_detected": bool(info.get("attack_detected", False)),
-            "attack_state_active": bool(info.get("attack_state_active", False)),
+            # Keep the legacy physical-channel fields stable for the p_adv /
+            # p_blind card and physical-attack acceptance.  The explicit
+            # module_a_* fields are the public umbrella state consumed by the
+            # top-level Web alert: a confirmed A3b attack is still a Module A
+            # alert, but must not masquerade as a physical-channel hit.
+            "alert_confirmed": physical_alert_confirmed,
+            "physical_alert_confirmed": physical_alert_confirmed,
+            "module_a_alert_confirmed": module_a_alert_confirmed,
+            "module_a_alert_channel": module_a_alert_channel,
+            "single_frame_suspicious": bool(
+                info.get("single_frame_suspicious", False)
+            ),
+            "attack_detected": physical_attack_detected,
+            "physical_attack_detected": physical_attack_detected,
+            "module_a_attack_detected": module_a_attack_detected,
+            "attack_state_active": physical_attack_state_active,
+            "physical_attack_state_active": physical_attack_state_active,
+            "module_a_attack_state_active": module_a_attack_state_active,
+            "module_a_primary_channel": module_a_primary_channel,
+            "module_a_alert_held": module_a_alert_held,
+            "module_a_alert_hold_remaining": module_a_alert_hold_remaining,
+            "module_a_fresh_confirmed": bool(
+                physical_alert_confirmed
+                and not module_a_alert_held
+            ),
+            "p_blind": _float(blinding.get("p_blind")),
+            "p_blind_triggered": bool(
+                blinding.get("p_blind_triggered", False)
+            ),
+            "blind_type": str(blinding.get("blind_type") or "none"),
             "reason": info_reason(info),
             "reason_codes": list(info.get("reason_codes") or []),
             "a3b_score": float(a3b_card_score),
@@ -576,11 +1834,14 @@ class FrameProcessor:
             "a3b_event_score": float(a3b_event_score),
             "a3b_state": a3b_state,
             "a3b_triggered": bool(a3b_triggered),
+            "a3b_confirmed_alert": a3b_confirmed_alert,
             "a3b_p_media": _float(static_media.get("p_media")),
-            "a3b_bbox": static_media.get("p_media_bbox"),
-            "a3b_triggered_source": str(a3b_soft.get("triggered_source") or "none"),
+            "a3b_bbox": effective_a3b_bbox,
+            "a3b_triggered_source": a3b_triggered_source,
             "a3b_reason": str(a3b_soft.get("reason") or ""),
-            "a3b_debug": dict(a3b_soft.get("debug") or {}),
+            "a3b_debug": a3b_debug,
+            **a3b_health,
+            "module_a_effective_config": self._module_a_effective_config(),
             "ppe_warning": bool(ppe.get("warning", False)),
             "ppe_candidate": bool(ppe.get("candidate", False)),
             "ppe_confirmed": bool(ppe.get("confirmed", False)),
@@ -676,13 +1937,79 @@ def _ppe_max_render_misses(
     return None
 
 
-def _source_auth_media_suppression_active(static_media: dict[str, Any], *, threshold: float = 0.42) -> bool:
-    bbox = static_media.get("p_media_bbox")
-    if not bbox:
+def _source_auth_media_suppression_active(
+    static_media: dict[str, Any],
+    *,
+    threshold: float = 0.42,
+    runtime_triggered: bool = False,
+    bbox: Any = None,
+) -> bool:
+    effective_bbox = bbox if bbox is not None else static_media.get("p_media_bbox")
+    if not effective_bbox:
         return False
+
+    is_rebuilt = static_media.get("result_contract_source") == "rebuilt"
+    if is_rebuilt and not bool(static_media.get("a3b_result_fresh", False)):
+        return False
+
+    policy = (
+        static_media.get("policy")
+        if isinstance(static_media.get("policy"), dict)
+        else {}
+    )
+    suppression = (
+        static_media.get("suppression")
+        if isinstance(static_media.get("suppression"), dict)
+        else {}
+    )
+    policy_state = (
+        static_media.get("p_media_policy_state")
+        if isinstance(static_media.get("p_media_policy_state"), dict)
+        else {}
+    )
+    candidate_allowed_values = [
+        static_media.get("media_candidate_allowed")
+        if "media_candidate_allowed" in static_media
+        else None,
+        policy.get("media_candidate_allowed")
+        if "media_candidate_allowed" in policy
+        else None,
+        suppression.get("media_candidate_allowed")
+        if "media_candidate_allowed" in suppression
+        else None,
+        policy_state.get("media_candidate_allowed")
+        if "media_candidate_allowed" in policy_state
+        else None,
+    ]
+    if any(value is not None and not bool(value) for value in candidate_allowed_values):
+        return False
+
+    if any(
+        bool(container.get("suppressed", False))
+        for container in (policy, suppression, policy_state)
+    ):
+        return False
+
+    no_suppression_reasons = {"", "none", "normal", "not_suppressed"}
+    suppression_reasons = {
+        str(static_media.get("suppressed_reason") or "").strip().lower(),
+        str(policy.get("suppressed_reason") or "").strip().lower(),
+        str(policy.get("reason") or "").strip().lower(),
+        str(suppression.get("reason") or "").strip().lower(),
+        str(policy_state.get("reason") or "").strip().lower(),
+    }
+    if any(
+        reason not in no_suppression_reasons
+        for reason in suppression_reasons
+    ):
+        return False
+    if str(static_media.get("a3b_state") or "").strip().lower() == "suppressed":
+        return False
+
     score_threshold = float(threshold)
     return bool(
-        static_media.get("triggered")
+        runtime_triggered
+        or static_media.get("triggered")
         or static_media.get("p_media_triggered")
         or static_media.get("classifier_triggered")
         or _float(static_media.get("p_media")) >= score_threshold
@@ -711,25 +2038,63 @@ def _bar_ratio(value: Any) -> float:
 def build_branch_cards(status: dict[str, Any]) -> list[dict[str, Any]]:
     """Build the right-panel branch cards consumed by the Web UI."""
     p_adv = status.get("p_adv")
-    p_adv_missing = p_adv is None
+    module_a_primary_channel = str(
+        status.get("module_a_primary_channel") or "none"
+    )
+    module_a_alert_held = bool(status.get("module_a_alert_held", False))
+    blind_primary = module_a_primary_channel == "blind"
+    module_a_score = status.get("p_blind") if blind_primary else p_adv
+    module_a_score_missing = module_a_score is None
     p_adv_confirmed = bool(status.get("alert_confirmed"))
     p_adv_active = bool(status.get("attack_state_active") or status.get("attack_detected"))
-    if p_adv_missing:
+    if blind_primary:
+        module_a_title = "致盲/去信号攻击（p_blind）"
+        module_a_badges = ["模块A", "致盲"]
+    else:
+        module_a_title = "物理对抗扰动（p_adv）"
+        module_a_badges = ["模块A"]
+    if module_a_score_missing:
         adv_class = "card-missing"
         adv_state = "待检测"
-        adv_detail = status.get("p_adv_missing_reason") or "尚未产生物理扰动检测结果。"
+        adv_detail = (
+            "尚未产生致盲检测结果。"
+            if blind_primary
+            else status.get("p_adv_missing_reason")
+            or "尚未产生物理扰动检测结果。"
+        )
+    elif module_a_alert_held and p_adv_confirmed:
+        adv_class = "card-warning"
+        adv_state = "告警保持"
+        remaining = _int(status.get("module_a_alert_hold_remaining"))
+        channel_text = "致盲/去信号" if blind_primary else "物理扰动"
+        adv_detail = (
+            f"最近一次{channel_text}确认仍在保持窗口"
+            + (f"，剩余 {remaining} 帧。" if remaining > 0 else "。")
+        )
     elif p_adv_confirmed:
         adv_class = "card-confirmed"
         adv_state = "确认告警"
-        adv_detail = "连续帧满足模块A告警条件。"
+        adv_detail = (
+            "连续帧满足致盲/去信号告警条件。"
+            if blind_primary
+            else "连续帧满足模块A物理扰动告警条件。"
+        )
     elif p_adv_active:
         adv_class = "card-warning"
         adv_state = "疑似扰动"
-        adv_detail = "当前帧存在物理扰动迹象，等待连续帧确认。"
+        adv_detail = (
+            "当前帧存在致盲/去信号迹象，等待连续帧确认。"
+            if blind_primary
+            else "当前帧存在物理扰动迹象，等待连续帧确认。"
+        )
     else:
         adv_class = "card-idle"
         adv_state = "OK"
-        adv_detail = "未触发物理扰动检测。"
+        adv_detail = (
+            "未触发致盲/去信号检测。"
+            if blind_primary
+            else "未触发物理扰动检测。"
+        )
 
     feature_options = status.get("feature_options") if isinstance(status.get("feature_options"), dict) else {}
     a3b_enabled = feature_options.get("static_image_enabled", True) is not False
@@ -800,15 +2165,30 @@ def build_branch_cards(status: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
             "branch": "p_adv",
-            "title": "物理对抗扰动（p_adv）",
-            "score": None if p_adv is None else _float(p_adv),
-            "score_display": _score_display(p_adv),
-            "score_bar_ratio": _bar_ratio(p_adv),
+            "title": module_a_title,
+            "score": (
+                None
+                if module_a_score is None
+                else _float(module_a_score)
+            ),
+            "score_display": _score_display(module_a_score),
+            "score_bar_ratio": _bar_ratio(module_a_score),
             "border_class": adv_class,
             "state": adv_state,
             "state_detail": adv_detail,
             "reason_text": status.get("reason") or "",
-            "badges": ["模块A", "连续帧"] if p_adv_confirmed else ["模块A"],
+            "badges": (
+                module_a_badges
+                + (
+                    ["告警保持"]
+                    if module_a_alert_held and p_adv_confirmed
+                    else ["连续帧"]
+                    if p_adv_confirmed
+                    else []
+                )
+            ),
+            "primary_channel": module_a_primary_channel,
+            "score_source": "p_blind" if blind_primary else "p_adv",
         },
         {
             "branch": "p_safety",

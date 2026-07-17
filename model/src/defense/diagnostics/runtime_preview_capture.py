@@ -56,10 +56,18 @@ def capture_runtime_preview_video(
         deadline = time.time() + max(0.1, float(max_seconds))
         last_seq = 0
         while time.time() < deadline:
-            seq, jpeg, running = engine.wait_latest_jpeg(
-                last_seq,
-                timeout=max(0.05, float(frame_timeout_s)),
-            )
+            wait_snapshot = getattr(engine, "wait_latest_jpeg_snapshot", None)
+            if callable(wait_snapshot):
+                seq, jpeg, running, preview_meta = wait_snapshot(
+                    last_seq,
+                    timeout=max(0.05, float(frame_timeout_s)),
+                )
+            else:
+                seq, jpeg, running = engine.wait_latest_jpeg(
+                    last_seq,
+                    timeout=max(0.05, float(frame_timeout_s)),
+                )
+                preview_meta = {}
             status = engine.get_status()
             final_status = dict(status)
             if jpeg is not None and seq > last_seq:
@@ -78,8 +86,30 @@ def capture_runtime_preview_video(
                 preview_frames.append(
                     {
                         "preview_seq": int(seq),
-                        "source_time_s": float(status.get("source_time_s") or 0.0),
-                        "video_time_s": float(status.get("video_time_s") or 0.0),
+                        "source_epoch": int(
+                            preview_meta.get(
+                                "source_epoch",
+                                status.get("source_epoch") or 0,
+                            )
+                        ),
+                        "frame_idx": int(
+                            preview_meta.get(
+                                "frame_idx",
+                                status.get("frame_idx") or 0,
+                            )
+                        ),
+                        "source_time_s": float(
+                            preview_meta.get(
+                                "source_time_s",
+                                status.get("source_time_s") or 0.0,
+                            )
+                        ),
+                        "video_time_s": float(
+                            preview_meta.get(
+                                "source_time_s",
+                                status.get("video_time_s") or 0.0,
+                            )
+                        ),
                         "preview_fps": float(status.get("preview_fps") or 0.0),
                         "detector_pipeline_mode": str(
                             status.get("detector_pipeline_mode") or ""

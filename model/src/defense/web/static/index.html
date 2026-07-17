@@ -636,7 +636,7 @@
         </select>
         <label id="sourceValueLabel">MP4 文件</label>
         <div id="pathRow" class="fieldRow">
-          <input id="sourceValue" value="D:\联合防御模块\素材\手机随意录制的视频\固定镜头室外视频.mp4" />
+          <input id="sourceValue" value="D:\联合防御模块\素材\手机随意录制的视频\固定镜头室外视频_1080.mp4" />
           <button class="secondary" id="browseBtn" type="button">浏览</button>
           <button class="secondary" id="testSourceBtn" type="button" style="display:none;">连通检测</button>
         </div>
@@ -656,8 +656,11 @@
             <div id="modelSecurityPill" class="pill">未检查</div>
           </div>
           <div class="sourceHint" id="modelSecuritySummary">详细扫描、净化、报告和白名单管理请打开安全中心。</div>
+          <div class="sourceHint" id="runtimeModelSummary">正在读取下次启动使用的运行模型。</div>
+          <div class="sourceHint" id="runtimeModelIdentity">源模型与 TensorRT engine 的 hash 绑定将在启动后显示。</div>
           <div class="actions">
             <button class="secondary" id="openModelSecurityCenterBtn" type="button">打开安全中心</button>
+            <button class="secondary" id="resetCustomModelBtn" type="button" style="display:none;">下次使用默认模型</button>
           </div>
         </section>
         <label>画面叠加</label>
@@ -770,6 +773,10 @@
     let modelSecurityBlockState = null;
     let lastModelSecurity = null;
     let lastTrustRecords = [];
+    const featureOptionOverrides = {
+      static_image_enabled: false,
+      a3b_sensitivity: false,
+    };
     const refreshIntervals = { running: 300, idle: 1200, error: 2000 };
     const DEFAULT_RUNTIME_PROFILE = "desktop_rtx";
     function toggleSection(headerEl) {
@@ -780,8 +787,7 @@
 
     const profileLabels = {
       desktop_rtx: "全速GPU",
-      desktop_debug_onnx: "均衡GPU",
-      edge_fast: "边缘ONNX",
+      high_quality: "高质量GPU",
     };
 
     function profileLabel(value) {
@@ -799,26 +805,70 @@
     function customModelOptions() {
       let enabled = false;
       let path = "";
-      let modelFamily = "auto";
+      let family = "auto";
       let sourcePtPath = "";
       let classNamesRaw = "";
       try {
         enabled = localStorage.getItem("moduleA.lastCustomModelEnabled") === "true";
         path = localStorage.getItem("moduleA.lastModelPath") || "";
-        localStorage.removeItem("moduleA.lastCustomModelBackend");
-        modelFamily = localStorage.getItem("moduleA.lastCustomModelFamily") || "auto";
+        family = localStorage.getItem("moduleA.lastCustomModelFamily") || "auto";
         sourcePtPath = localStorage.getItem("moduleA.lastSourcePtPath") || "";
         classNamesRaw = localStorage.getItem("moduleA.lastCustomClassNames") || "";
       } catch (_) {}
+      if (/\.(pt|pth)$/i.test(path)) sourcePtPath = path;
       const options = {
         enabled: enabled && !!path,
         path,
         backend: "auto",
-        model_family: modelFamily,
+        model_family: family,
         source_pt_path: sourcePtPath,
       };
-      if (classNamesRaw) options.class_names = classNamesRaw.split(",").map((item) => item.trim()).filter(Boolean);
+      if (classNamesRaw) {
+        options.class_names = classNamesRaw.split(",").map((item) => item.trim()).filter(Boolean);
+      }
       return options;
+    }
+
+    function runtimeModelSelectionSummary(modelSecurity = {}) {
+      void modelSecurity;
+      const custom = customModelOptions();
+      if (custom.enabled) {
+        if (modelSecurityBypassEnabled()) {
+          return `本机自定义模型测试 · ${custom.path} · 绕过B模块准入，不写入白名单。`;
+        }
+        return `本机自定义模型测试 · ${custom.path} · 启动前由B模块执行安全准入。`;
+      }
+      return "生产运行已锁定 mask_bd_v4_clean_baseline.pt → TensorRT FP16；不接受自定义或历史 YOLO 模型。";
+    }
+
+    function renderRuntimeModelSelection(modelSecurity = {}) {
+      const summary = $("runtimeModelSummary");
+      const resetButton = $("resetCustomModelBtn");
+      const custom = customModelOptions();
+      if (summary) summary.textContent = runtimeModelSelectionSummary(modelSecurity);
+      if (resetButton) resetButton.style.display = custom.enabled ? "" : "none";
+    }
+
+    function shortHash(value) {
+      const text = String(value || "");
+      return text.length > 16 ? `${text.slice(0, 12)}…${text.slice(-4)}` : (text || "-");
+    }
+
+    function renderAuthoritativeModel(status = {}) {
+      const target = $("runtimeModelIdentity");
+      if (!target) return;
+      const model = status.authoritative_model || {};
+      const source = model.source || {};
+      const engine = model.engine || {};
+      if (!source.path && !engine.path) {
+        target.textContent = "源模型与 TensorRT engine 的 hash 绑定将在启动后显示。";
+        return;
+      }
+      const valid = model.metadata_valid ? "绑定有效" : "绑定无效";
+      target.textContent =
+        `${valid} · PT ${source.path || "-"} · SHA ${shortHash(source.sha256)} · ` +
+        `engine ${engine.path || status.artifact || "-"} · SHA ${shortHash(engine.sha256)} · ` +
+        `类别 ${(model.class_names || []).join(", ") || "-"}`;
     }
 
     function modelSecurityBypassEnabled() {
@@ -900,6 +950,7 @@
     }
 
     function isModelSecurityBlocking(ms) {
+      if (!customModelOptions().enabled) return false;
       const status = modelSecurityStatus(ms);
       const blockingStatuses = ["blocked_scan_required", "scanning", "purifying", "unverifiable", "suspicious", "review", "clean_export_required", "purified_alternative_available", "error"];
       return !!ms && blockingStatuses.includes(status);
@@ -1008,7 +1059,16 @@
     function stateText(status) {
       if (status.source_ended) return ["播放结束", "MP4 已到达末尾，可重新开始检测。", ""];
       if (status.preview_mode === "model_security_blocked") return ["B模块准入阻断", "模型安全准入未通过，A模块没有启动。", "alert"];
-      if (status.alert_confirmed) return ["确认告警", "检测到疑似物理扰动，建议复核画面与事件列表。", "alert"];
+      if (status.module_a_alert_confirmed ?? status.alert_confirmed) {
+        const isA3b = status.module_a_alert_channel === "a3b";
+        return [
+          "确认告警",
+          isA3b
+            ? "检测到翻拍/假目标确认，建议复核 A3b 事件与证据。"
+            : "检测到疑似物理扰动，建议复核画面与事件列表。",
+          "alert",
+        ];
+      }
       if (status.running && !status.detector_ready) return ["初始化中", "正在加载检测器。", ""];
       if (status.running && status.playback_paused) return ["已暂停", "后端源时钟已暂停，检测队列保持 latest-only。", ""];
       if (status.running && status.preview_mode === "source_waiting_for_frames") return ["等待帧", "输入源暂时无新帧，预览线程不会阻塞检测。", ""];
@@ -1341,6 +1401,12 @@
     }
 
     function evidenceLinks(evt) {
+      if (evt.evidence_persistence_pending || evt.evidence_persistence_status === "pending") {
+        return '<div class="evidenceLinks"><span>证据正在异步持久化，完成后自动开放预览。</span></div>';
+      }
+      if (evt.evidence_persistence_status === "failed") {
+        return `<div class="evidenceLinks"><span>证据持久化失败：${evt.evidence_persistence_error || "请检查运行状态"}</span></div>`;
+      }
       if (!evt.evidence_saved) {
         return '<div class="evidenceLinks"><span>证据生成中，事件结束后可打开预览。</span></div>';
       }
@@ -1355,7 +1421,7 @@
         links.push(`<a href="${evt.evidence_representative_url}" target="_blank">代表帧</a>`);
       }
       if (evt.evidence_saved_frame_count) {
-        links.push(`<span>关键帧 ${evt.evidence_saved_frame_count || 0} 张</span>`);
+        links.push(`<span>证据抽样关键帧 ${evt.evidence_saved_frame_count || 0} 张</span>`);
       }
       return `<div class="evidenceLinks">${links.join("") || "<span>证据已保存</span>"}</div>`;
     }
@@ -1432,10 +1498,14 @@
     }
 
     function featureOptions() {
-      return {
-        static_image_enabled: $("enableStaticImage").checked,
-        a3b_sensitivity: currentA3bSensitivity(),
-      };
+      const options = {};
+      if (featureOptionOverrides.static_image_enabled) {
+        options.static_image_enabled = $("enableStaticImage").checked;
+      }
+      if (featureOptionOverrides.a3b_sensitivity) {
+        options.a3b_sensitivity = currentA3bSensitivity();
+      }
+      return options;
     }
 
     const a3bSensitivityLevels = ["conservative", "balanced", "sensitive", "high"];
@@ -1472,7 +1542,44 @@
           <span>窗口命中 ${params.window}</span>
         `;
       }
-      try { localStorage.setItem("moduleA.a3bSensitivity", normalized); } catch (_) {}
+    }
+
+    function setA3bSensitivityCustom(effectiveConfig) {
+      $("a3bSensitivityText").textContent = "自定义";
+      const interval = Number(effectiveConfig?.static_image_interval || 0);
+      const meta = $("a3bSensitivityMeta");
+      if (meta) {
+        meta.innerHTML = `
+          <span>自定义阈值组合</span>
+          <span>检测间隔 ${interval > 0 ? `${interval}帧` : "以后端为准"}</span>
+          <span>未匹配预设档位</span>
+          <span>以后端 effective config 为准</span>
+        `;
+      }
+    }
+
+    function applyEffectiveFeatureOptions(status) {
+      const featureStatus = status?.feature_options || {};
+      const effectiveConfig = status?.module_a_effective_config || {};
+      if (!featureOptionOverrides.static_image_enabled) {
+        if (typeof effectiveConfig.static_image_enabled === "boolean") {
+          $("enableStaticImage").checked = effectiveConfig.static_image_enabled;
+        } else if (typeof featureStatus.static_image_enabled === "boolean") {
+          $("enableStaticImage").checked = featureStatus.static_image_enabled;
+        }
+      }
+      if (!featureOptionOverrides.a3b_sensitivity) {
+        const hasEffectiveSensitivity = Object.prototype.hasOwnProperty.call(
+          effectiveConfig,
+          "a3b_sensitivity",
+        );
+        const sensitivity = effectiveConfig.a3b_sensitivity || featureStatus.a3b_sensitivity;
+        if (sensitivity) {
+          setA3bSensitivity(sensitivity);
+        } else if (hasEffectiveSensitivity && effectiveConfig.detector_impl) {
+          setA3bSensitivityCustom(effectiveConfig);
+        }
+      }
     }
 
     function updateStartButtonState(status) {
@@ -1512,7 +1619,7 @@
       const sourceTime = status?.source_ended && duration > 0
         ? Math.min(Math.max(rawSourceTime, 0), duration)
         : rawSourceTime;
-      const showProgressControls = isFile && duration > 0 && running;
+      const showProgressControls = isFile && duration > 0 && (running || !!status?.source_ended);
       $("runControls").style.display = showProgressControls ? "grid" : "none";
       if (!showProgressControls) {
         $("playPauseBtn").disabled = true;
@@ -1538,10 +1645,15 @@
       if (!seekControlInFlight) $("seekSlider").value = String(Math.min(sourceTime, duration || sourceTime));
       $("clockText").textContent = `${fmtSeconds(sourceTime)} / ${fmtSeconds(duration)}`;
       const dropped = Number(status?.dropped_detection_frames || 0);
-      const previewFps = status?.source_ended ? "0.0" : Number(status?.preview_fps || 0).toFixed(1);
-      const detectFps = status?.source_ended ? "0.0" : Number(status?.fps || 0).toFixed(1);
+      const sourceFps = Number(status?.source_fps || 0).toFixed(1);
+      const detectFps = Number(status?.fps || 0).toFixed(1);
+      const computeFps = Number(status?.detector_compute_fps || 0).toFixed(1);
+      const previewFps = Number(status?.preview_fps || 0).toFixed(1);
+      const coverage = (Number(status?.detection_source_coverage_ratio || 0) * 100).toFixed(1);
       const pipelineMode = status?.source_ended ? "ended" : (status?.detector_pipeline_mode || "idle");
-      $("pipelineText").textContent = `${pipelineMode} · 检测${detectFps}fps · 预览${previewFps}fps · drop ${dropped}`;
+      $("pipelineText").textContent =
+        `${pipelineMode} · 源${sourceFps}fps · 检测输出${detectFps}fps · ` +
+        `检测算力${computeFps}fps · 预览${previewFps}fps · 检测覆盖${coverage}% · 丢弃旧检测帧 ${dropped}`;
       lastControlRunId = Number(status?.run_id || lastControlRunId || 0);
     }
 
@@ -1561,15 +1673,12 @@
         const source = localStorage.getItem("moduleA.lastSourcePath");
         if (source) $("sourceValue").value = source;
       } catch (_) {}
-      try {
-        setA3bSensitivity(localStorage.getItem("moduleA.a3bSensitivity") || "balanced");
-      } catch (_) {
-        setA3bSensitivity("balanced");
-      }
+      setA3bSensitivity("balanced");
     }
 
     function modelSecurityStatusLabel(value) {
       const labels = {
+        production_authoritative: "生产权威模型",
         unknown: "未检查",
         trusted: "已信任",
         clean: "扫描通过",
@@ -1613,6 +1722,9 @@
     }
 
     function modelSecurityCompactSummary(ms, status) {
+      if (!customModelOptions().enabled) {
+        return "默认生产运行使用唯一权威 PT 及其哈希绑定 TensorRT engine；B模块准入仅用于本机自定义模型测试入口。";
+      }
       const reasonText = modelSecurityReasonLabel(ms.blocking_reason);
       const suffix = "详细扫描、净化、报告和白名单管理请打开安全中心。";
       if (ms.purifying || status === "purifying") {
@@ -1648,14 +1760,18 @@
     function renderModelSecurity(ms) {
       ms = ms || {};
       lastModelSecurity = ms;
-      const status = ms.admission_status || ms.status || "unknown";
+      const productionDefault = !customModelOptions().enabled;
+      const status = productionDefault
+        ? "production_authoritative"
+        : (ms.admission_status || ms.status || "unknown");
       const pill = $("modelSecurityPill");
       if (!pill) return;
       pill.textContent = modelSecurityStatusLabel(status);
       const summaryNode = $("modelSecuritySummary");
       if (summaryNode) summaryNode.textContent = modelSecurityCompactSummary(ms, status);
+      renderRuntimeModelSelection(ms);
       const alertStates = ["blocked_scan_required", "unverifiable", "suspicious", "review", "clean_export_required", "purified_alternative_available", "purifying", "exporting", "planned", "error"];
-      pill.className = "pill " + ((status === "trusted") ? "live" : alertStates.includes(status) ? "alert" : "");
+      pill.className = "pill " + ((status === "trusted" || status === "production_authoritative") ? "live" : alertStates.includes(status) ? "alert" : "");
     }
 
     function renderModelTrust(trust) {
@@ -1881,8 +1997,23 @@
     $("openModelSecurityCenterBtn").onclick = () => {
       window.location.href = "/model-security";
     };
+    $("resetCustomModelBtn").onclick = async () => {
+      try {
+        localStorage.setItem("moduleA.lastCustomModelEnabled", "false");
+        localStorage.setItem("moduleA.testBypassModelSecurity", "false");
+      } catch (_) {}
+      renderRuntimeModelSelection(lastModelSecurity || {});
+      setError("");
+      await refreshModelSecurity();
+    };
 
-    $("a3bSensitivity").oninput = () => setA3bSensitivity(currentA3bSensitivity());
+    $("enableStaticImage").onchange = () => {
+      featureOptionOverrides.static_image_enabled = true;
+    };
+    $("a3bSensitivity").oninput = () => {
+      featureOptionOverrides.a3b_sensitivity = true;
+      setA3bSensitivity(currentA3bSensitivity());
+    };
     $("startBtn").onclick = async () => {
       if (startInFlight) return;
       setError("");
@@ -1908,18 +2039,27 @@
         }
         await syncDrawingOptions();
         const sourceType = $("sourceType").value;
+        const featureOverrides = featureOptions();
+        const customModel = customModelOptions();
+        const useCustomModelTestEntry = Boolean(customModel.enabled);
+        const bypassModelSecurity = Boolean(
+          useCustomModelTestEntry && modelSecurityBypassEnabled()
+        );
         const body = {
           source_type: sourceType,
           source: currentSourceValue(),
           profile: currentRuntimeProfile(),
           realtime: true,
-          feature_options: featureOptions(),
-          custom_model: customModelOptions(),
-          test_bypass_model_security: modelSecurityBypassEnabled(),
+          custom_model: customModel,
+          test_bypass_model_security: bypassModelSecurity,
           ready_timeout_s: 45,
         };
+        if (Object.keys(featureOverrides).length) {
+          body.feature_options = featureOverrides;
+        }
         saveLastPaths();
-        const data = await api("/api/start", body);
+        const startEndpoint = useCustomModelTestEntry ? "/api/test/start" : "/api/start";
+        const data = await api(startEndpoint, body);
         modelSecurityBlockState = null;
         const status = normalizeLifecycleStatus(data.status || {});
         lastOverlayStatus = status;
@@ -2007,6 +2147,7 @@
         if (status.model_security) renderModelSecurity(status.model_security);
         $("profilePill").textContent = profileLabel(status.profile || currentRuntimeProfile());
         $("backendPill").textContent = backendLabel(status);
+        renderAuthoritativeModel(status);
         $("frame").textContent = status.frame_idx ?? 0;
         $("pAdv").textContent = Number(status.p_adv || 0).toFixed(3);
         $("timing").textContent = Number(status.timing_ms || 0).toFixed(1);
@@ -2016,11 +2157,7 @@
         const ppeActive = !!(status.ppe_warning || status.ppe_event_active);
         $("ppePill").textContent = ppeActive ? "未戴帽" : "业务通道";
         $("ppePill").className = "pill " + (ppeActive ? "alert" : "");
-        const featureStatus = status.feature_options || {};
-        if (status.running) {
-          $("enableStaticImage").checked = featureStatus.static_image_enabled !== false;
-          if (featureStatus.a3b_sensitivity) setA3bSensitivity(featureStatus.a3b_sensitivity);
-        }
+        if (status.running) applyEffectiveFeatureOptions(status);
         const displayOptions = status.display_options || {};
         $("showBoxes").checked = displayOptions.show_boxes !== false;
         $("showPersonBoxes").checked = displayOptions.show_person_boxes !== false;
@@ -2050,7 +2187,7 @@
           <div class="event alert">
             <strong>告警 #${eventId}</strong>
             <div class="main">${reasonSummary(evt.reason)}</div>
-            <div class="sub">帧 ${startFrame} - ${endFrame} · 峰值分数 ${peak.toFixed(3)}</div>
+            <div class="sub">事件源帧 ${startFrame} - ${endFrame}（不是视频总帧） · 峰值分数 ${peak.toFixed(3)}</div>
             <div class="chips">
               <span class="chip danger">高风险</span>
               ${tags.map((tag) => `<span class="chip">${tag}</span>`).join("")}
@@ -2089,7 +2226,7 @@
           <div class="event ppe">
             <strong>安全帽告警 #${eventId}</strong>
             <div class="main">检测到人员未佩戴安全帽，已按连续帧规则确认。</div>
-            <div class="sub">帧 ${startFrame} - ${endFrame} · 推断人员 ${personCount} · 原始人员 ${rawPersonCount} · 裸头 ${headCount} · 安全帽 ${helmetCount}</div>
+            <div class="sub">事件源帧 ${startFrame} - ${endFrame}（不是视频总帧） · 推断人员 ${personCount} · 原始人员 ${rawPersonCount} · 裸头 ${headCount} · 安全帽 ${helmetCount}</div>
             <div class="chips">
               <span class="chip warn">业务安全</span>
               <span class="chip">未戴安全帽</span>
@@ -2100,14 +2237,18 @@
         `;
         }).join("") || '<div class="empty"><strong>暂无安全帽告警</strong><div class="hint">该通道只判断人员是否佩戴安全帽，不代表物理扰动。</div></div>';
         const completedSourceEvents = status.recent_source_auth_events || [];
-        const activeSourceEvent = status.a3b_triggered ? [{
+        const a3bConfirmed = Boolean(
+          status.a3b_confirmed_alert
+          || (status.a3b_triggered && status.a3b_state === "confirmed")
+        );
+        const activeSourceEvent = a3bConfirmed ? {
           active: true,
           event_id: "实时",
           trigger_frame: status.frame_idx || 0,
           last_warning_frame: status.frame_idx || 0,
           peak_a3b_score: status.a3b_event_score ?? status.a3b_observed_score ?? status.a3b_display_score ?? status.a3b_score ?? 0,
           reason: status.a3b_triggered_source || status.a3b_reason || "实时疑似",
-        }] : null;
+        } : null;
         const sourceEvents = activeSourceEvent ? [activeSourceEvent, ...completedSourceEvents] : completedSourceEvents;
         $("sourceAlerts").textContent = sourceEvents.length || 0;
         $("sourcePill").textContent = sourceEvents.length ? "A3b警告" : "A3b通道";
@@ -2121,7 +2262,7 @@
           <div class="event alert">
             <strong>${evt.active ? "A3b实时告警" : `A3b警告 #${eventId}`}</strong>
             <div class="main">${evt.active ? "检测到可疑翻拍/假目标迹象，正在持续确认。" : "检测到可疑翻拍/假目标迹象，已记录为 A3b 警告。"}</div>
-            <div class="sub">帧 ${startFrame} - ${endFrame} · 峰值分数 ${peak.toFixed(3)}</div>
+            <div class="sub">事件源帧 ${startFrame} - ${endFrame}（不是视频总帧） · 峰值分数 ${peak.toFixed(3)}</div>
             <div class="chips">
               <span class="chip danger">A3b</span>
               <span class="chip">${evt.reason || "连续帧异常"}</span>

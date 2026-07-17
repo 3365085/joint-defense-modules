@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from defense.module_a.result_contract import adapt_a3b_result
 from defense.runtime.a3b_soft_trigger import A3BSoftTriggerState
 
 FIELDNAMES = [
@@ -43,7 +44,9 @@ def frame_row(video_path: Path, frame_idx: int, info: dict[str, Any], a3b_state:
     flow = features.get("flow", {})
     blur = features.get("blur", {})
     track = features.get("track", {})
-    static_image = dict(features.get("static_media") or features.get("static_image", {}))
+    static_image = adapt_a3b_result(info)
+    if not static_image:
+        static_image = dict(features.get("static_image", {}))
     static_image["source_path"] = str(video_path)
     a3b_soft = a3b_state.update(static_image) if a3b_state is not None else None
     raw_p_media = float(static_image.get("p_media", 0.0) or 0.0)
@@ -85,7 +88,16 @@ def frame_row(video_path: Path, frame_idx: int, info: dict[str, Any], a3b_state:
         "motion_score": float(flow.get("motion_score", 0.0) or 0.0),
         "flow_local_ratio": float(flow.get("local_max_ratio", 0.0) or 0.0),
         "blur_score": float(blur.get("score", 0.0) or 0.0),
-        "track_score": float(track.get("score", 0.0) or 0.0),
+        "track_score": float(
+            track.get(
+                "score",
+                static_image.get(
+                    "track_score",
+                    (static_image.get("p_media_scores") or {}).get("track", 0.0),
+                ),
+            )
+            or 0.0
+        ),
         "confidence_drop_score": float(track.get("confidence_drop_score", 0.0) or 0.0),
         "timing_ms": float(info.get("timing_ms", 0.0) or 0.0),
         "reason_codes": ";".join(str(code) for code in info.get("reason_codes", [])),

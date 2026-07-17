@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -11,7 +9,8 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from defense.runtime import MonitorEngine, PipelineCache, list_profiles, sample_sources, scan_camera_devices
-from defense.runtime.config import DEFAULT_CONFIG_PATH, project_root
+from defense.runtime.authoritative_model import authoritative_source_path, resolve_project_path
+from defense.runtime.config import DEFAULT_CONFIG_PATH, load_runtime_config, project_root
 from defense.runtime.evidence import (
     evidence_path_from_token,
     list_evidence_events,
@@ -79,9 +78,11 @@ def _install_asyncio_exception_filter() -> None:
 
 @asynccontextmanager
 async def _app_lifespan(app: FastAPI):
-    del app
     _install_asyncio_exception_filter()
-    yield
+    try:
+        yield
+    finally:
+        _engine(app).stop()
 
 
 async def _body(request: Request) -> dict[str, Any]:
@@ -90,6 +91,36 @@ async def _body(request: Request) -> dict[str, Any]:
     except Exception:
         data = {}
     return data if isinstance(data, dict) else {}
+
+
+def _production_unique_model_enabled(
+    config_path: str | Path,
+    *,
+    profile: str,
+) -> bool:
+    config = load_runtime_config(
+        config_path=config_path,
+        profile=profile,
+        custom_model={},
+    )
+    runtime = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
+    return bool(runtime.get("production_unique_model", False))
+
+
+def _localhost_test_entry_enabled(request: Request) -> bool:
+    host = str(getattr(request.app.state, "bind_host", "") or "").strip().lower()
+    return host in {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _is_redundant_authoritative_model_selection(custom_model: Any) -> bool:
+    """Recognize stale Web selections that point at the locked source PT itself."""
+    if not isinstance(custom_model, dict):
+        return False
+    raw_path = str(custom_model.get("path") or "").strip()
+    if not raw_path:
+        return False
+    root = project_root()
+    return resolve_project_path(raw_path, root) == authoritative_source_path(root)
 
 
 def _start_blocked_payload(
@@ -226,6 +257,8 @@ def create_app(
         # artifacts, so the UI fetches it through /api/model-security/status.
         return _json({"ok": True, "status": enrich_status(_engine(request.app).get_status())})
 
+    @app.post("/api/test/runs/start")
+    @app.post("/api/test/start")
     @app.post("/api/runs/start")
     @app.post("/api/start")
     async def start(request: Request) -> JSONResponse:
@@ -233,12 +266,86 @@ def create_app(
         payload = await _body(request)
         profile = normalize_profile(payload.get("profile", "default"))
         custom_model = payload.get("custom_model") or {}
+        production_unique_model = _production_unique_model_enabled(
+            request.app.state.config_path,
+            profile=profile,
+        )
         model_security_service = _model_security(request.app)
         bypass_security_for_test = bool(
             payload.get("test_bypass_model_security")
             or payload.get("bypass_model_security_for_test")
             or payload.get("bypass_model_security")
         )
+        test_start_endpoint = request.url.path in {
+            "/api/test/start",
+            "/api/test/runs/start",
+        }
+        # Older/open Web pages may still submit the authoritative PT through the
+        # former custom-model fields.  It is not a real model replacement: drop
+        # that stale selection (and its stale bypass flag) so the production
+        # path loads the hash-bound TensorRT artifact instead of rejecting the
+        # user's start request.  Any different path remains forbidden below.
+        if (
+            production_unique_model
+            and not test_start_endpoint
+            and _is_redundant_authoritative_model_selection(custom_model)
+        ):
+            custom_model = {}
+            bypass_security_for_test = False
+        test_custom_model_requested = bool(
+            isinstance(custom_model, dict)
+            and custom_model.get("enabled")
+            and str(custom_model.get("path") or "").strip()
+        )
+        if test_start_endpoint and not test_custom_model_requested:
+            return _json(
+                {
+                    "ok": False,
+                    "error": "test_custom_model_required",
+                    "message": "本机测试入口必须先选择并启用自定义模型。",
+                },
+                status_code=400,
+            )
+        if test_start_endpoint and not _localhost_test_entry_enabled(request):
+            return _json(
+                {
+                    "ok": False,
+                    "error": "test_entry_localhost_only",
+                    "message": "自定义模型测试入口仅允许本机 Web 服务使用。",
+                },
+                status_code=403,
+            )
+        production_test_entry = bool(
+            production_unique_model
+            and test_start_endpoint
+        )
+        if production_unique_model and not production_test_entry and bool(
+            isinstance(custom_model, dict)
+            and (
+                custom_model.get("enabled")
+                or str(custom_model.get("path") or "").strip()
+            )
+        ):
+            return _json(
+                {
+                    "ok": False,
+                    "error": "production_model_locked",
+                    "message": (
+                        "生产运行已锁定唯一 YOLO 模型 "
+                        "mask_bd_v4_clean_baseline.pt，禁止自定义模型覆盖。"
+                    ),
+                },
+                status_code=409,
+            )
+        if production_unique_model and bypass_security_for_test and not production_test_entry:
+            return _json(
+                {
+                    "ok": False,
+                    "error": "production_security_bypass_forbidden",
+                    "message": "生产运行禁止绕过模型安全准入。",
+                },
+                status_code=409,
+            )
         if bypass_security_for_test:
             try:
                 admission = model_security_service.status(profile=profile, custom_model=custom_model)
@@ -301,15 +408,36 @@ def create_app(
                 )
                 admission = model_security_service.status(profile=profile, custom_model=custom_model)
             return _json(_start_blocked_payload(admission, scan_result=scan_result, purification_result=purification_result), status_code=409)
+        if production_unique_model and not production_test_entry and bool(
+            isinstance(runtime_custom_model, dict)
+            and runtime_custom_model.get("enabled")
+        ):
+            return _json(
+                {
+                    "ok": False,
+                    "error": "production_model_replacement_forbidden",
+                    "message": (
+                        "模型安全服务返回了替换模型，但 Module A 生产运行只允许"
+                        "权威模型及其绑定的 TensorRT engine。"
+                    ),
+                    "model_security": admission,
+                },
+                status_code=409,
+            )
         engine = _engine(request.app)
         try:
+            start_kwargs = {
+                "source_type": str(payload.get("source_type", "file")),
+                "source": str(payload.get("source", "")),
+                "profile": profile,
+                "realtime": bool(payload.get("realtime", True)),
+                "feature_options": payload.get("feature_options") or None,
+                "custom_model": runtime_custom_model,
+            }
+            if production_test_entry:
+                start_kwargs["allow_test_custom_model"] = True
             run_id = engine.start(
-                source_type=str(payload.get("source_type", "file")),
-                source=str(payload.get("source", "")),
-                profile=profile,
-                realtime=bool(payload.get("realtime", True)),
-                feature_options=payload.get("feature_options") or {},
-                custom_model=runtime_custom_model,
+                **start_kwargs,
             )
         except FileNotFoundError as exc:
             return _json(
@@ -571,15 +699,34 @@ def create_app(
         profile = normalize_profile(payload.get("profile", "default"))
         custom_model = payload.get("custom_model") or {}
         auto_purify = bool(payload.get("auto_purify", scan_type == "full"))
-        if background:
-            result = _model_security(request.app).start_background_scan(
+        service = _model_security(request.app)
+        try:
+            if background:
+                result = service.start_background_scan(
+                    scan_type=scan_type,
+                    profile=profile,
+                    custom_model=custom_model,
+                    auto_purify=auto_purify,
+                )
+                return _json({"ok": True, "model_security": service.status(profile=profile, custom_model=custom_model), "scan": result})
+            report = service.scan(
                 scan_type=scan_type,
                 profile=profile,
                 custom_model=custom_model,
-                auto_purify=auto_purify,
+                trust_if_low_risk=bool(payload.get("trust_if_low_risk", False)),
             )
-            return _json({"ok": True, "model_security": _model_security(request.app).status(profile=profile, custom_model=custom_model), "scan": result})
-        report = _model_security(request.app).scan(scan_type=scan_type, profile=profile, custom_model=custom_model, trust_if_low_risk=bool(payload.get("trust_if_low_risk", False)))
+        except ValueError as exc:
+            if str(exc).startswith("trust_store_compromised:"):
+                return _json(
+                    {
+                        "ok": False,
+                        "error": "trust_store_compromised",
+                        "reason": str(exc).split(":", 1)[1],
+                        "model_security": service.status(profile=profile, custom_model=custom_model),
+                    },
+                    status_code=409,
+                )
+            raise
         return _json({"ok": True, "report": report, "model_security": _model_security(request.app).status(profile=profile, custom_model=custom_model)})
 
     @app.post("/api/model-security/scan/stop")

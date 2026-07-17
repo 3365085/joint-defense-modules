@@ -229,7 +229,7 @@
           <div id="configPill" class="pill">未保存</div>
         </div>
         <div class="content">
-          <div class="notice">这里决定A模块即将运行的模型。配置变更会立即应用；陌生模型不会被直接放行，开始检测或手动扫描时会触发B模块准入流程。</div>
+          <div class="notice">默认生产运行使用唯一权威模型及其 TensorRT engine。配置变更会立即应用；启用自定义模型后会进入本机测试入口，默认仍由B模块准入，只有显式勾选测试绕过才会跳过B模块。</div>
           <div class="compactForm">
             <label class="checkLine wide"><input id="enableCustomModel" type="checkbox" />使用自定义模型</label>
             <label class="wide">自定义模型路径
@@ -261,7 +261,7 @@
             <div class="field"><strong>后端：</strong><span id="resolvedBackend">自动匹配</span><br /><strong>模型族：</strong><span id="resolvedFamily">自动识别</span></div>
             <label class="checkLine wide"><input id="testBypassModelSecurity" type="checkbox" />测试入口：绕过B模块安全准入直接运行当前模型</label>
           </div>
-          <div class="notice warn">仅用于当前阶段对比毒模型、原模型和净化模型检测效果；不会写入白名单，禁止生产使用。</div>
+          <div class="notice warn">自定义模型仅用于本机测试，不改变生产权威模型。未勾选绕过时必须通过B模块准入；勾选绕过后不会写入白名单。</div>
           <div id="modelConfigMessage" class="field"></div>
         </div>
       </section>
@@ -443,12 +443,14 @@
 
     function loadModelConfig() {
       try { localStorage.removeItem("moduleA.lastCustomModelBackend"); } catch (_) {}
-      $("enableCustomModel").checked = getStored("moduleA.lastCustomModelEnabled", "false") === "true";
+      const customEnabled = getStored("moduleA.lastCustomModelEnabled", "false") === "true";
+      $("enableCustomModel").checked = customEnabled;
       $("customModelPath").value = getStored("moduleA.lastModelPath", "");
       $("sourcePtPath").value = getStored("moduleA.lastSourcePtPath", "");
       $("customModelFamily").value = getStored("moduleA.lastCustomModelFamily", "auto");
       $("customClassNames").value = getStored("moduleA.lastCustomClassNames", "");
-      $("testBypassModelSecurity").checked = modelSecurityBypassEnabled();
+      $("testBypassModelSecurity").checked = customEnabled && modelSecurityBypassEnabled();
+      if (!customEnabled) setStored("moduleA.testBypassModelSecurity", "false");
       syncModelConfigControls();
     }
 
@@ -468,12 +470,17 @@
 
     function syncModelConfigControls() {
       const enabled = $("enableCustomModel").checked;
+      if (!enabled) {
+        $("testBypassModelSecurity").checked = false;
+        setStored("moduleA.testBypassModelSecurity", "false");
+      }
       $("customModelPath").disabled = !enabled;
       $("browseModelBtn").disabled = !enabled;
       $("sourcePtPath").disabled = !enabled;
       $("browseSourcePtBtn").disabled = !enabled;
       $("customModelFamily").disabled = !enabled;
       $("customClassNames").disabled = !enabled;
+      $("testBypassModelSecurity").disabled = !enabled;
       $("configPill").textContent = enabled ? "自定义模型" : "默认模型";
       $("configPill").className = "pill " + (enabled ? "warn" : "ok");
     }
@@ -484,6 +491,7 @@
 
     function statusLabel(value) {
       const labels = {
+        production_authoritative: "生产权威模型",
         trusted: "已信任",
         clean: "扫描通过",
         blocked_scan_required: "需要完整扫描",
@@ -551,7 +559,7 @@
 
     function tone(status) {
       const text = String(status || "");
-      if (["trusted", "clean", "ok"].includes(text) || text.includes("trusted")) return "ok";
+      if (["production_authoritative", "trusted", "clean", "ok"].includes(text) || text.includes("trusted")) return "ok";
       if (["blocked_scan_required", "scanning", "purifying", "review", "suspicious", "unverifiable", "purified_alternative_available", "empty_unsealed", "host_fingerprint_degraded"].includes(text)) return "warn";
       if (text.includes("error") || text.includes("failed") || text.includes("compromised")) return "bad";
       return "";
@@ -645,7 +653,10 @@
 
     function renderStatus(ms) {
       lastModelSecurity = ms || {};
-      const status = lastModelSecurity.admission_status || lastModelSecurity.status || "unknown";
+      const productionDefault = !$("enableCustomModel").checked;
+      const status = productionDefault
+        ? "production_authoritative"
+        : (lastModelSecurity.admission_status || lastModelSecurity.status || "unknown");
       $("statusPill").textContent = statusLabel(status);
       $("statusPill").className = "pill " + tone(status);
       const metrics = metricsOf(lastModelSecurity);
@@ -654,7 +665,7 @@
       $("purifiedAsr").textContent = percentText(metrics.purified_asr);
       $("purifiedWilson").textContent = percentText(metrics.purified_wilson_upper);
       $("lastScan").textContent = timeText(lastModelSecurity.last_scan_time);
-      $("whitelistHit").textContent = lastModelSecurity.whitelist_hit ? "是" : "否";
+      $("whitelistHit").textContent = productionDefault ? "不适用" : (lastModelSecurity.whitelist_hit ? "是" : "否");
       $("runtimePath").textContent = lastModelSecurity.runtime_artifact_path || lastModelSecurity.model_path || "--";
       $("sourcePtStatusPath").textContent = lastModelSecurity.source_pt_path || "--";
       $("resolvedBackend").textContent = lastModelSecurity.backend || "自动匹配";
@@ -678,7 +689,8 @@
       const reason = reasonLabel(lastModelSecurity.blocking_reason);
       const purificationStatus = lastModelSecurity.purification_status || "idle";
       let text = "模型安全状态尚未确认。";
-      if (status === "trusted") text = "当前运行模型已通过B模块准入，可以启动A模块检测。";
+      if (status === "production_authoritative") text = "当前为唯一生产权威模型及其哈希绑定 TensorRT engine；B模块准入只针对启用后的本机自定义模型测试入口。";
+      else if (status === "trusted") text = "当前运行模型已通过B模块准入，可以启动A模块检测。";
       else if (lastModelSecurity.exporting) text = "B模块正在导出加速模型；导出成功后会计算哈希和语义指纹，并自动写入白名单。";
       else if (status === "blocked_scan_required") text = "当前模型未命中白名单，需要先对源PT执行完整扫描；若扫描判定疑似风险，系统会自动净化并复扫。";
       else if (status === "scanning") text = "B模块正在后台完整扫描；若判定疑似风险，会自动进入净化并复扫，A模块暂未启动。";
@@ -710,8 +722,27 @@
         profile: currentRuntimeProfile(),
         custom_model: customModelOptions(),
       });
-      renderStatus(data.model_security || {});
-      return data.model_security || {};
+      let modelSecurity = data.model_security || {};
+      if (!$("enableCustomModel").checked) {
+        try {
+          const runtimeData = await api("/api/status");
+          const authoritative = (runtimeData.status || {}).authoritative_model || {};
+          const source = authoritative.source || {};
+          const engine = authoritative.engine || {};
+          modelSecurity = Object.assign({}, modelSecurity, {
+            admission_status: "production_authoritative",
+            runtime_artifact_path: engine.path || modelSecurity.runtime_artifact_path,
+            model_path: engine.path || modelSecurity.model_path,
+            source_pt_path: source.path || modelSecurity.source_pt_path,
+            original_source_model_path: source.path || modelSecurity.original_source_model_path,
+            backend: authoritative.backend || modelSecurity.backend,
+            model_family: "yolov8",
+            class_names: authoritative.class_names || modelSecurity.class_names,
+          });
+        } catch (_) {}
+      }
+      renderStatus(modelSecurity);
+      return modelSecurity;
     }
 
     async function refreshTrust() {

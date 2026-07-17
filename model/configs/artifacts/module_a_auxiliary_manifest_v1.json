@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-07-17",
+  "artifacts": {
+    "raft": {
+      "artifact_id": "module_a.raft_small_fp16_256",
+      "required": true,
+      "path": "runtime/artifacts/module_a/raft_small_fp16_256.engine",
+      "size_bytes": 4403868,
+      "sha256": "A7A338A8ACDBE718D54DD673C40D8B55FBD6A9898257B12A6471C4628FCD7739",
+      "backend": "tensorrt",
+      "runtime_version_verified": "10.16.1.11",
+      "inputs": [
+        {
+          "name": "img1",
+          "dtype": "float32",
+          "shape": [1, 3, 256, 256]
+        },
+        {
+          "name": "img2",
+          "dtype": "float32",
+          "shape": [1, 3, 256, 256]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "flow",
+          "dtype": "float32",
+          "shape": [1, 2, 256, 256]
+        }
+      ],
+      "purpose": "Module A A3 GPU optical flow; production resolver must use this main-project path only"
+    },
+    "a4": {
+      "artifact_id": "module_a.a4_classifier",
+      "required": true,
+      "path": "runtime/artifacts/module_a/a4/a4_classifier.pkl",
+      "metadata_path": "runtime/artifacts/module_a/a4/a4_classifier.pkl.meta.json",
+      "sha256": "C4F9FC5A2EE835AE4D73DE08A29BD46E02E0E63D9402924F246452B798428BFB",
+      "status": "qualified_installed",
+      "purpose": "Qualified adv_patch rescue classifier fused with the independent A4 rule path and temporal confirmation"
+    }
+  }
+}

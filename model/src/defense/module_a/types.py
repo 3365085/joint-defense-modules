@@ -60,11 +60,16 @@ class ModuleAResult:
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_info_dict(self) -> dict[str, Any]:
-        layer = "MODULE_A_PHYSICAL" if self.single_frame_suspicious else "NORMAL"
+        attack_detected = bool(
+            self.single_frame_suspicious
+            or self.alert_confirmed
+            or self.attack_state_active
+        )
+        layer = "MODULE_A_PHYSICAL" if attack_detected else "NORMAL"
         return {
             "layer_triggered": layer,
-            "is_attack": self.single_frame_suspicious,
-            "attack_detected": self.single_frame_suspicious,
+            "is_attack": attack_detected,
+            "attack_detected": attack_detected,
             "single_frame_suspicious": self.single_frame_suspicious,
             "reason_codes": list(self.reason_codes),
             "attack_state_active": self.attack_state_active,

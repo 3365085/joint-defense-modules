@@ -121,7 +121,14 @@ def _apply_temporal_helmet_mutex(
     helmet_tracks = [
         track
         for track in tracks
-        if str(track.get("label") or "") == "helmet" and _normalize_bbox(track.get("box")) is not None
+        if (
+            str(track.get("label") or "") == "helmet"
+            and _normalize_bbox(track.get("box")) is not None
+            and float(track.get("confidence") or 0.0)
+            >= config.head_helmet_mutex_min_helmet_confidence
+            and int(track.get("misses") or 0) == 0
+            and str(track.get("source") or "") == "detected"
+        )
     ]
     if not helmet_tracks:
         return ppe

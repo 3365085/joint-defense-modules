@@ -328,7 +328,7 @@ def test_web_start_purifying_model_blocks_without_duplicate_work_or_engine_start
     assert engine.started_with is None
 
 
-def test_web_start_purified_alternative_uses_trusted_purified_pt_for_a_module(tmp_path) -> None:
+def test_web_start_rejects_purified_runtime_replacement_in_production(tmp_path) -> None:
     purified = tmp_path / "purified.pt"
     purified.write_bytes(b"trusted-purified")
     engine = ReadyDetectionEngine()
@@ -342,37 +342,20 @@ def test_web_start_purified_alternative_uses_trusted_purified_pt_for_a_module(tm
             "source": "sample.mp4",
             "profile": "desktop_rtx",
             "ready_timeout_s": 0.1,
-            "custom_model": {
-                "enabled": True,
-                "path": "poisoned.pt",
-                "backend": "pytorch",
-                "model_family": "yolov5",
-            },
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 409
     data = response.json()
-    assert data["ok"] is True
+    assert data["ok"] is False
+    assert data["error"] == "production_model_replacement_forbidden"
     assert data["model_security"]["admission_status"] == "trusted"
     assert data["model_security"]["runtime_replacement"]["path"] == str(purified)
-    assert data["model_security_runtime_replacement"]["mode"] == "purified_runtime"
-    assert engine.started_with["custom_model"] == {
-        "enabled": True,
-        "path": str(purified),
-        "backend": "pytorch",
-        "model_family": "yolov5",
-        "source_pt_path": str(purified),
-    }
-    assert data["status"]["ready_for_preview"] is True
-    assert data["status"]["detector_ready"] is True
-    assert data["status"]["overlay_seq"] == 3
-    assert data["status"]["raw_boxes_count"] == 2
+    assert engine.started_with is None
     assert security.runtime_resolve_calls[0]["profile"] == "desktop_rtx"
 
 
-@pytest.mark.skip(reason="超前契约未实装:仅准入(admission-only)流未实装,旧准入逻辑自动扫描/净化并覆盖admission、无顶层next_action")
-def test_web_start_does_not_auto_remediate_suspicious_model(tmp_path) -> None:
+def test_web_start_rejects_custom_model_before_auto_remediation(tmp_path) -> None:
     purified = tmp_path / "auto_purified.pt"
     purified.write_bytes(b"trusted-purified")
     engine = ReadyDetectionEngine()
@@ -398,12 +381,9 @@ def test_web_start_does_not_auto_remediate_suspicious_model(tmp_path) -> None:
     assert response.status_code == 409
     data = response.json()
     assert data["ok"] is False
-    assert data["error"] == "model_security_blocked"
-    assert data["model_security"]["admission_status"] == "suspicious"
-    assert data["scan"] is None
-    assert data["purification"] is None
+    assert data["error"] == "production_model_locked"
     assert engine.started_with is None
-    assert security.prepare_calls[0]["auto_remediate"] is False
+    assert security.prepare_calls == []
 
 
 def test_web_overlay_returns_detection_records() -> None:

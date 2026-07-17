@@ -2,23 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
+from .ppe_postprocess import PPE_LABEL_ALIASES, canonical_ppe_label
 from .types import ROI
 
 
-_DEFAULT_CLASS_ALIASES = {
-    "human": "person",
-    "worker": "person",
-    "people": "person",
-    "man": "person",
-    "woman": "person",
-    "person_head": "head",
-    "bare_head": "head",
-    "no_helmet": "head",
-    "hardhat": "helmet",
-    "hard_hat": "helmet",
-    "safety_helmet": "helmet",
-    "hat": "helmet",
-}
+_DEFAULT_CLASS_ALIASES = dict(PPE_LABEL_ALIASES)
 
 
 class DetectionROIProvider:
@@ -56,7 +44,8 @@ class DetectionROIProvider:
 
     def normalize_label(self, label: str) -> str:
         normalized = str(label).strip().lower().replace(" ", "_").replace("-", "_")
-        return self.class_aliases.get(normalized, normalized)
+        aliased = self.class_aliases.get(normalized, normalized)
+        return canonical_ppe_label(aliased) or aliased
 
     def from_detections(
         self, boxes: list[list[int]], classes: list[int], confs: list[float]

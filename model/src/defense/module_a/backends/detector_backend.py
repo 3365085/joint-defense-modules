@@ -33,6 +33,9 @@ class DetectionFrameResult:
     artifact_path: str
     inference_ms: float
     raw_result: Any | None = None
+    preprocess_ms: float = 0.0
+    input_device: str = "host"
+    input_format: str = "bgr24"
 
     def class_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -90,6 +93,14 @@ class UltralyticsDetectorBackend:
         )
         self.image_size = int(image_size)
         self.model = YOLO(str(self.artifact_path))
+        self._cuda_resize_functional = None
+        self._cuda_resize_interpolation = None
+        if self.device.startswith("cuda"):
+            from torchvision.transforms import InterpolationMode
+            from torchvision.transforms.v2 import functional as vision_functional
+
+            self._cuda_resize_functional = vision_functional
+            self._cuda_resize_interpolation = InterpolationMode.BILINEAR
         configured_names = normalize_class_names(class_names)
         self.names = configured_names or self._normalize_names(getattr(self.model, "names", {}))
 
@@ -111,6 +122,107 @@ class UltralyticsDetectorBackend:
 
         result = self.model(image, **kwargs)[0]
         inference_ms = (time.perf_counter() - started) * 1000.0
+        return self._normalize_result(
+            result,
+            image=image,
+            inference_ms=inference_ms,
+            preprocess_ms=0.0,
+            input_device="host",
+            input_format="bgr24",
+            keep_raw_result=True,
+        )
+
+    def predict_cuda(self, cuda_rgbp: Any, *, image: np.ndarray) -> DetectionFrameResult:
+        """Run Ultralytics/TensorRT from an owned CUDA RGBP tensor.
+
+        ``cuda_rgbp`` is the stable D2D clone produced by the file decoder, not
+        a recyclable PyNv surface. Resize, normalization and dtype conversion
+        stay on the GPU; ``image`` is the separately materialized 640 BGR frame
+        consumed by Module A and used as the normalized result image.
+        """
+
+        import torch
+        if not isinstance(cuda_rgbp, torch.Tensor):
+            raise TypeError(
+                "predict_cuda requires torch.Tensor RGBP input, got "
+                f"{type(cuda_rgbp).__name__}"
+            )
+        if not cuda_rgbp.is_cuda:
+            raise ValueError(f"predict_cuda requires CUDA input, got {cuda_rgbp.device}")
+        tensor = cuda_rgbp
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim != 4 or int(tensor.shape[1]) != 3:
+            raise ValueError(
+                "predict_cuda requires BCHW/RGBP input, got "
+                f"shape={tuple(tensor.shape)!r}"
+            )
+
+        started = time.perf_counter()
+        preprocess_start_event = torch.cuda.Event(enable_timing=True)
+        preprocess_end_event = torch.cuda.Event(enable_timing=True)
+        preprocess_start_event.record()
+        tensor = tensor.to(device=self.device, non_blocking=True)
+        if tuple(int(v) for v in tensor.shape[-2:]) != (
+            self.image_size,
+            self.image_size,
+        ):
+            if self._cuda_resize_functional is None:
+                raise RuntimeError("cuda_uint8_resize_unavailable")
+            tensor = self._cuda_resize_functional.resize(
+                tensor,
+                [self.image_size, self.image_size],
+                interpolation=self._cuda_resize_interpolation,
+                antialias=False,
+            )
+        target_dtype = (
+            torch.float16
+            if self.half and self.device.startswith("cuda")
+            else torch.float32
+        )
+        tensor = tensor.to(dtype=target_dtype).div_(255.0)
+        tensor = tensor.contiguous()
+        preprocess_end_event.record()
+
+        result = self.model(
+            tensor,
+            verbose=False,
+            conf=self._prediction_confidence(),
+            imgsz=self.image_size,
+        )[0]
+        # The result normalization below reads boxes on the host and therefore
+        # establishes completion of inference. Synchronize only the preprocess
+        # event here instead of globally synchronizing twice per frame.
+        preprocess_end_event.synchronize()
+        preprocess_ms = float(
+            preprocess_start_event.elapsed_time(preprocess_end_event)
+        )
+        inference_ms = (time.perf_counter() - started) * 1000.0
+        return self._normalize_result(
+            result,
+            image=image,
+            inference_ms=inference_ms,
+            preprocess_ms=preprocess_ms,
+            input_device=str(tensor.device),
+            input_format="rgbp_fp16_normalized"
+            if tensor.dtype == torch.float16
+            else "rgbp_fp32_normalized",
+            # Raw Ultralytics plotting may retain/reinterpret the tensor input;
+            # use the stable host image in DetectionFrameResult.plot instead.
+            keep_raw_result=False,
+        )
+
+    def _normalize_result(
+        self,
+        result: Any,
+        *,
+        image: np.ndarray,
+        inference_ms: float,
+        preprocess_ms: float,
+        input_device: str,
+        input_format: str,
+        keep_raw_result: bool,
+    ) -> DetectionFrameResult:
         if not self.names:
             self.names = self._normalize_names(getattr(result, "names", {}))
 
@@ -134,7 +246,10 @@ class UltralyticsDetectorBackend:
             backend=self.backend,
             artifact_path=str(self.artifact_path),
             inference_ms=inference_ms,
-            raw_result=result,
+            raw_result=result if keep_raw_result else None,
+            preprocess_ms=float(preprocess_ms),
+            input_device=str(input_device),
+            input_format=str(input_format),
         )
 
     def close(self) -> None:

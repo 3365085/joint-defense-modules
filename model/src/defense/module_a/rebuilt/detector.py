@@ -1,60 +1,197 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import math
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path as _Path
 from typing import Any
 
 import cv2
 import numpy as np
 
+from .. import native_bridge as _NATIVE_BRIDGE
 from ..types import ROI, ModuleAInput, ModuleAResult
+from .a4_artifact import (
+    A4ArtifactValidationError,
+    load_a4_artifact_metadata,
+    validate_a4_artifact_metadata,
+)
+from .a4_patch_features import (
+    A4_PATCH_FEATURE_NAMES,
+    extract_a4_patch_features,
+)
 from .target_anchored import TargetAnchoredAnalyzer
 
-# 可选 Rust 原生加速：A1 LBP 直方图聚合（数值与 Python 等价，已对拍验证）。
-# 导入失败则自动回退纯 Python 实现，功能不受影响。
+A4_FEATURE_SCHEMA_VERSION = "rebuilt-a4-96-v4"
+_A4_PHYSICAL_FEATURE_NAMES: tuple[str, ...] = (
+    "a1.delta_h",
+    "a1.delta_h_roi_max",
+    "a1.delta_h_local_max",
+    "a1.delta_h_target_contrast",
+    "a1.a1_feature_score",
+    "a2.change_t",
+    "a2.change_t_roi_max",
+    "a2.change_t_local_max",
+    "a2.change_t_without_motion_target",
+    "a2.a2_feature_score",
+    "a3.f_flow",
+    "a3.flow_local_anomaly_ratio",
+    "a3.flow_residual",
+    "a3.flow_shape_score",
+    "a3.flow_target_relation",
+    "a3.a3_feature_score",
+)
+A4_FEATURE_NAMES: tuple[str, ...] = (
+    *_A4_PHYSICAL_FEATURE_NAMES,
+    *A4_PATCH_FEATURE_NAMES,
+    *tuple(
+        name.replace("a4_patch.", "a4_patch_delta.", 1)
+        for name in A4_PATCH_FEATURE_NAMES
+    ),
+)
+
+_A3B_GLOBAL_WORKER_LOCK = threading.Lock()
+_A3B_GLOBAL_WORKER_TOKENS: set[int] = set()
+_A3B_GLOBAL_WORKER_TOKEN_SEQ = 0
+_A3B_GLOBAL_WORKER_HARD_LIMIT = 2
+
+
+def _try_acquire_a3b_global_worker_token(limit: int) -> int | None:
+    global _A3B_GLOBAL_WORKER_TOKEN_SEQ
+    with _A3B_GLOBAL_WORKER_LOCK:
+        if len(_A3B_GLOBAL_WORKER_TOKENS) >= max(1, int(limit)):
+            return None
+        _A3B_GLOBAL_WORKER_TOKEN_SEQ += 1
+        token = _A3B_GLOBAL_WORKER_TOKEN_SEQ
+        _A3B_GLOBAL_WORKER_TOKENS.add(token)
+        return token
+
+
+def _release_a3b_global_worker_token(token: int) -> None:
+    with _A3B_GLOBAL_WORKER_LOCK:
+        _A3B_GLOBAL_WORKER_TOKENS.discard(int(token))
+
+
+def _a3b_global_live_worker_count() -> int:
+    with _A3B_GLOBAL_WORKER_LOCK:
+        return len(_A3B_GLOBAL_WORKER_TOKENS)
+
+
 try:
-    import module_a_native as _NATIVE
-except Exception:
+    _NATIVE = _NATIVE_BRIDGE.require_native()
+except RuntimeError:
     _NATIVE = None
 
-from pathlib import Path as _Path
+
+def _file_sha256(path: _Path | str | None) -> str | None:
+    if not path:
+        return None
+    resolved = _Path(path)
+    if not resolved.is_file():
+        return None
+    digest = hashlib.sha256()
+    try:
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest().upper()
 
 
 def _resolve_rebuilt_data_dir() -> _Path:
-    """Resolve the data directory holding a4_classifier.pkl and raft_small_* assets.
+    """Resolve main-project data for A4 and RAFT auxiliary artifacts.
 
     Candidate order (first existing wins):
-      1. ``MODULE_A_REBUILT_DATA_DIR`` env var
-      2. ``defense/module_a/rebuilt/data`` (bundled next to this package)
-      3. ``model/data`` (main project data dir)
-      4. ``<repo>/rebuilt_demo/data`` (read-only demo source; reused in place)
-    Returns candidate 2 as the writable default when none exist yet (so the
-    RAFT engine build can create it).
+      1. ``MODULE_A_ARTIFACT_DIR`` env var
+      2. ``model/runtime/artifacts/module_a``
+      3. ``defense/module_a/rebuilt/data`` (bundled next to this package)
+      4. ``model/data`` (main project data dir)
+    Returns candidate 2 as the conventional default when none exist. Runtime
+    initialization treats these locations as read-only and never downloads or
+    builds missing RAFT assets.
     """
     import os
 
     here = _Path(__file__).resolve()
     candidates: list[_Path] = []
-    env_dir = os.environ.get("MODULE_A_REBUILT_DATA_DIR")
+    env_dir = os.environ.get("MODULE_A_ARTIFACT_DIR")
     if env_dir:
         candidates.append(_Path(env_dir))
+    candidates.append(here.parents[4] / "runtime" / "artifacts" / "module_a")
     candidates.append(here.parent / "data")              # defense/module_a/rebuilt/data
     candidates.append(here.parents[4] / "data")          # model/data
-    candidates.append(here.parents[5] / "rebuilt_demo" / "data")  # repo/rebuilt_demo/data (read-only)
     for cand in candidates:
         try:
             if cand.exists():
                 return cand
         except OSError:
             continue
-    return here.parent / "data"
+    return here.parents[4] / "runtime" / "artifacts" / "module_a"
 
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return float(max(lo, min(hi, value)))
+
+
+def _projection_peak_lines(
+    values: np.ndarray,
+    limit: int,
+    min_gap: int,
+) -> list[tuple[int, float]]:
+    """Return strong projection-line centers without scanning bins in Python."""
+
+    if values.size == 0:
+        return []
+    vmax = float(np.max(values))
+    if vmax <= 1e-6:
+        return []
+    norm = values.astype(np.float32) / vmax
+    threshold = max(0.18, float(np.percentile(norm, 88)) * 0.82)
+    above_threshold = norm >= threshold
+    padded = np.concatenate(
+        (
+            np.asarray([False], dtype=np.bool_),
+            above_threshold,
+            np.asarray([False], dtype=np.bool_),
+        )
+    )
+    transitions = np.flatnonzero(padded[1:] != padded[:-1])
+    groups: list[tuple[int, float]] = []
+    for start, end in zip(
+        transitions[0::2],
+        transitions[1::2],
+        strict=True,
+    ):
+        segment = norm[start:end]
+        weights = segment + 1e-4
+        center = int(
+            round(
+                float(
+                    np.average(
+                        np.arange(start, end),
+                        weights=weights,
+                    )
+                )
+            )
+        )
+        groups.append((center, float(np.max(segment))))
+    groups.sort(key=lambda item: item[1], reverse=True)
+    selected: list[tuple[int, float]] = []
+    for center, strength in groups:
+        if all(
+            abs(center - old_center) >= min_gap
+            for old_center, _ in selected
+        ):
+            selected.append((center, strength))
+        if len(selected) >= limit:
+            break
+    selected.sort(key=lambda item: item[0])
+    return selected
 
 
 def _score(value: float, floor: float, ceil: float) -> float:
@@ -242,10 +379,74 @@ class ModuleADetector:
     preserving the public ModuleAInput / ModuleAResult contract.
     """
 
+    _A3B_CLOSE_JOIN_BUDGET_SECONDS = 1.0
+
+    def _refresh_native_status(self) -> None:
+        status = _NATIVE_BRIDGE.status()
+        status.update(
+            {
+                "hit_counts": dict(self.native_hit_counts),
+                "fallback_counts": dict(self.native_fallback_counts),
+                "enabled_stages": sorted(
+                    stage
+                    for stage, count in self.native_hit_counts.items()
+                    if int(count) > 0
+                ),
+                "last_error": self.native_last_error,
+            }
+        )
+        self.native_status = status
+
+    def _native_call(
+        self,
+        stage: str,
+        function_name: str,
+        *args: Any,
+    ) -> Any | None:
+        if _NATIVE is None:
+            self.native_fallback_counts[stage] += 1
+            self._native_status_dirty = True
+            return None
+        try:
+            function = getattr(_NATIVE, function_name)
+            value = function(*args)
+        except Exception as exc:
+            self.native_fallback_counts[stage] += 1
+            self.native_last_error = (
+                f"{stage}:{function_name}:{type(exc).__name__}:{exc}"
+            )
+            self._native_status_dirty = True
+            return None
+        self.native_hit_counts[stage] += 1
+        self._native_status_dirty = True
+        return value
+
     def __init__(self, config: dict[str, Any] | None = None):
         module_config = (config or {}).get("module_a", config or {})
+        self.native_hit_counts: dict[str, int] = {
+            "a1": 0,
+            "a2": 0,
+            "a3": 0,
+            "a3b": 0,
+            "blind": 0,
+        }
+        self.native_fallback_counts: dict[str, int] = {
+            "a1": 0,
+            "a2": 0,
+            "a3": 0,
+            "a3b": 0,
+            "blind": 0,
+        }
+        self.native_last_error: str | None = None
+        self.native_status: dict[str, Any] = {}
+        self._refresh_native_status()
         self.frame_size = int(module_config.get("frame_size", 640))
         self.theta_adv = float(module_config.get("rebuilt_theta_adv", 0.65))
+        # Rule fallback keeps the configured threshold.  A bound production
+        # classifier may carry a threshold selected by grouped CV/heldout
+        # gates; keep it separate so classifier calibration does not silently
+        # change fallback behaviour.
+        self.a4_classifier_decision_threshold = float(self.theta_adv)
         self.theta_media = float(module_config.get("rebuilt_theta_media", 0.55))
         self.theta_media_raw = float(module_config.get("rebuilt_theta_media_raw", 0.50))
         # A3b 静态媒体/翻拍作为独立报警触发器: demo 内核移植时禁用(背景结构墙/门框会误报, 原计划改喂
@@ -270,6 +471,24 @@ class ModuleADetector:
         self._a3b_gate_border_contrast_min = float(
             module_config.get("rebuilt_a3b_gate_border_contrast_min", 0.80)
         )
+        self._a3b_gate_aspect_ratio_min = max(
+            0.0,
+            float(
+                module_config.get(
+                    "rebuilt_a3b_soft_gate_aspect_ratio_min",
+                    0.40,
+                )
+            ),
+        )
+        self._a3b_gate_aspect_ratio_max = max(
+            self._a3b_gate_aspect_ratio_min,
+            float(
+                module_config.get(
+                    "rebuilt_a3b_soft_gate_aspect_ratio_max",
+                    2.50,
+                )
+            ),
+        )
         # A3b 独立触发的持续段确认(2026-07-12): 实测干净误报段只是偶发 6-12 帧蒙过收紧门, 而真翻拍
         # 持续 ~192 帧过门。要求累计过门帧数 _media_run >= floor(默认15)才确认, 利用"真翻拍持续存在 vs
         # 误报偶发闪烁"的本质差异挡掉偶发负例, 不过拟合具体场景。容忍段内间隙。
@@ -281,6 +500,18 @@ class ModuleADetector:
         # 这类攻击"抹掉"纹理→A1/A2 反而低于干净帧，靠 A4(支路A) 检不出；改用"相对场景自身
         # 基线的清晰度/对比度/YOLO置信度骤降"来判定（绝对值高的焊接/快动场景不会误报）。
         self.theta_blind = float(module_config.get("rebuilt_theta_blind", 0.55))
+        self._blind_confirm_ratio = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    module_config.get(
+                        "rebuilt_blind_confirm_ratio",
+                        0.60,
+                    )
+                ),
+            ),
+        )
         self._blind_enabled = bool(module_config.get("rebuilt_blind_branch", True))
         # 致盲疑似期冻结基线(2026-07-12 修 glare 008/016 掉零): 完全致盲攻击(强光/去信号)会让
         # YOLO 持续丢目标, 而这些模糊/暗帧因 p_blind 未过阈不被冻结→被吸进场景基线→基线"适应"攻击→
@@ -323,17 +554,137 @@ class ModuleADetector:
         self._scene_baseline_min = int(module_config.get("rebuilt_scene_baseline_min", 8))
         # 问题3修复：A1基线冷启动帧数（前N帧强制更新基线，避免攻击帧污染基线）
         self._bootstrap_frames = int(module_config.get("a1_bootstrap_frames", 8))
-        # A4 可插拔分类器：demo 默认接 rebuilt_demo/data/a4_classifier.pkl（用当前检测器重采
-        # 特征+分组CV调参重训）。config 可覆盖；缺失/失败自动回退手工规则。不碰主项目配置。
+        # A4 可插拔分类器由主项目配置显式管理。缺失/失败必须记录并回退手工规则，
+        # 不再搜索或读取外部 demo 目录。
         # 注：分组CV(防泄漏)真实泛化 AUC≈0.70（特征+攻击样本有限），对训练内视频效果好。
         _clf_path = str(module_config.get("a4_classifier_path", "") or "")
-        if not _clf_path:
-            _bundled = _resolve_rebuilt_data_dir() / "a4_classifier.pkl"
-            if _bundled.exists():
-                _clf_path = str(_bundled)
-        self._classifier = self._load_classifier(_clf_path)
+        self.a4_classifier_configured = bool(_clf_path)
+        self.a4_classifier_loaded = False
+        self.a4_classifier_error: str | None = None
+        self.a4_classifier_metadata: dict[str, Any] = {}
+        self.a4_classifier_alarm_window = 8
+        self.a4_classifier_alarm_required_hits = 5
+        self.a4_classifier_fallback_reason = (
+            "not_configured" if not _clf_path else "load_pending"
+        )
+        self._a4_classifier_runtime_disabled = False
+        self.a4_classifier_path = _clf_path or None
+        self.a4_classifier_resolved_path = (
+            str(self._resolve_classifier_path(_clf_path))
+            if _clf_path
+            else None
+        )
+        self.a4_classifier_sha256 = _file_sha256(
+            self.a4_classifier_resolved_path
+        )
+        self.a4_classifier_expected_sha256 = str(
+            module_config.get("a4_classifier_sha256", "") or ""
+        ).strip().upper() or None
+        if (
+            self.a4_classifier_expected_sha256
+            and self.a4_classifier_sha256
+            != self.a4_classifier_expected_sha256
+        ):
+            self._classifier = None
+            self.a4_classifier_error = (
+                "a4_classifier_sha256_mismatch:"
+                f"expected={self.a4_classifier_expected_sha256}:"
+                f"actual={self.a4_classifier_sha256}"
+            )
+            self.a4_classifier_fallback_reason = "sha256_mismatch"
+        else:
+            self._classifier = self._load_classifier(
+                self.a4_classifier_resolved_path or ""
+            )
+        if self._classifier is not None:
+            raw_classifier_threshold = self.a4_classifier_metadata.get(
+                "selected_threshold",
+                self.theta_adv,
+            )
+            try:
+                classifier_threshold = float(raw_classifier_threshold)
+            except (TypeError, ValueError):
+                classifier_threshold = float("nan")
+            if (
+                not math.isfinite(classifier_threshold)
+                or classifier_threshold <= 0.0
+                or classifier_threshold >= 1.0
+            ):
+                self._classifier = None
+                self.a4_classifier_error = (
+                    "a4_classifier_decision_threshold_invalid:"
+                    f"{raw_classifier_threshold!r}"
+                )
+                self.a4_classifier_fallback_reason = (
+                    "decision_threshold_invalid"
+                )
+            else:
+                self.a4_classifier_decision_threshold = (
+                    classifier_threshold
+                )
+                self.a4_classifier_alarm_window = int(
+                    self.a4_classifier_metadata.get("alarm_window", 8)
+                )
+                self.a4_classifier_alarm_required_hits = int(
+                    self.a4_classifier_metadata.get(
+                        "alarm_required_hits",
+                        5,
+                    )
+                )
+        if self._classifier is not None:
+            self.a4_classifier_loaded = True
+            self.a4_classifier_error = None
+            self.a4_classifier_fallback_reason = "none"
+        elif self.a4_classifier_configured and self.a4_classifier_error is None:
+            self.a4_classifier_error = "classifier_loader_returned_none"
+            self.a4_classifier_fallback_reason = "load_failed"
+
+        self.light_flow_enabled = bool(
+            module_config.get("light_flow_enabled", True)
+        )
+        self.light_flow_interval = max(
+            1,
+            int(module_config.get("light_flow_interval", 1)),
+        )
+        self._flow_frame_count = 0
+        self.flow_requested_device = self._normalize_flow_device(
+            module_config.get("device", "cuda:0")
+        )
+        self.flow_effective_device = "disabled"
+        self.flow_backend = "disabled"
+        self.flow_fallback_reason = (
+            "disabled_by_config" if not self.light_flow_enabled else "initializing"
+        )
+        configured_raft_path = _Path(
+            str(module_config.get("raft_engine_path", "") or "")
+        ).expanduser()
+        if configured_raft_path.is_absolute():
+            resolved_raft_path = configured_raft_path.resolve(strict=False)
+        elif str(configured_raft_path):
+            resolved_raft_path = (
+                _Path(__file__).resolve().parents[4]
+                / configured_raft_path
+            ).resolve(strict=False)
+        else:
+            resolved_raft_path = (
+                _resolve_rebuilt_data_dir()
+                / "raft_small_fp16_256.engine"
+            ).resolve(strict=False)
+        self.flow_artifact_path = str(resolved_raft_path)
+        self.flow_artifact_sha256 = _file_sha256(
+            self.flow_artifact_path
+        )
+        self.flow_artifact_expected_sha256 = str(
+            module_config.get("raft_engine_sha256", "") or ""
+        ).strip().upper() or None
         self._flownet = self._load_flownet()
-        self.max_history = 8
+        self._finalize_flow_contract_after_load()
+        self._gpu_lbp_disabled = False
+        self.lbp_backend = (
+            "gpu" if self._flownet is not None else "cpu"
+        )
+        self.lbp_fallback_reason = "none"
+        self.max_history = max(8, self.a4_classifier_alarm_window)
         self.prev_gray: np.ndarray | None = None
         self.prev_lbp: np.ndarray | None = None
         self.prev_timestamp: float | None = None
@@ -346,6 +697,9 @@ class ModuleADetector:
         self.adv_hits: deque[int] = deque(maxlen=self.max_history)
         self.adv_scores: deque[float] = deque(maxlen=self.max_history)
         self.adv_support_hits: deque[int] = deque(maxlen=self.max_history)
+        self.classifier_adv_hits: deque[int] = deque(
+            maxlen=self.a4_classifier_alarm_window
+        )
         self.media_hits: deque[int] = deque(maxlen=self.max_history)
         self.media_scores: deque[float] = deque(maxlen=self.max_history)
         # 支路B 时序确认窗口（与 adv 同机制）
@@ -355,6 +709,14 @@ class ModuleADetector:
         # 短暂掉到 N-of-M 阈值以下时 alert_confirmed 立刻翻回正常（"断警告"）。
         # 经 module_a.rebuilt_alert_hold_frames 配置，<=0 关闭。对齐 legacy attack_state_hold。
         self._alert_hold_frames = int(module_config.get("rebuilt_alert_hold_frames", 12))
+        # A3b background evidence is intentionally sampled/verified
+        # asynchronously and may have short gaps while the physical display is
+        # still present.  Give only the already-confirmed media channel a longer
+        # bounded hold; ADV/blind keep the original window.
+        self._a3b_alert_hold_frames = max(
+            self._alert_hold_frames,
+            int(module_config.get("rebuilt_a3b_alert_hold_frames", 45)),
+        )
         # 报警保持刷新(2026-07-12 修"攻击持续但报警断裂"): 原 held 单调递减、不感知攻击传感器
         # 是否仍在响, 12帧一到就掉回正常。攻击持续期(p_adv 全程高)逐帧候选被抑制门轮流否决→
         # N-of-M 确认失效→held 撑不过候选枯竭段→报警断成多段。开启后: held 递减前若原始 p_adv 仍
@@ -365,11 +727,12 @@ class ModuleADetector:
         )
         self._alert_hold_remaining = 0
         self._alert_hold_channel = "none"
-        # 候选连续性桥接(2026-06-30 修 adv_patch 漏报):抑制门在持续高 p_adv 段偶发翻假会把连续
-        # 候选打散,N-of-M 确认失败。近 K 帧内有过被放行的 adv 候选且本帧 p_adv 仍触发时,即便本帧
-        # adv_candidate_allowed 翻假也桥接为候选。config rebuilt_adv_candidate_bridge_frames(默认4=当前口径)。
+        # 候选连续性桥接(2026-06-30 修 adv_patch 漏报):仅在短窗内保留最近有效候选的独立物理
+        # 支持血统，防止 raw p_adv 在正常运动/正常场景门已否决后自行制造候选。
+        # config rebuilt_adv_candidate_bridge_frames(默认4=当前口径)。
         self._adv_cand_bridge_frames = int(module_config.get("rebuilt_adv_candidate_bridge_frames", 4))
         self._adv_cand_bridge_remaining = 0
+        self._adv_cand_bridge_has_physical_support = False
         # C1(2026-06-30 修 016 多人交叉干净误报的"基线冻结跑飞"): A1 单支饱和的未确认候选不冻结
         # 场景基线,让基线学到本场景纹理常态→z-score 抑制恢复;带 A2/A3 佐证的候选(真实结构/致盲攻击)
         # 仍冻结,不影响攻击检出。config rebuilt_scene_baseline_a1only_carveout(默认开)。
@@ -440,15 +803,89 @@ class ModuleADetector:
         # P4 实验性开关：默认关(运行时零开销)。开启后 process() 会算 P4 5 维加入 a4_feature_vector。
         # 见 doc/optimization-roadmap.md「P4 已被数据否决」小节。
         self._p4_enabled = bool(module_config.get("rebuilt_p4_enabled", False))
+        self._a4_patch_feature_interval = max(
+            1,
+            int(module_config.get("rebuilt_a4_patch_feature_interval", 2)),
+        )
+        self._a4_classifier_rescue_underexposed_max = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    module_config.get(
+                        "rebuilt_a4_classifier_rescue_underexposed_max",
+                        0.55,
+                    )
+                ),
+            ),
+        )
+        self._a4_patch_feature_cache: tuple[float, ...] | None = None
+        self._a4_patch_baseline_vectors: deque[tuple[float, ...]] = deque(
+            maxlen=12
+        )
         self.media_track: _MediaTrack | None = None
+        self.static_image_enabled = bool(module_config.get("static_image_enabled", True))
         # a3b 后台检测间隔（帧）。可经 config 的 module_a.static_image_interval 覆盖。
         # 注：真正消除 a3b GIL 拖累的是 _extract_media_candidates 的候选数上限优化
         # （单轮 221ms→16ms），而非拉大此间隔，故保持原值不牺牲静态媒体检测响应速度。
-        self._a3b_interval = int(module_config.get("static_image_interval", 4))
+        self._a3b_interval = max(
+            1,
+            int(module_config.get("static_image_interval", 4)),
+        )
+        self._a3b_worker_timeout_s = max(
+            0.0,
+            float(module_config.get("static_image_worker_timeout_s", 3.0)),
+        )
+        self._a3b_result_lease_s = max(
+            0.0,
+            float(module_config.get("static_image_result_lease_s", 5.0)),
+        )
+        self._a3b_max_retired_workers = max(
+            1,
+            int(module_config.get("static_image_max_retired_workers", 2)),
+        )
+        self._a3b_global_worker_limit = max(
+            1,
+            min(
+                _A3B_GLOBAL_WORKER_HARD_LIMIT,
+                int(
+                    module_config.get(
+                        "static_image_global_worker_limit",
+                        _A3B_GLOBAL_WORKER_HARD_LIMIT,
+                    )
+                ),
+            ),
+        )
         self._a3b_frame_count = 0
         self._a3b_cache: dict[str, Any] | None = None
         self._a3b_bg_thread: threading.Thread | None = None
+        self._a3b_retired_threads: list[threading.Thread] = []
         self._a3b_bg_result: dict[str, Any] | None = None
+        self._a3b_bg_lock = threading.Lock()
+        self._a3b_generation = 0
+        self._a3b_error_count = 0
+        self._a3b_last_error: str | None = None
+        self._a3b_last_error_at: float | None = None
+        self._a3b_last_success_at: float | None = None
+        self._a3b_source_frame_idx: int | None = None
+        self._a3b_source_timestamp: float | None = None
+        self._a3b_last_attempt_frame_idx: int | None = None
+        self._a3b_last_attempt_timestamp: float | None = None
+        self._a3b_active_worker_started_at: float | None = None
+        self._a3b_active_worker_started_monotonic: float | None = None
+        self._a3b_active_worker_frame_idx: int | None = None
+        self._a3b_active_worker_timestamp: float | None = None
+        self._a3b_active_worker_token: int | None = None
+        self._a3b_timed_out_worker_count = 0
+        self._a3b_worker_rejected_count = 0
+        self._a3b_last_worker_rejected_at: float | None = None
+        self._a3b_result_published_at: float | None = None
+        self._a3b_result_published_monotonic: float | None = None
+        self._a3b_result_expired_count = 0
+        self._a3b_result_seq = 0
+        self._a3b_last_consumed_result_seq = 0
+        self._a3b_last_consumed_source_frame_idx: int | None = None
+        self._a3b_last_consumed_source_timestamp: float | None = None
         self.a1_visibility_hold_score = 0.0
         self.a1_visibility_hold_frames = 0
         self.a3_residual_hold_score = 0.0
@@ -460,6 +897,12 @@ class ModuleADetector:
         self.a3b_display_score = 0.0
         self.a4_display_score = 0.0
         self.primary_display_score = 0.0
+        self.target_anchored_diagnostics_enabled = bool(
+            module_config.get(
+                "rebuilt_target_anchored_diagnostics",
+                False,
+            )
+        )
         self._ta = TargetAnchoredAnalyzer(
             allow_global_fallback=bool(module_config.get("target_anchored_global_fallback", True)),
             global_fallback_overexposure_threshold=float(
@@ -480,9 +923,13 @@ class ModuleADetector:
         self.lbp_baseline = None
         self.lbp_baseline_samples = 0
         self.process_fps = 15.0
+        self._flow_frame_count = 0
+        self._a4_patch_feature_cache = None
+        self._a4_patch_baseline_vectors.clear()
         self.adv_hits.clear()
         self.adv_scores.clear()
         self.adv_support_hits.clear()
+        self.classifier_adv_hits.clear()
         self.media_hits.clear()
         self.media_scores.clear()
         self.blind_hits.clear()
@@ -490,6 +937,7 @@ class ModuleADetector:
         self._alert_hold_remaining = 0
         self._alert_hold_channel = "none"
         self._adv_cand_bridge_remaining = 0
+        self._adv_cand_bridge_has_physical_support = False
         self._adv_run = 0
         self._adv_run_gap = 0
         self._adv_run_escalated = False
@@ -504,11 +952,35 @@ class ModuleADetector:
         self._sb_detstr.clear()
         self._sb_maxfeat.clear()
         self._prev_sharp = 0.0
-        self.media_track = None
         self._a3b_frame_count = 0
         self._a3b_cache = None
-        self._a3b_bg_thread = None
-        self._a3b_bg_result = None
+        with self._a3b_bg_lock:
+            self._a3b_generation += 1
+            self.media_track = None
+            self._prune_a3b_workers_locked()
+            current = self._a3b_bg_thread
+            if current is not None and current.is_alive():
+                self._a3b_retired_threads.append(current)
+            self._a3b_bg_thread = None
+            self._a3b_active_worker_token = None
+            self._clear_a3b_active_worker_metadata_locked()
+            self._clear_a3b_result_locked()
+            self._a3b_error_count = 0
+            self._a3b_last_error = None
+            self._a3b_last_error_at = None
+            self._a3b_last_success_at = None
+            self._a3b_source_frame_idx = None
+            self._a3b_source_timestamp = None
+            self._a3b_last_attempt_frame_idx = None
+            self._a3b_last_attempt_timestamp = None
+            self._a3b_timed_out_worker_count = 0
+            self._a3b_worker_rejected_count = 0
+            self._a3b_last_worker_rejected_at = None
+            self._a3b_result_expired_count = 0
+            self._a3b_result_seq = 0
+            self._a3b_last_consumed_result_seq = 0
+            self._a3b_last_consumed_source_frame_idx = None
+            self._a3b_last_consumed_source_timestamp = None
         self.a1_visibility_hold_score = 0.0
         self.a1_visibility_hold_frames = 0
         self.a3_residual_hold_score = 0.0
@@ -520,16 +992,352 @@ class ModuleADetector:
         self.a3b_display_score = 0.0
         self.a4_display_score = 0.0
         self.primary_display_score = 0.0
+        self._ta.reset()
 
-    def _run_a3b_bg(self, gray, rois, width, height, exposure, flow, a1, a2, a3):
+    def close(self) -> None:
+        deadline = time.monotonic() + self._A3B_CLOSE_JOIN_BUDGET_SECONDS
+        self._a3b_frame_count = 0
+        self._a3b_cache = None
+        with self._a3b_bg_lock:
+            self._a3b_generation += 1
+            self._prune_a3b_workers_locked()
+            current = self._a3b_bg_thread
+            if current is not None and current.is_alive():
+                self._a3b_retired_threads.append(current)
+            self._a3b_bg_thread = None
+            self._a3b_active_worker_token = None
+            self._clear_a3b_active_worker_metadata_locked()
+            self.media_track = None
+            self._clear_a3b_result_locked()
+            self._a3b_error_count = 0
+            self._a3b_last_error = None
+            self._a3b_last_error_at = None
+            self._a3b_last_success_at = None
+            self._a3b_source_frame_idx = None
+            self._a3b_source_timestamp = None
+            self._a3b_last_attempt_frame_idx = None
+            self._a3b_last_attempt_timestamp = None
+            self._a3b_timed_out_worker_count = 0
+            self._a3b_worker_rejected_count = 0
+            self._a3b_last_worker_rejected_at = None
+            self._a3b_result_expired_count = 0
+            self._a3b_result_seq = 0
+            self._a3b_last_consumed_result_seq = 0
+            self._a3b_last_consumed_source_frame_idx = None
+            self._a3b_last_consumed_source_timestamp = None
+            workers = list(dict.fromkeys(self._a3b_retired_threads))
+
+        current_thread = threading.current_thread()
+        joinable = [worker for worker in workers if worker is not current_thread]
+        for index, worker in enumerate(joinable):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            worker.join(timeout=remaining / (len(joinable) - index))
+
+        with self._a3b_bg_lock:
+            self._prune_a3b_workers_locked()
+
+    def _prune_a3b_workers_locked(self) -> None:
+        current = self._a3b_bg_thread
+        if current is not None and not current.is_alive():
+            self._a3b_bg_thread = None
+            self._clear_a3b_active_worker_metadata_locked()
+        self._a3b_retired_threads[:] = [
+            worker for worker in self._a3b_retired_threads if worker.is_alive()
+        ]
+
+    def _clear_a3b_active_worker_metadata_locked(self) -> None:
+        self._a3b_active_worker_started_at = None
+        self._a3b_active_worker_started_monotonic = None
+        self._a3b_active_worker_frame_idx = None
+        self._a3b_active_worker_timestamp = None
+
+    def _clear_a3b_result_locked(self) -> None:
+        self._a3b_bg_result = None
+        self._a3b_result_published_at = None
+        self._a3b_result_published_monotonic = None
+
+    def _expire_stale_a3b_result_locked(self) -> bool:
+        published = self._a3b_result_published_monotonic
+        if (
+            self._a3b_bg_result is None
+            or published is None
+            or self._a3b_result_lease_s <= 0.0
+        ):
+            return False
+        result_age_s = max(0.0, time.monotonic() - published)
+        if result_age_s < self._a3b_result_lease_s:
+            return False
+        self._clear_a3b_result_locked()
+        self._a3b_result_expired_count += 1
+        return True
+
+    def _expire_hung_a3b_worker_locked(self) -> bool:
+        self._prune_a3b_workers_locked()
+        current = self._a3b_bg_thread
+        started = self._a3b_active_worker_started_monotonic
+        if (
+            current is None
+            or self._a3b_active_worker_token is None
+            or started is None
+            or self._a3b_worker_timeout_s <= 0.0
+        ):
+            return False
+        worker_age_s = max(0.0, time.monotonic() - started)
+        if worker_age_s < self._a3b_worker_timeout_s:
+            return False
+
+        # Python threads cannot be force-killed safely.  Invalidate this
+        # generation so a late return cannot publish, move the worker to the
+        # bounded retired pool, and allow at most one replacement while the
+        # total retired-worker limit still has capacity.
+        self._a3b_generation += 1
+        self._clear_a3b_result_locked()
+        self._a3b_error_count += 1
+        self._a3b_timed_out_worker_count += 1
+        self._a3b_last_error = (
+            "TimeoutError: A3b background worker exceeded "
+            f"{self._a3b_worker_timeout_s:.3f}s"
+        )
+        self._a3b_last_error_at = time.time()
+        if current.is_alive() and current not in self._a3b_retired_threads:
+            self._a3b_retired_threads.append(current)
+        self._a3b_bg_thread = None
+        self._a3b_active_worker_token = None
+        self._clear_a3b_active_worker_metadata_locked()
+        return True
+
+    def _run_a3b_bg(
+        self,
+        generation,
+        worker_token,
+        frame_idx,
+        timestamp,
+        gray,
+        rois,
+        width,
+        height,
+        exposure,
+        flow,
+        a1,
+        a2,
+        a3,
+        source_fps,
+        source_interval_frames,
+    ):
+        current_thread = threading.current_thread()
         try:
-            self._a3b_bg_result = self._compute_a3b(gray, rois, width, height, exposure, flow, a1, a2, a3)
-        except Exception:
-            pass
+            try:
+                with self._a3b_bg_lock:
+                    if (
+                        generation != self._a3b_generation
+                        or not self.static_image_enabled
+                    ):
+                        return
+                    media_track = copy.deepcopy(self.media_track)
+                worker_detector = copy.copy(self)
+                worker_detector.media_track = media_track
+                result_payload = dict(worker_detector._compute_a3b(
+                    gray, rois, width, height, exposure, flow, a1, a2, a3
+                ))
+            except Exception as exc:
+                with self._a3b_bg_lock:
+                    if (
+                        generation != self._a3b_generation
+                        or not self.static_image_enabled
+                    ):
+                        return
+                    self._complete_a3b_worker_locked(
+                        worker_token,
+                        current_thread,
+                    )
+                    self._record_a3b_worker_failure_locked(
+                        exc,
+                        frame_idx=frame_idx,
+                        timestamp=timestamp,
+                    )
+                return
 
-    @staticmethod
-    def _empty_a3b() -> dict[str, Any]:
+            completed_at = time.time()
+            completed_monotonic = time.monotonic()
+            with self._a3b_bg_lock:
+                if (
+                    generation != self._a3b_generation
+                    or not self.static_image_enabled
+                ):
+                    return
+                # Mark business completion atomically before publishing.  A
+                # thread remains ``is_alive()`` until its target returns, so
+                # relying only on Thread.is_alive() creates a race where a
+                # just-published result can be immediately timed out.
+                self._complete_a3b_worker_locked(
+                    worker_token,
+                    current_thread,
+                )
+                previous_media_track = self.media_track
+                previous_result_seq = self._a3b_result_seq
+                previous_last_success_at = self._a3b_last_success_at
+                previous_source_frame_idx = self._a3b_source_frame_idx
+                previous_source_timestamp = self._a3b_source_timestamp
+                try:
+                    self.media_track = worker_detector.media_track
+                    self._a3b_result_seq = previous_result_seq + 1
+                    self._a3b_last_success_at = completed_at
+                    self._a3b_source_frame_idx = int(frame_idx)
+                    self._a3b_source_timestamp = float(timestamp)
+                    self._a3b_last_attempt_frame_idx = int(frame_idx)
+                    self._a3b_last_attempt_timestamp = float(timestamp)
+                    self._a3b_result_published_at = completed_at
+                    self._a3b_result_published_monotonic = (
+                        completed_monotonic
+                    )
+                    published = dict(result_payload)
+                    published["a3b_source_fps"] = float(source_fps)
+                    published["a3b_source_interval_frames"] = max(
+                        1,
+                        int(source_interval_frames),
+                    )
+                    published.update(self._a3b_diagnostics_locked())
+                except Exception as exc:
+                    self.media_track = previous_media_track
+                    self._a3b_result_seq = previous_result_seq
+                    self._a3b_last_success_at = previous_last_success_at
+                    self._a3b_source_frame_idx = previous_source_frame_idx
+                    self._a3b_source_timestamp = previous_source_timestamp
+                    self._record_a3b_worker_failure_locked(
+                        exc,
+                        frame_idx=frame_idx,
+                        timestamp=timestamp,
+                    )
+                    return
+                self._a3b_bg_result = published
+        finally:
+            with self._a3b_bg_lock:
+                self._complete_a3b_worker_locked(
+                    worker_token,
+                    current_thread,
+                )
+            _release_a3b_global_worker_token(worker_token)
+
+    def _complete_a3b_worker_locked(
+        self,
+        worker_token: int,
+        current_thread: threading.Thread,
+    ) -> None:
+        if (
+            self._a3b_active_worker_token == worker_token
+            and self._a3b_bg_thread is current_thread
+        ):
+            self._a3b_active_worker_token = None
+            self._clear_a3b_active_worker_metadata_locked()
+
+    def _record_a3b_worker_failure_locked(
+        self,
+        exc: Exception,
+        *,
+        frame_idx: int,
+        timestamp: float,
+    ) -> None:
+        # Any newer attempt failure—including result normalization or publish
+        # preparation—invalidates the previous payload.  This prevents an old
+        # confirmed bbox from being relabeled as a fresh/new-seq result.
+        self._clear_a3b_result_locked()
+        self._a3b_error_count += 1
+        self._a3b_last_error = f"{type(exc).__name__}: {exc}"
+        self._a3b_last_error_at = time.time()
+        self._a3b_last_attempt_frame_idx = int(frame_idx)
+        self._a3b_last_attempt_timestamp = float(timestamp)
+
+    def _a3b_diagnostics_locked(self) -> dict[str, Any]:
+        self._prune_a3b_workers_locked()
+        active_worker_age_s = 0.0
+        if self._a3b_active_worker_started_monotonic is not None:
+            active_worker_age_s = max(
+                0.0,
+                time.monotonic() - self._a3b_active_worker_started_monotonic,
+            )
+        result_age_s = 0.0
+        if self._a3b_result_published_monotonic is not None:
+            result_age_s = max(
+                0.0,
+                time.monotonic() - self._a3b_result_published_monotonic,
+            )
+        result_fresh = bool(
+            self._a3b_result_published_monotonic is not None
+            and (
+                self._a3b_result_lease_s <= 0.0
+                or result_age_s < self._a3b_result_lease_s
+            )
+        )
+        local_schedule_blocked = bool(
+            self._a3b_bg_thread is None
+            and len(self._a3b_retired_threads)
+            >= self._a3b_max_retired_workers
+        )
+        global_live_worker_count = _a3b_global_live_worker_count()
+        global_schedule_blocked = bool(
+            self._a3b_bg_thread is None
+            and global_live_worker_count >= self._a3b_global_worker_limit
+        )
+        schedule_blocked = bool(
+            local_schedule_blocked or global_schedule_blocked
+        )
+        if local_schedule_blocked:
+            schedule_blocked_reason = "retired_worker_limit"
+        elif global_schedule_blocked:
+            schedule_blocked_reason = "global_worker_limit"
+        else:
+            schedule_blocked_reason = "none"
         return {
+            "a3b_background_enabled": bool(self.static_image_enabled),
+            "a3b_generation": int(self._a3b_generation),
+            "a3b_active_worker_count": int(
+                self._a3b_active_worker_token is not None
+            ),
+            "a3b_retired_worker_count": len(self._a3b_retired_threads),
+            "a3b_live_worker_count": int(
+                self._a3b_bg_thread is not None
+            )
+            + len(self._a3b_retired_threads),
+            "a3b_global_live_worker_count": int(global_live_worker_count),
+            "a3b_global_worker_limit": int(self._a3b_global_worker_limit),
+            "a3b_worker_limit_scope": "process",
+            "a3b_worker_timeout_s": float(self._a3b_worker_timeout_s),
+            "a3b_max_retired_workers": int(self._a3b_max_retired_workers),
+            "a3b_active_worker_started_at": self._a3b_active_worker_started_at,
+            "a3b_active_worker_age_s": float(active_worker_age_s),
+            "a3b_active_worker_frame_idx": self._a3b_active_worker_frame_idx,
+            "a3b_active_worker_timestamp": self._a3b_active_worker_timestamp,
+            "a3b_timed_out_worker_count": int(
+                self._a3b_timed_out_worker_count
+            ),
+            "a3b_worker_rejected_count": int(
+                self._a3b_worker_rejected_count
+            ),
+            "a3b_last_worker_rejected_at": self._a3b_last_worker_rejected_at,
+            "a3b_schedule_blocked": schedule_blocked,
+            "a3b_schedule_blocked_reason": schedule_blocked_reason,
+            "a3b_error_count": int(self._a3b_error_count),
+            "a3b_last_error": self._a3b_last_error,
+            "a3b_last_error_at": self._a3b_last_error_at,
+            "a3b_last_success_at": self._a3b_last_success_at,
+            "a3b_source_frame_idx": self._a3b_source_frame_idx,
+            "a3b_source_timestamp": self._a3b_source_timestamp,
+            "a3b_last_attempt_frame_idx": self._a3b_last_attempt_frame_idx,
+            "a3b_last_attempt_timestamp": self._a3b_last_attempt_timestamp,
+            "a3b_result_published_at": self._a3b_result_published_at,
+            "a3b_result_age_s": float(result_age_s),
+            "a3b_result_lease_s": float(self._a3b_result_lease_s),
+            "a3b_result_fresh": result_fresh,
+            "a3b_result_expired_count": int(
+                self._a3b_result_expired_count
+            ),
+            "a3b_result_seq": int(self._a3b_result_seq),
+        }
+
+    def _empty_a3b(self, *, disabled: bool = False) -> dict[str, Any]:
+        payload = {
             "p_media_raw": 0.0, "p_media_raw_triggered": False,
             "p_media": 0.0, "p_media_policy": 0.0, "p_media_triggered": False,
             "p_media_confirmed_score": 0.0, "media_confirmed": False,
@@ -538,54 +1346,358 @@ class ModuleADetector:
             "p_media_strong_evidence": False, "p_media_background_static_suppressed": False,
             "a3b_display_score": 0.0, "suppressed_reason": "not_computed",
             "score_cap": 1.0, "media_candidate_allowed": False,
-            "a3b_state": "idle", "a3b_moire": 0.0,
+            "a3b_state": "disabled" if disabled else "idle", "a3b_moire": 0.0,
         }
+        if disabled:
+            payload["suppressed_reason"] = "disabled"
+        with self._a3b_bg_lock:
+            payload.update(self._a3b_diagnostics_locked())
+        return payload
+
+    def _a3b_result_snapshot(self) -> dict[str, Any]:
+        with self._a3b_bg_lock:
+            # Compatibility for in-memory adapters/tests that predate the
+            # worker sequence contract: normalize one already-published
+            # business payload to a single synthetic successful sequence.
+            # Repeated snapshots retain that same seq and therefore cannot
+            # create additional votes.
+            if (
+                self._a3b_bg_result is not None
+                and self._a3b_result_seq <= 0
+                and bool(
+                    self._a3b_bg_result.get(
+                        "p_media_raw_triggered",
+                        False,
+                    )
+                    or self._a3b_bg_result.get(
+                        "media_candidate_allowed",
+                        False,
+                    )
+                )
+            ):
+                published_at = time.time()
+                published_monotonic = time.monotonic()
+                self._a3b_result_seq = 1
+                self._a3b_last_success_at = published_at
+                self._a3b_result_published_at = published_at
+                self._a3b_result_published_monotonic = (
+                    published_monotonic
+                )
+            self._expire_hung_a3b_worker_locked()
+            self._expire_stale_a3b_result_locked()
+            cached = None if self._a3b_bg_result is None else dict(self._a3b_bg_result)
+            diagnostics = self._a3b_diagnostics_locked()
+        if cached is None:
+            return self._empty_a3b()
+        cached.update(diagnostics)
+        return cached
+
+    def _schedule_a3b(
+        self,
+        *,
+        frame_idx: int,
+        timestamp: float,
+        gray: np.ndarray,
+        rois: list[ROI],
+        width: int,
+        height: int,
+        exposure: dict[str, Any],
+        flow: dict[str, Any],
+        a1: dict[str, Any],
+        a2: dict[str, Any],
+        a3: dict[str, Any],
+    ) -> None:
+        if not self.static_image_enabled:
+            return
+        self._a3b_frame_count += 1
+        effective_interval = self._effective_a3b_interval()
+        if self._a3b_frame_count < effective_interval:
+            return
+        with self._a3b_bg_lock:
+            self._expire_hung_a3b_worker_locked()
+            current = self._a3b_bg_thread
+            if current is not None:
+                return
+            if (
+                len(self._a3b_retired_threads)
+                >= self._a3b_max_retired_workers
+            ):
+                self._a3b_worker_rejected_count += 1
+                self._a3b_last_worker_rejected_at = time.time()
+                return
+            worker_token = _try_acquire_a3b_global_worker_token(
+                self._a3b_global_worker_limit
+            )
+            if worker_token is None:
+                self._a3b_worker_rejected_count += 1
+                self._a3b_last_worker_rejected_at = time.time()
+                return
+            generation = self._a3b_generation
+            self._a3b_frame_count = 0
+            source_fps, source_interval_frames = self._a3b_source_cadence(
+                effective_interval
+            )
+            worker_started_at = time.time()
+            worker_started_monotonic = time.monotonic()
+            thread = threading.Thread(
+                target=self._run_a3b_bg,
+                args=(
+                    generation,
+                    worker_token,
+                    int(frame_idx),
+                    float(timestamp),
+                    gray.copy(),
+                    list(rois),
+                    width,
+                    height,
+                    dict(exposure),
+                    dict(flow),
+                    dict(a1),
+                    dict(a2),
+                    dict(a3),
+                    float(source_fps),
+                    int(source_interval_frames),
+                ),
+                name=f"rebuilt-a3b-g{generation}",
+                daemon=True,
+            )
+            self._a3b_bg_thread = thread
+            self._a3b_active_worker_token = worker_token
+            self._a3b_active_worker_started_at = worker_started_at
+            self._a3b_active_worker_started_monotonic = (
+                worker_started_monotonic
+            )
+            self._a3b_active_worker_frame_idx = int(frame_idx)
+            self._a3b_active_worker_timestamp = float(timestamp)
+            self._a3b_last_attempt_frame_idx = int(frame_idx)
+            self._a3b_last_attempt_timestamp = float(timestamp)
+            try:
+                thread.start()
+            except Exception:
+                self._a3b_bg_thread = None
+                self._a3b_active_worker_token = None
+                self._clear_a3b_active_worker_metadata_locked()
+                _release_a3b_global_worker_token(worker_token)
+                raise
+
+    def _effective_a3b_interval(self) -> int:
+        """Keep configured A3b sampling cadence stable in source-time units.
+
+        ``static_image_interval`` was tuned on the 30 FPS authoritative A3b
+        source.  Without scaling, a 60 FPS file doubles background A3b work
+        to 10 Hz and contends with YOLO/RAFT while adding no source-time
+        information.  Never sample more frequently than the configured
+        interval, and scale only high-frame-rate sources relative to 30 FPS.
+        """
+        source_fps_scale = max(1.0, float(self.process_fps) / 30.0)
+        return max(
+            1,
+            int(round(float(self._a3b_interval) * source_fps_scale)),
+        )
+
+    def _a3b_source_cadence(
+        self,
+        effective_interval: int,
+    ) -> tuple[float, int]:
+        """Translate analysis-call cadence back into real source-frame units."""
+        analysis_fps = max(0.1, float(self.process_fps))
+        observed_source_fps = getattr(self, "source_fps", None)
+        source_fps = (
+            float(observed_source_fps)
+            if observed_source_fps is not None
+            and np.isfinite(float(observed_source_fps))
+            and float(observed_source_fps) > 0.0
+            else analysis_fps
+        )
+        source_interval_frames = max(
+            1,
+            int(round(float(effective_interval) * source_fps / analysis_fps)),
+        )
+        return source_fps, source_interval_frames
 
     @staticmethod
-    def _load_classifier(path: str) -> Any:
-        """加载 sklearn pickle 分类器（predict_proba 接口）。路径为空或加载失败时返回 None。"""
+    def _resolve_classifier_path(path: str) -> _Path:
+        """Resolve classifier paths without depending on the process cwd."""
+        configured = _Path(path).expanduser()
+        if configured.is_absolute():
+            return configured.resolve(strict=False)
+
+        here = _Path(__file__).resolve()
+        project_root = here.parents[4]
+        return (project_root / configured).resolve(strict=False)
+
+    def _load_classifier(self, path: str) -> Any:
+        """Load only a schema-bound predict_proba classifier."""
         if not path:
+            self.a4_classifier_fallback_reason = "not_configured"
             return None
         try:
             import pickle
-            from pathlib import Path
-            with open(Path(path), "rb") as fh:
-                clf = pickle.load(fh)
-            if not hasattr(clf, "predict_proba"):
-                return None
-            return clf
-        except Exception:
+
+            model_path = _Path(path)
+            if not model_path.is_file():
+                raise FileNotFoundError(model_path)
+            metadata = load_a4_artifact_metadata(model_path)
+            self.a4_classifier_metadata = validate_a4_artifact_metadata(
+                metadata,
+                model_path=model_path,
+                expected_schema_version=A4_FEATURE_SCHEMA_VERSION,
+                expected_feature_names=A4_FEATURE_NAMES,
+            )
+            with model_path.open("rb") as fh:
+                classifier = pickle.load(fh)
+            if not hasattr(classifier, "predict_proba"):
+                raise TypeError("classifier_missing_predict_proba")
+            return classifier
+        except A4ArtifactValidationError as exc:
+            self.a4_classifier_error = str(exc)
+            self.a4_classifier_fallback_reason = (
+                str(exc).split(":", 1)[0] or "schema_validation_failed"
+            )
+            return None
+        except Exception as exc:
+            self.a4_classifier_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            self.a4_classifier_fallback_reason = "load_failed"
             return None
 
     @staticmethod
-    def _load_flownet() -> Any:
-        """优先级: RAFT-TRT FP16 (~2ms) → GPU LK (~5ms) → DIS-CPU。"""
+    def _normalize_flow_device(value: Any) -> str:
+        requested = str(value or "cuda:0").strip().lower()
+        if requested in {"cuda", "gpu"}:
+            return "cuda:0"
+        if requested in {"cpu", "auto"} or requested.startswith("cuda:"):
+            return requested
+        return requested or "cuda:0"
+
+    def _finalize_flow_contract_after_load(self) -> None:
+        """Normalize attributes when tests or integrations replace the loader."""
+        if not self.light_flow_enabled:
+            self._flownet = None
+            self.flow_effective_device = "disabled"
+            self.flow_backend = "disabled"
+            self.flow_fallback_reason = "disabled_by_config"
+            return
+        if self._flownet is None:
+            if self.flow_backend in {"disabled", "initializing"}:
+                self.flow_backend = "dis_cpu"
+                self.flow_effective_device = "cpu"
+                self.flow_fallback_reason = "flow_loader_returned_none"
+            return
+        mode = str(self._flownet.get("mode", "unknown"))
+        self.flow_backend = mode
+        self.flow_effective_device = str(
+            self._flownet.get("device", self.flow_requested_device)
+        )
+        if self.flow_fallback_reason == "initializing":
+            self.flow_fallback_reason = "none"
+
+    def _load_flownet(self) -> Any:
+        """Load an existing GPU backend or explicitly degrade to DIS on CPU."""
+        if not self.light_flow_enabled:
+            self.flow_effective_device = "disabled"
+            self.flow_backend = "disabled"
+            self.flow_fallback_reason = "disabled_by_config"
+            return None
+
+        requested = self.flow_requested_device
+        if requested == "cpu":
+            self.flow_effective_device = "cpu"
+            self.flow_backend = "dis_cpu"
+            self.flow_fallback_reason = "requested_cpu"
+            return None
+
         try:
             import torch
-            if not torch.cuda.is_available():
-                print("[FlowNet] CUDA unavailable, DIS fallback", flush=True)
-                return None
-            device = torch.device("cuda:0")
-            result = ModuleADetector._try_load_raft_trt(device)
-            if result is not None:
-                return result
-            return ModuleADetector._load_gpu_lk(device)
-        except Exception as e:
-            print(f"[FlowNet] init failed: {e}", flush=True)
+        except Exception as exc:
+            self.flow_effective_device = "cpu"
+            self.flow_backend = "dis_cpu"
+            self.flow_fallback_reason = (
+                f"torch_unavailable:{type(exc).__name__}"
+            )
             return None
 
-    @staticmethod
-    def _try_load_raft_trt(device: Any) -> Any:
-        """尝试加载/构建 RAFT-small TRT FP16 引擎，失败返回 None。"""
-        import torch, tensorrt as trt, os, shutil, tempfile
-        from pathlib import Path
-        data_dir = _resolve_rebuilt_data_dir()
-        engine_path = data_dir / "raft_small_fp16_256.engine"
-        onnx_path = data_dir / "raft_small_256.onnx"
-        os.makedirs(data_dir, exist_ok=True)
-        if not engine_path.exists():
-            if not ModuleADetector._build_raft_trt_engine(onnx_path, engine_path):
-                return None
+        if requested == "auto":
+            requested = "cuda:0" if torch.cuda.is_available() else "cpu"
+        if requested == "cpu":
+            self.flow_effective_device = "cpu"
+            self.flow_backend = "dis_cpu"
+            self.flow_fallback_reason = "cuda_unavailable"
+            return None
+        if not requested.startswith("cuda:"):
+            self.flow_effective_device = "cpu"
+            self.flow_backend = "dis_cpu"
+            self.flow_fallback_reason = f"unsupported_device:{requested}"
+            return None
+        if not torch.cuda.is_available():
+            self.flow_effective_device = "cpu"
+            self.flow_backend = "dis_cpu"
+            self.flow_fallback_reason = "cuda_unavailable"
+            return None
+
+        try:
+            device_index = int(requested.split(":", 1)[1])
+        except (IndexError, ValueError):
+            self.flow_effective_device = "cpu"
+            self.flow_backend = "dis_cpu"
+            self.flow_fallback_reason = f"invalid_cuda_device:{requested}"
+            return None
+        try:
+            device_count = int(torch.cuda.device_count())
+        except Exception:
+            device_count = 0
+        if device_index < 0 or device_index >= device_count:
+            self.flow_effective_device = "cpu"
+            self.flow_backend = "dis_cpu"
+            self.flow_fallback_reason = f"cuda_device_unavailable:{requested}"
+            return None
+
+        device = torch.device(requested)
+        engine_path = _Path(self.flow_artifact_path)
+        raft_failure = "raft_engine_missing"
+        if engine_path.is_file():
+            if (
+                self.flow_artifact_expected_sha256
+                and self.flow_artifact_sha256
+                != self.flow_artifact_expected_sha256
+            ):
+                raft_failure = "raft_engine_sha256_mismatch"
+            else:
+                try:
+                    result = self._try_load_raft_trt(device)
+                    if result is not None:
+                        self.flow_effective_device = requested
+                        self.flow_backend = "raft_trt"
+                        self.flow_fallback_reason = "none"
+                        return result
+                    raft_failure = "raft_engine_load_returned_none"
+                except Exception as exc:
+                    raft_failure = (
+                        f"raft_engine_load_failed:{type(exc).__name__}"
+                    )
+        try:
+            result = self._load_gpu_lk(device)
+            self.flow_effective_device = requested
+            self.flow_backend = "gpu_lk"
+            self.flow_fallback_reason = raft_failure
+            return result
+        except Exception as exc:
+            self.flow_effective_device = "cpu"
+            self.flow_backend = "dis_cpu"
+            self.flow_fallback_reason = (
+                f"{raft_failure};gpu_lk_failed:{type(exc).__name__}"
+            )
+            return None
+
+    def _try_load_raft_trt(self, device: Any) -> Any:
+        """Load an existing RAFT-small TRT engine without building assets."""
+        import torch
+        import tensorrt as trt
+
+        engine_path = _Path(self.flow_artifact_path)
+        if not engine_path.is_file():
+            return None
         logger = trt.Logger(trt.Logger.WARNING)
         runtime = trt.Runtime(logger)
         with open(engine_path, "rb") as f:
@@ -596,7 +1708,9 @@ class ModuleADetector:
         img1_t = torch.zeros(1, 3, 256, 256, device=device, dtype=torch.float32)
         img2_t = torch.zeros(1, 3, 256, 256, device=device, dtype=torch.float32)
         flow_t = torch.zeros(1, 2, 256, 256, device=device, dtype=torch.float32)
-        raft_stream = torch.cuda.Stream()  # 独立 stream：不阻塞 YOLO TRT
+        raft_stream = torch.cuda.Stream(
+            device=device
+        )  # 独立 stream：不阻塞 YOLO TRT
         ctx.set_tensor_address("img1", img1_t.data_ptr())
         ctx.set_tensor_address("img2", img2_t.data_ptr())
         ctx.set_tensor_address("flow", flow_t.data_ptr())
@@ -607,23 +1721,20 @@ class ModuleADetector:
 
     @staticmethod
     def _build_raft_trt_engine(onnx_path: Any, engine_path: Any) -> bool:
-        """从 ONNX 构建 RAFT TRT FP16 引擎，成功返回 True。"""
-        import torch, torch.nn as nn, tensorrt as trt, shutil, os, tempfile
+        """Explicitly build from a local ONNX file; never download weights."""
+        import os
+        import shutil
+        import tempfile
+        import tensorrt as trt
         from pathlib import Path
+
         try:
             if not Path(onnx_path).exists():
-                from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
-                class _W(nn.Module):
-                    def __init__(self, m): super().__init__(); self.m = m
-                    def forward(self, a, b): return self.m(a, b, num_flow_updates=4)[-1]
-                d = torch.device("cuda:0")
-                w = _W(raft_small(weights=Raft_Small_Weights.DEFAULT).to(d).eval()).to(d).eval()
-                dummy = torch.zeros(1, 3, 256, 256, device=d)
-                with torch.no_grad():
-                    torch.onnx.export(w, (dummy, dummy), str(onnx_path),
-                                      input_names=["img1", "img2"], output_names=["flow"],
-                                      opset_version=16, do_constant_folding=True,
-                                      export_params=True, dynamo=False)
+                print(
+                    f"[FlowNet] local RAFT ONNX missing: {onnx_path}",
+                    flush=True,
+                )
+                return False
             with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
                 tmp = f.name
             shutil.copy2(str(onnx_path), tmp)
@@ -632,14 +1743,17 @@ class ModuleADetector:
             network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
             parser = trt.OnnxParser(network, logger)
             if not parser.parse_from_file(tmp):
-                os.remove(tmp); return False
+                os.remove(tmp)
+                return False
             config = builder.create_builder_config()
             config.set_flag(trt.BuilderFlag.FP16)
             config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 512 * 1024 * 1024)
             eb = builder.build_serialized_network(network, config)
             os.remove(tmp)
-            if eb is None: return False
-            with open(engine_path, "wb") as f: f.write(memoryview(eb))
+            if eb is None:
+                return False
+            with open(engine_path, "wb") as f:
+                f.write(memoryview(eb))
             print(f"[FlowNet] RAFT TRT engine built: {Path(engine_path).name}", flush=True)
             return True
         except Exception as e:
@@ -721,7 +1835,8 @@ class ModuleADetector:
 
     def _gpu_lk_flow(self, prev_gray: np.ndarray, gray: np.ndarray) -> tuple:
         """GPU Lucas-Kanade 光流回退（~5ms，无需模型权重）。"""
-        import torch, torch.nn.functional as F
+        import torch
+        import torch.nn.functional as F
         device = self._flownet["device"]
         sobel_x = self._flownet["sobel_x"]
         sobel_y = self._flownet["sobel_y"]
@@ -747,7 +1862,8 @@ class ModuleADetector:
         sd = torch.where(valid, det, torch.ones_like(det))
         u = torch.where(valid, torch.clamp((-s_yy*s_xt+s_xy*s_yt)/sd, -16, 16), torch.zeros_like(det))
         v = torch.where(valid, torch.clamp((s_xy*s_xt-s_xx*s_yt)/sd, -16, 16), torch.zeros_like(det))
-        u_s = u.squeeze()*(w/S); v_s = v.squeeze()*(h/S)
+        u_s = u.squeeze()*(w/S)
+        v_s = v.squeeze()*(h/S)
         du, dv = float(u_s.mean()), float(v_s.mean())
         mag_t = torch.sqrt(u_s*u_s+v_s*v_s)
         res_t = torch.sqrt((u_s-du)**2+(v_s-dv)**2)
@@ -765,6 +1881,7 @@ class ModuleADetector:
 
     def process(self, item: ModuleAInput) -> ModuleAResult:
         start = time.perf_counter()
+        timing: dict[str, float] = {}
         frame = item.frame
         if frame.ndim == 2:
             gray = frame.astype(np.uint8)
@@ -775,29 +1892,81 @@ class ModuleADetector:
         self.recent_target_presence.append(1 if rois else 0)
         self._update_process_fps(item.timestamp)
 
+        stage_started = time.perf_counter()
         exposure = self._compute_scene_context(gray)
+        timing["scene_context"] = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
+
+        stage_started = time.perf_counter()
         lbp = self._compute_lbp(gray)
-        flow = self._compute_flow(self.prev_gray, gray)
+        timing["lbp"] = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
+        self._flow_frame_count += 1
+        flow_due = bool(
+            self.light_flow_enabled
+            and self._flow_frame_count % self.light_flow_interval == 0
+        )
+        if flow_due:
+            flow = self._compute_flow(self.prev_gray, gray)
+        else:
+            flow = self._empty_flow_result(
+                gray,
+                reason=(
+                    "disabled_by_config"
+                    if not self.light_flow_enabled
+                    else "interval_skip"
+                ),
+            )
+        timing["flow"] = (time.perf_counter() - stage_started) * 1000.0
         self._last_computed_lbp = lbp  # runner 下一帧可直接复用，无需重算 prev_lbp
 
+        stage_started = time.perf_counter()
         a1 = self._compute_a1(lbp, rois, width, height, exposure)
+        timing["a1"] = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
         a2 = self._compute_a2(lbp, rois, width, height, exposure, flow)
+        timing["a2"] = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
         a3 = self._compute_a3(flow, rois, width, height, exposure)
+        timing["a3"] = (time.perf_counter() - stage_started) * 1000.0
         # A3b 后台线程：主路径永不等待，使用上一次结果。
         # 按 _a3b_interval 节流：a3b 检测静态媒体（慢变化），无需每帧重算；
         # 不节流会让后台线程 100% 占用并通过 GIL 拖慢主路径 ~5ms/帧。
-        a3b = self._a3b_bg_result if self._a3b_bg_result is not None else self._empty_a3b()
-        self._a3b_frame_count += 1
-        if (self._a3b_frame_count >= self._a3b_interval
-                and (self._a3b_bg_thread is None or not self._a3b_bg_thread.is_alive())):
-            self._a3b_frame_count = 0
-            self._a3b_bg_thread = threading.Thread(
-                target=self._run_a3b_bg,
-                args=(gray.copy(), list(rois), width, height, dict(exposure), dict(flow), dict(a1), dict(a2), dict(a3)),
-                daemon=True,
-            )
-            self._a3b_bg_thread.start()
-        a4 = self._compute_a4(a1, a2, a3, a3b)
+        stage_started = time.perf_counter()
+        a3b = (
+            self._a3b_result_snapshot()
+            if self.static_image_enabled
+            else self._empty_a3b(disabled=True)
+        )
+        self._schedule_a3b(
+            frame_idx=int(item.frame_idx),
+            timestamp=float(item.timestamp or 0.0),
+            gray=gray,
+            rois=rois,
+            width=width,
+            height=height,
+            exposure=exposure,
+            flow=flow,
+            a1=a1,
+            a2=a2,
+            a3=a3,
+        )
+        timing["a3b_schedule"] = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
+
+        stage_started = time.perf_counter()
+        a4 = self._compute_a4(
+            a1,
+            a2,
+            a3,
+            frame=frame,
+            frame_idx=int(item.frame_idx),
+        )
         # P4 判别性特征位（hf_ratio/lap_var/edge_density/sat_p95/color_ext）：
         # 实验显示当前实现下分组CV不增益(0.58)、且训练后系统级误报恶化(4/12→5/12)，
         # 故运行时**不计算**(零开销)，分类器维度对齐到 20 维。保留 _compute_p4 与采集端 25 维字段
@@ -808,52 +1977,87 @@ class ModuleADetector:
             a4["a4_feature_vector"] = a4["a4_feature_vector"] + [
                 float(p4.get(k, 0.0)) for k in self._P4_NAMES
             ]
+        timing["a4"] = (time.perf_counter() - stage_started) * 1000.0
+
+        stage_started = time.perf_counter()
         blinding = self._compute_blinding(gray, rois, exposure, flow)
-        ta_result = self._ta.evaluate(
-            rois=rois,
-            overexposure={
-                "ratio": exposure["overexposure_ratio"],
-                "underexposed_ratio": exposure["underexposed_ratio"],
-                "temporal_flash": False,  # 由 _joint_decision 独立处理，不双重判断
-                "threshold": 0.06,
-                "is_glare": False,  # 由 _joint_decision 独立处理，TA 只做目标锚定
-            },
-            blur={
-                "blur_score": 0.0,
-                "roi_results": [],
-            },
-            track={
-                "track_score": 0.0,
-                "confidence_drop_score": 0.0,
-            },
-            temporal={
-                "local_max": float(a2.get("change_t_local_max", 0.0)),
-                "change_t": float(a2.get("change_t", 0.0)),
-            },
-            motion={
-                "target_related": bool(a3.get("target_related", False)),
-                "motion_score": float(a3.get("a3_feature_score", 0.0)),
-                "light_flow_score": 0.0,
-                "local_max_ratio": float(a3.get("flow_local_anomaly_ratio", 0.0)),
-                "light_flow_local_anomaly_ratio": float(a3.get("flow_local_anomaly_ratio", 0.0)),
-            },
-            static_image={"triggered": bool(a3b.get("p_media_raw_triggered", False))},
-            classifier_result={
-                "classifier_p_adv": float(a4["p_adv"]),
-                "classifier_triggered": bool(a4["p_adv_triggered"]),
-            },
-            texture={
-                "delta_h": float(a1["delta_h"]),
-                "local_max": float(a1["delta_h_local_max"]),
-            },
-        )
+        timing["blinding"] = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
+
+        stage_started = time.perf_counter()
+        ta_result = None
+        if self.target_anchored_diagnostics_enabled:
+            ta_result = self._ta.evaluate(
+                rois=rois,
+                overexposure={
+                    "ratio": exposure["overexposure_ratio"],
+                    "underexposed_ratio": exposure["underexposed_ratio"],
+                    "temporal_flash": False,
+                    "threshold": 0.06,
+                    "is_glare": False,
+                },
+                blur={
+                    "blur_score": 0.0,
+                    "roi_results": [],
+                },
+                track={
+                    "track_score": 0.0,
+                    "confidence_drop_score": 0.0,
+                },
+                temporal={
+                    "local_max": float(
+                        a2.get("change_t_local_max", 0.0)
+                    ),
+                    "change_t": float(a2.get("change_t", 0.0)),
+                },
+                motion={
+                    "target_related": bool(
+                        a3.get("target_related", False)
+                    ),
+                    "motion_score": float(
+                        a3.get("a3_feature_score", 0.0)
+                    ),
+                    "light_flow_score": 0.0,
+                    "local_max_ratio": float(
+                        a3.get("flow_local_anomaly_ratio", 0.0)
+                    ),
+                    "light_flow_local_anomaly_ratio": float(
+                        a3.get("flow_local_anomaly_ratio", 0.0)
+                    ),
+                },
+                static_image={
+                    "triggered": bool(
+                        a3b.get("p_media_raw_triggered", False)
+                    )
+                },
+                classifier_result={
+                    "classifier_p_adv": float(a4["p_adv"]),
+                    "classifier_triggered": bool(
+                        a4["p_adv_triggered"]
+                    ),
+                },
+                texture={
+                    "delta_h": float(a1["delta_h"]),
+                    "local_max": float(
+                        a1["delta_h_local_max"]
+                    ),
+                },
+            )
+        timing["target_anchored"] = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
+
+        stage_started = time.perf_counter()
         joint = self._joint_decision(a1, a2, a3, a4, a3b, rois, exposure, flow, ta_result, blinding)
         a3b = dict(a3b)
         a3b["p_media_confirmed_score"] = float(joint["p_media_confirmed_score"])
         a3b["media_confirmed"] = bool(joint["media_confirmed"])
         if a3b["media_confirmed"]:
             a3b["a3b_state"] = "confirmed"
+        timing["joint"] = (time.perf_counter() - stage_started) * 1000.0
 
+        stage_started = time.perf_counter()
         features = self._build_features(a1, a2, a3, a4, a3b, joint, exposure, flow)
         details = {
             "a1": a1,
@@ -862,15 +2066,27 @@ class ModuleADetector:
             "a4": a4,
             "a3b": a3b,
             "blinding": blinding,
+            "target_anchored": {
+                "enabled": bool(
+                    self.target_anchored_diagnostics_enabled
+                ),
+                "evaluated": ta_result is not None,
+                "result": ta_result,
+            },
             "joint_decision": joint,
             "scene_context": exposure,
             "flow_context": {
                 k: v for k, v in flow.items()
                 if k not in ("flow", "mag", "residual_mag")
             },
+            "a4_feature_schema": {
+                "version": A4_FEATURE_SCHEMA_VERSION,
+                "names": list(A4_FEATURE_NAMES),
+            },
+            "timing": timing,
         }
         reason_codes = list(joint.get("reason_codes", []))
-        timing_ms = (time.perf_counter() - start) * 1000.0
+        roi_results = self._build_roi_results(rois, a1, a2, a3, a3b)
         result = ModuleAResult(
             frame_idx=int(item.frame_idx),
             p_adv=float(a4["p_adv"]),
@@ -879,17 +2095,30 @@ class ModuleADetector:
             attack_state_active=bool(joint["alert_confirmed"]),
             reason_codes=reason_codes,
             features=features,
-            roi_results=self._build_roi_results(rois, a1, a2, a3, a3b),
-            timing_ms=timing_ms,
+            roi_results=roi_results,
+            timing_ms=0.0,
             details=details,
         )
+        timing["result_build"] = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
 
+        stage_started = time.perf_counter()
         self._update_baseline(lbp, joint)
         self._update_scene_baseline(blinding, a1, a2, a3, joint)
         self.prev_gray = gray
         self.prev_lbp = lbp
         self.prev_timestamp = float(item.timestamp or time.time())
         self.prev_brightness = float(np.mean(gray))
+        timing["state_update"] = (
+            time.perf_counter() - stage_started
+        ) * 1000.0
+        timing_ms = (time.perf_counter() - start) * 1000.0
+        timing["total"] = timing_ms
+        result.timing_ms = timing_ms
+        if bool(getattr(self, "_native_status_dirty", False)):
+            self._refresh_native_status()
+            self._native_status_dirty = False
         return result
 
     def _prepare_rois(self, rois: list[ROI] | None, width: int, height: int) -> list[ROI]:
@@ -915,11 +2144,15 @@ class ModuleADetector:
 
     def _compute_lbp(self, gray: np.ndarray) -> np.ndarray:
         # GPU LBP（当 CUDA 可用时，~1ms，否则回退 CPU ~7ms）
-        if self._flownet is not None:
+        if self._flownet is not None and not self._gpu_lbp_disabled:
             try:
                 return self._compute_lbp_gpu(gray)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._gpu_lbp_disabled = True
+                self.lbp_backend = "cpu"
+                self.lbp_fallback_reason = (
+                    f"gpu_lbp_failed:{type(exc).__name__}"
+                )
         padded = np.pad(gray, 1, mode="edge")
         center = padded[1:-1, 1:-1]
         code = np.zeros_like(center, dtype=np.uint8)
@@ -931,7 +2164,8 @@ class ModuleADetector:
 
     def _compute_lbp_gpu(self, gray: np.ndarray) -> np.ndarray:
         """GPU LBP：PyTorch unfold 实现，~1ms。"""
-        import torch, torch.nn.functional as F
+        import torch
+        import torch.nn.functional as F
         device = self._flownet["device"]
         t = torch.from_numpy(gray.astype(np.float32)).to(device).unsqueeze(0).unsqueeze(0)
         padded = F.pad(t, (1,1,1,1), mode="reflect")
@@ -977,23 +2211,59 @@ class ModuleADetector:
             "has_prev_frame": self.prev_gray is not None,
         }
 
+    def _empty_flow_result(
+        self,
+        gray: np.ndarray,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        h, w = gray.shape[:2]
+        zeros = np.zeros((h, w), dtype=np.float32)
+        return {
+            "available": False, "flow": None, "flow_scale": 1.0,
+            "mag": zeros, "residual_mag": zeros,
+            "global_flow_dx": 0.0, "global_flow_dy": 0.0,
+            "global_flow_mag": 0.0, "global_motion_weight": 0.0,
+            "background_coherence": 0.0, "valid_ratio": 0.0,
+            "mean_motion": 0.0, "mean_residual_motion": 0.0,
+            "flow_requested_device": self.flow_requested_device,
+            "flow_effective_device": self.flow_effective_device,
+            "flow_backend": self.flow_backend,
+            "flow_fallback_reason": self.flow_fallback_reason,
+            "flow_sampled": False,
+            "flow_skip_reason": reason,
+            "flow_interval": int(self.light_flow_interval),
+        }
+
     def _compute_flow(self, prev_gray: np.ndarray | None, gray: np.ndarray) -> dict[str, Any]:
         h, w = gray.shape[:2]
+        if not self.light_flow_enabled:
+            return self._empty_flow_result(
+                gray,
+                reason="disabled_by_config",
+            )
         if prev_gray is None or prev_gray.shape != gray.shape:
-            zeros = np.zeros((h, w), dtype=np.float32)
-            return {
-                "available": False, "flow": None, "flow_scale": 1.0,
-                "mag": zeros, "residual_mag": zeros,
-                "global_flow_dx": 0.0, "global_flow_dy": 0.0,
-                "global_flow_mag": 0.0, "global_motion_weight": 0.0,
-                "background_coherence": 0.0, "valid_ratio": 0.0,
-                "mean_motion": 0.0, "mean_residual_motion": 0.0,
-            }
+            return self._empty_flow_result(
+                gray,
+                reason="missing_compatible_predecessor",
+            )
         if self._flownet is not None:
             try:
                 flow, mag, residual_mag, flow_s, flow_stats = self._raft_flow(prev_gray, gray)
                 flow_scale = flow_s / w  # e.g. 256/640 = 0.4
-            except Exception:
+            except Exception as exc:
+                previous_backend = self.flow_backend
+                self._flownet = None
+                self._gpu_lbp_disabled = True
+                self.lbp_backend = "cpu"
+                self.lbp_fallback_reason = (
+                    f"flow_backend_failed:{type(exc).__name__}"
+                )
+                self.flow_backend = "dis_cpu"
+                self.flow_effective_device = "cpu"
+                self.flow_fallback_reason = (
+                    f"{previous_backend}_runtime_failed:{type(exc).__name__}"
+                )
                 dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
                 flow = dis.calc(prev_gray, gray, None)
                 mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2).astype(np.float32)
@@ -1038,6 +2308,13 @@ class ModuleADetector:
             "valid_ratio": valid_ratio,
             "mean_motion": mean_mag,
             "mean_residual_motion": mean_residual,
+            "flow_requested_device": self.flow_requested_device,
+            "flow_effective_device": self.flow_effective_device,
+            "flow_backend": self.flow_backend,
+            "flow_fallback_reason": self.flow_fallback_reason,
+            "flow_sampled": True,
+            "flow_skip_reason": "none",
+            "flow_interval": int(self.light_flow_interval),
         }
 
     def _compute_a1(
@@ -1048,14 +2325,20 @@ class ModuleADetector:
         height: int,
         exposure: dict[str, Any],
     ) -> dict[str, Any]:
-        if _NATIVE is not None:
-            # Rust 原生路径：把每帧上千次 _hist_lbp/_hist_distance 塌缩成一次调用。
-            base_arr = None if self.lbp_baseline is None else np.ascontiguousarray(self.lbp_baseline, dtype=np.float32)
-            roi_boxes = [(int(r.bbox[0]), int(r.bbox[1]), int(r.bbox[2]), int(r.bbox[3])) for r in rois]
+        # Rust 原生路径：把每帧上千次 _hist_lbp/_hist_distance 塌缩成一次调用。
+        base_arr = None if self.lbp_baseline is None else np.ascontiguousarray(self.lbp_baseline, dtype=np.float32)
+        roi_boxes = [(int(r.bbox[0]), int(r.bbox[1]), int(r.bbox[2]), int(r.bbox[3])) for r in rois]
+        native_result = self._native_call(
+            "a1",
+            "a1_lbp_features",
+            np.ascontiguousarray(lbp, dtype=np.uint8),
+            roi_boxes,
+            base_arr,
+        )
+        if native_result is not None:
             (delta_h_global, delta_h_local_max, local_mean, local_box,
              delta_h_roi_max, delta_h_target_contrast, delta_h_roi_patch_max,
-             target_box) = _NATIVE.a1_lbp_features(
-                np.ascontiguousarray(lbp, dtype=np.uint8), roi_boxes, base_arr)
+             target_box) = native_result
         else:
             global_hist = _hist_lbp(lbp)
             baseline = self.lbp_baseline if self.lbp_baseline is not None else global_hist
@@ -1231,14 +2514,18 @@ class ModuleADetector:
                 "target_related": False,
             }
 
-        if _NATIVE is not None:
-            roi_boxes = [(int(r.bbox[0]), int(r.bbox[1]), int(r.bbox[2]), int(r.bbox[3])) for r in rois]
+        roi_boxes = [(int(r.bbox[0]), int(r.bbox[1]), int(r.bbox[2]), int(r.bbox[3])) for r in rois]
+        native_result = self._native_call(
+            "a2",
+            "a2_change_features",
+            np.ascontiguousarray(lbp, dtype=np.uint8),
+            np.ascontiguousarray(self.prev_lbp, dtype=np.uint8),
+            roi_boxes,
+            0.45,
+        )
+        if native_result is not None:
             (change_t_global, change_t_local_max, change_t_local_mean, local_box,
-             change_t_roi_max, target_box, change_t_context_mean) = _NATIVE.a2_change_features(
-                np.ascontiguousarray(lbp, dtype=np.uint8),
-                np.ascontiguousarray(self.prev_lbp, dtype=np.uint8),
-                roi_boxes, 0.45,
-            )
+             change_t_roi_max, target_box, change_t_context_mean) = native_result
             local_box = tuple(local_box)
             target_box = tuple(target_box) if target_box is not None else None
         else:
@@ -1267,12 +2554,19 @@ class ModuleADetector:
         target_relation, _, _, target_related = _target_relation(relation_box, rois, width, height)
 
         motion_aligned = 0.0
-        if flow["available"] and target_box is not None:
-            x1, y1, x2, y2 = target_box
-            motion_aligned = float(np.mean(flow["mag"][y1:y2, x1:x2])) / 3.0
-        elif flow["available"]:
-            x1, y1, x2, y2 = local_box
-            motion_aligned = float(np.mean(flow["mag"][y1:y2, x1:x2])) / 3.0
+        if flow["available"]:
+            flow_mag = np.asarray(flow.get("mag"))
+            sample_box = target_box or local_box
+            if flow_mag.ndim >= 2 and flow_mag.size and sample_box is not None:
+                flow_h, flow_w = flow_mag.shape[:2]
+                x1, y1, x2, y2 = sample_box
+                fx1 = max(0, min(flow_w, int(np.floor(float(x1) * flow_w / max(1, width)))))
+                fy1 = max(0, min(flow_h, int(np.floor(float(y1) * flow_h / max(1, height)))))
+                fx2 = max(0, min(flow_w, int(np.ceil(float(x2) * flow_w / max(1, width)))))
+                fy2 = max(0, min(flow_h, int(np.ceil(float(y2) * flow_h / max(1, height)))))
+                flow_patch = flow_mag[fy1:fy2, fx1:fx2]
+                if flow_patch.size:
+                    motion_aligned = float(np.mean(flow_patch)) / 3.0
         motion_aligned = _clamp(motion_aligned)
         no_motion_weight = 1.0 - min(0.65, motion_aligned * 0.75)
         if flow.get("global_motion_weight", 0.0) >= 0.65:
@@ -1386,6 +2680,7 @@ class ModuleADetector:
                 "flow_context_residual": 0.0,
                 "flow_residual_contrast": 0.0,
                 "flow_roi_motion_gap": 0.0,
+                "flow_roi_coverage_ratio": 0.0,
                 "flow_background_explain_score": 0.0,
                 "flow_shape_score": 0.0,
                 "flow_target_relation": 0.0,
@@ -1403,9 +2698,14 @@ class ModuleADetector:
         residual = flow["residual_mag"]
         mag = flow["mag"]
         fs = flow.get("flow_scale", 1.0)  # 缩放因子：flow 分辨率 / 帧分辨率
-        if _NATIVE is not None:
-            local_residual, mean_residual_grid, local_box = _NATIVE.best_grid_value_f32(
-                np.ascontiguousarray(residual, dtype=np.float32), 8)
+        native_result = self._native_call(
+            "a3",
+            "best_grid_value_f32",
+            np.ascontiguousarray(residual, dtype=np.float32),
+            8,
+        )
+        if native_result is not None:
+            local_residual, mean_residual_grid, local_box = native_result
             local_box = tuple(local_box)
         else:
             local_residual, mean_residual_grid, local_box = _best_grid_value(residual, grid=8)
@@ -1419,8 +2719,12 @@ class ModuleADetector:
             if x2 <= x1 or y2 <= y1:
                 continue
             fx1, fy1, fx2, fy2 = int(x1*fs), int(y1*fs), int(x2*fs), int(y2*fs)
-            res_val = float(np.mean(residual[fy1:fy2, fx1:fx2]))
-            mag_val = float(np.mean(mag[fy1:fy2, fx1:fx2]))
+            residual_patch = residual[fy1:fy2, fx1:fx2]
+            magnitude_patch = mag[fy1:fy2, fx1:fx2]
+            if residual_patch.size == 0 or magnitude_patch.size == 0:
+                continue
+            res_val = float(np.mean(residual_patch))
+            mag_val = float(np.mean(magnitude_patch))
             if res_val > roi_residual:
                 roi_residual = res_val
                 roi_mag = mag_val
@@ -1551,6 +2855,7 @@ class ModuleADetector:
             "flow_context_residual": float(roi_context_residual),
             "flow_residual_contrast": float(roi_residual_contrast),
             "flow_roi_motion_gap": float(roi_motion_gap),
+            "flow_roi_coverage_ratio": float(roi_coverage_ratio),
             "flow_background_explain_score": float(background_motion_explain_score),
             "flow_background_like_residual": bool(background_like_residual),
             "a3_residual_hold_active": bool(hold_active),
@@ -1573,15 +2878,17 @@ class ModuleADetector:
         a2: dict[str, Any],
         a3: dict[str, Any],
         a3b: dict[str, Any] | None = None,
+        frame: np.ndarray | None = None,
+        frame_idx: int | None = None,
     ) -> dict[str, Any]:
         s1 = float(a1["a1_feature_score"])
         s2 = float(a2["a2_feature_score"])
         s3 = float(a3["a3_feature_score"])
-        a3b = a3b or {}
-        a3b_scores = a3b.get("p_media_scores", {}) or {}
 
-        # 按设计稿 §7.2 构建 16 维特征向量（A1×5 + A2×5 + A3×6）
-        # 问题2修复：不再只传三个标量，而是传完整特征组
+        # A4 is a synchronous physical-attack classifier. Keep the optional
+        # argument for call compatibility, but never consume asynchronous A3b
+        # cache values in its feature schema.
+        _ = a3b
         a4_feature_vector: list[float] = [
             # A1 组
             float(a1["delta_h"]), float(a1["delta_h_roi_max"]),
@@ -1595,17 +2902,117 @@ class ModuleADetector:
             float(a3["f_flow"]), float(a3["flow_local_anomaly_ratio"]),
             float(a3["flow_residual"]), float(a3["flow_shape_score"]),
             float(a3["flow_target_relation"]), s3,
-            # A3b 组（4维）
-            float(a3b.get("p_media_raw", 0.0)),
-            float(a3b_scores.get("flow_gap", 0.0)),
-            float(a3b_scores.get("warp_residual", 0.0)),
-            float(a3b_scores.get("display", 0.0)),
         ]
+        patch_interval = max(
+            1,
+            int(getattr(self, "_a4_patch_feature_interval", 1)),
+        )
+        cached_patch_features = getattr(
+            self,
+            "_a4_patch_feature_cache",
+            None,
+        )
+        patch_features_reused = bool(
+            frame is not None
+            and frame_idx is not None
+            and cached_patch_features is not None
+            and int(frame_idx) % patch_interval != 0
+        )
+        if patch_features_reused:
+            patch_features = cached_patch_features
+        else:
+            patch_features = extract_a4_patch_features(frame)
+            if frame is not None:
+                self._a4_patch_feature_cache = patch_features
+        patch_baseline_vectors = getattr(
+            self,
+            "_a4_patch_baseline_vectors",
+            None,
+        )
+        if patch_baseline_vectors is None:
+            patch_baseline_vectors = deque(maxlen=12)
+            self._a4_patch_baseline_vectors = patch_baseline_vectors
+        if frame is not None and len(patch_baseline_vectors) < 12:
+            patch_baseline_vectors.append(tuple(patch_features))
+        patch_baseline_ready = len(patch_baseline_vectors) >= 12
+        if patch_baseline_vectors:
+            patch_baseline = np.median(
+                np.asarray(patch_baseline_vectors, dtype=np.float32),
+                axis=0,
+            )
+            patch_delta_features = tuple(
+                float(current - baseline)
+                for current, baseline in zip(
+                    patch_features,
+                    patch_baseline,
+                    strict=True,
+                )
+            )
+        else:
+            patch_delta_features = (0.0,) * len(patch_features)
+        a4_feature_vector.extend(float(value) for value in patch_features)
+        a4_feature_vector.extend(patch_delta_features)
 
-        # 贡献权重：优先从分类器 feature_importances_ 按模块分组求和，再乘当前帧分数
-        # 无分类器时用固定经验乘数（1.00/1.08/1.12）回退
-        if self._classifier is not None and hasattr(self._classifier, "feature_importances_"):
-            fi = self._classifier.feature_importances_  # shape (20,)
+        classifier_used = False
+        classifier_p_adv: float | None = None
+        if (
+            self._classifier is not None
+            and self.a4_classifier_loaded
+            and not self._a4_classifier_runtime_disabled
+        ):
+            try:
+                expected = int(
+                    getattr(
+                        self._classifier,
+                        "n_features_in_",
+                        len(a4_feature_vector),
+                    )
+                    or len(a4_feature_vector)
+                )
+                actual = len(a4_feature_vector)
+                if expected != actual:
+                    raise ValueError(
+                        "feature_schema_mismatch:"
+                        f"expected={expected},actual={actual}"
+                    )
+                if hasattr(self._classifier, "feature_importances_"):
+                    importance_count = int(
+                        np.asarray(
+                            self._classifier.feature_importances_
+                        ).size
+                    )
+                    if importance_count != actual:
+                        raise ValueError(
+                            "feature_schema_mismatch:"
+                            f"importances={importance_count},actual={actual}"
+                        )
+                classifier_p_adv = float(
+                    self._classifier.predict_proba(
+                        [a4_feature_vector]
+                    )[0][1]
+                )
+                if not math.isfinite(classifier_p_adv):
+                    raise ValueError(
+                        f"non_finite_probability:{classifier_p_adv}"
+                    )
+                classifier_used = True
+                self.a4_classifier_error = None
+                self.a4_classifier_fallback_reason = "none"
+            except Exception as exc:
+                self._a4_classifier_runtime_disabled = True
+                self.a4_classifier_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self.a4_classifier_fallback_reason = (
+                    "feature_schema_mismatch"
+                    if "feature_schema_mismatch" in str(exc)
+                    else "predict_failed"
+                )
+
+        # 贡献权重：只在本帧分类器确实成功使用时读取其重要性；任何降级路径
+        # 都使用固定经验乘数，避免错误资产继续影响 dominant input。
+        if classifier_used and hasattr(self._classifier, "feature_importances_"):
+            fi = self._classifier.feature_importances_  # shape (16,)
             # 用各模块的全局重要性之和作为乘数，比固定 1.00/1.08/1.12 更有数据依据
             w1 = s1 * float(np.sum(fi[0:5]))    # A1 (5维): ~0.328
             w2 = s2 * float(np.sum(fi[5:10]))   # A2 (5维): ~0.297
@@ -1638,29 +3045,40 @@ class ModuleADetector:
             + 0.20 * _score(synergy, 0.06, 0.22)
         )
 
-        if self._classifier is not None:
-            try:
-                # 分类器可能是旧版(20维) 也可能是含P4的新版(25维)；按其期望维度裁/补零。
-                expected = int(getattr(self._classifier, "n_features_in_", len(a4_feature_vector)) or len(a4_feature_vector))
-                if expected == len(a4_feature_vector):
-                    fv = a4_feature_vector
-                elif expected < len(a4_feature_vector):
-                    fv = a4_feature_vector[:expected]
-                else:
-                    fv = a4_feature_vector + [0.0] * (expected - len(a4_feature_vector))
-                p_adv_raw = float(self._classifier.predict_proba([fv])[0][1])
-            except Exception:
-                p_adv_raw = self._rule_p_adv(max_score, second_score, third_score, multi_evidence)
+        rule_p_adv = self._rule_p_adv(
+            max_score,
+            second_score,
+            third_score,
+            multi_evidence,
+        )
+        if classifier_used and classifier_p_adv is not None:
+            p_adv_raw = max(rule_p_adv, classifier_p_adv)
         else:
-            p_adv_raw = self._rule_p_adv(max_score, second_score, third_score, multi_evidence)
+            p_adv_raw = rule_p_adv
 
         p_adv_calibrated = _clamp(p_adv_raw)
         p_adv = p_adv_calibrated
+        decision_threshold = float(
+            self.a4_classifier_decision_threshold
+            if classifier_used
+            else self.theta_adv
+        )
+        classifier_triggered = bool(
+            classifier_used
+            and classifier_p_adv is not None
+            and patch_baseline_ready
+            and classifier_p_adv >= decision_threshold
+        )
+        rule_triggered = bool(rule_p_adv >= self.theta_adv)
+        fused_triggered = bool(rule_triggered or classifier_triggered)
+        if classifier_triggered:
+            dominant = "A4_PATCH_CLASSIFIER"
         return {
             "p_adv_raw": float(p_adv_raw),
             "p_adv_calibrated": float(p_adv_calibrated),
             "p_adv": float(p_adv),
-            "p_adv_triggered": bool(p_adv >= self.theta_adv),
+            "p_adv_triggered": fused_triggered,
+            "a4_rule_triggered": rule_triggered,
             "a1_contribution": float(contributions["a1_contribution"]),
             "a2_contribution": float(contributions["a2_contribution"]),
             "a3_contribution": float(contributions["a3_contribution"]),
@@ -1670,8 +3088,45 @@ class ModuleADetector:
             "a4_multi_evidence": float(multi_evidence),
             "a4_synergy": float(synergy),
             "a4_feature_vector": a4_feature_vector,
-            "a4_classifier_used": self._classifier is not None,
+            "a4_patch_feature_count": len(patch_features),
+            "a4_patch_delta_feature_count": len(patch_delta_features),
+            "a4_patch_feature_interval": patch_interval,
+            "a4_patch_features_reused": patch_features_reused,
+            "a4_patch_baseline_samples": len(patch_baseline_vectors),
+            "a4_patch_baseline_ready": patch_baseline_ready,
+            "a4_classifier_used": bool(classifier_used),
+            "a4_classifier_p_adv": (
+                None
+                if classifier_p_adv is None
+                else float(classifier_p_adv)
+            ),
+            "a4_classifier_triggered": classifier_triggered,
+            "a4_rule_p_adv": float(rule_p_adv),
+            "a4_classifier_configured": bool(
+                self.a4_classifier_configured
+            ),
+            "a4_classifier_loaded": bool(self.a4_classifier_loaded),
+            "a4_classifier_error": self.a4_classifier_error,
+            "a4_classifier_fallback_reason": (
+                self.a4_classifier_fallback_reason
+            ),
+            "a4_classifier_path": self.a4_classifier_path,
+            "a4_classifier_resolved_path": (
+                self.a4_classifier_resolved_path
+            ),
+            "a4_classifier_metadata": dict(
+                self.a4_classifier_metadata
+            ),
+            "a4_feature_schema_version": A4_FEATURE_SCHEMA_VERSION,
+            "a4_feature_names": list(A4_FEATURE_NAMES),
+            "a4_async_a3b_features_used": False,
             "theta_adv": float(self.theta_adv),
+            "a4_decision_threshold": decision_threshold,
+            "a4_decision_threshold_source": (
+                "classifier_metadata"
+                if classifier_used
+                else "runtime_rule_config"
+            ),
         }
 
     @staticmethod
@@ -1765,8 +3220,13 @@ class ModuleADetector:
         这样常年模糊/低对比的场景不会误报，只有突发退化才告警。
         """
         # 1) 逐帧清晰度(拉普拉斯方差)：优先 Rust 单遍融合(免中间float32数组+二次遍历)，回退 cv2
-        if _NATIVE is not None and hasattr(_NATIVE, "blinding_laplacian_var"):
-            sharpness = float(_NATIVE.blinding_laplacian_var(np.ascontiguousarray(gray, dtype=np.uint8)))
+        native_result = self._native_call(
+            "blind",
+            "blinding_laplacian_var",
+            np.ascontiguousarray(gray, dtype=np.uint8),
+        )
+        if native_result is not None:
+            sharpness = float(native_result)
         else:
             lap = cv2.Laplacian(gray, cv2.CV_32F)
             sharpness = float(lap.var())
@@ -1787,16 +3247,28 @@ class ModuleADetector:
                 "sharpness": sharpness, "contrast": contrast, "det_strength": det_strength,
                 "sharp_drop": 0.0, "contrast_drop": 0.0, "det_drop": 0.0,
                 "glare_blind": 0.0, "target_loss": 0.0, "blind_type": "none",
+                "sharp_drop_short": float(sharp_drop_short),
+                "blind_independent_support": False,
             }
         if not ready:
             # P1 冷启动绝对兜底：场景基线未就绪时(如视频开头即攻击)，靠"曾有目标却骤然漏检
             # + (帧间清晰度骤降 或 强过曝)"判定致盲——目标丢失是强证据但需退化佐证防误报。
             now_lost = len(rois) == 0
             degrade = max(sharp_drop_short, glare_blind0)
+            cold_independent_support = bool(
+                glare_blind0 >= 0.30
+                or (
+                    recent_present
+                    and now_lost
+                    and sharp_drop_short >= 0.12
+                )
+            )
             if recent_present and now_lost:
                 p_cold = _clamp(0.45 + 0.55 * degrade)
             else:
                 p_cold = _clamp(0.70 * glare_blind0)
+            if not cold_independent_support:
+                p_cold = min(p_cold, 0.40)
             btype = "cold_glare" if glare_blind0 >= sharp_drop_short else "cold_blur"
             return {
                 "p_blind": float(p_cold), "p_blind_triggered": bool(p_cold >= self.theta_blind),
@@ -1804,6 +3276,11 @@ class ModuleADetector:
                 "det_strength": det_strength, "sharp_drop": float(sharp_drop_short),
                 "contrast_drop": 0.0, "det_drop": 0.0, "glare_blind": float(glare_blind0),
                 "target_loss": float(recent_present and now_lost), "blind_type": btype,
+                "sharp_drop_short": float(sharp_drop_short),
+                "low_motion_target_loss_support": False,
+                "blind_independent_support": bool(
+                    cold_independent_support
+                ),
             }
 
         # 2) 本场景参考值（分位数，鲁棒于个别异常帧）
@@ -1837,18 +3314,62 @@ class ModuleADetector:
         else:
             blind_type = "visibility"
 
-        # Normal camera/worker motion can drop sharpness and detector strength
-        # together for a short burst. Treat that as a motion artifact unless the
-        # frame also carries attack-like exposure evidence. This keeps Branch B
-        # focused on blinding/flash attacks instead of ordinary panning blur.
-        if (
+        # A motion-blur score can be large when ordinary worker motion, helmet
+        # removal, or a head turn causes the detector confidence to disappear.
+        # The independent low-motion branch captures the opposite physical
+        # pattern: targets disappear while the whole scene remains stable and
+        # sharpness stays below its own baseline for several frames.  This is
+        # the characteristic signal in true blur/visibility degradation, and
+        # it does not treat ordinary high-motion target exit as blur evidence.
+        # Normalize Laplacian energy by the frame luminance variance.  This
+        # separates a real loss of high-frequency detail from a naturally
+        # high-detail scene whose target detector temporarily drops out:
+        # both can have a large relative sharpness delta, but only the former
+        # has little residual edge energy for its remaining contrast.
+        blur_detail_ratio = sharpness / max(contrast * contrast, 1e-6)
+        motion_blur_scene_degradation_support = bool(
+            blur_detail_ratio <= 0.25
+            and float(
+                exposure.get("underexposed_ratio", 0.0)
+            ) < 0.10
+            and float(
+                exposure.get("frame_diff_global", 0.0)
+            ) <= 0.015
+            and float(
+                flow.get("global_motion_weight", 0.0)
+            ) <= 0.45
+        )
+        low_motion_target_loss_support = bool(
             blind_type == "motion_blur"
-            and float(exposure.get("frame_diff_global", 0.0)) >= 0.080
-            and float(exposure.get("exposure_delta", 0.0)) < 0.020
-            and glare_blind < 0.30
-        ):
+            and sharp_drop >= 0.18
+            and target_loss >= 0.50
+            and motion_blur_scene_degradation_support
+        )
+        if low_motion_target_loss_support:
+            low_motion_blind_score = _clamp(
+                self.theta_blind
+                + 0.20 * _score(sharp_drop, 0.18, 0.40)
+                + 0.15 * _score(target_loss, 0.50, 1.0)
+            )
+            p_blind = max(p_blind, low_motion_blind_score)
+
+        motion_blur_visual_degradation_support = bool(
+            motion_blur_scene_degradation_support
+            and (
+                contrast_drop >= 0.18
+                or sharp_drop >= 0.85
+                or sharp_drop_short >= 0.12
+            )
+        )
+        motion_blur_independent_support = bool(
+            blind_type != "motion_blur"
+            or low_motion_target_loss_support
+            or motion_blur_visual_degradation_support
+            or float(exposure.get("exposure_delta", 0.0)) >= 0.010
+            or float(exposure.get("overexposure_ratio", 0.0)) >= 0.10
+        )
+        if blind_type == "motion_blur" and not motion_blur_independent_support:
             p_blind = min(p_blind, 0.40)
-            blind_type = "motion_blur_scene_motion"
 
         return {
             "p_blind": float(p_blind),
@@ -1859,6 +3380,15 @@ class ModuleADetector:
             "sharp_drop": float(sharp_drop), "contrast_drop": float(contrast_drop),
             "det_drop": float(det_drop), "glare_blind": float(glare_blind),
             "target_loss": float(target_loss), "blind_type": blind_type,
+            "sharp_drop_short": float(sharp_drop_short),
+            "blur_detail_ratio": float(blur_detail_ratio),
+            "motion_blur_scene_degradation_support": bool(
+                motion_blur_scene_degradation_support
+            ),
+            "low_motion_target_loss_support": bool(
+                low_motion_target_loss_support
+            ),
+            "blind_independent_support": bool(motion_blur_independent_support),
         }
 
     @staticmethod
@@ -2136,10 +3666,14 @@ class ModuleADetector:
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
         edges = cv2.Canny(blur, 60, 160)
         edge_mask = edges > 0
-        # 原生路径需要 uint8 连续视图（C-contiguous）；只算一次，供逐候选 a3b_one_box_stats 复用。
-        edge_mask_u8 = np.ascontiguousarray(edge_mask, dtype=np.uint8) if _NATIVE is not None else None
+        # 原生路径需要 uint8 连续视图（C-contiguous）；候选几何先集中，
+        # 随后整帧一次调用 a3b_boxes_stats，避免逐框 Python→Rust 往返。
+        edge_mask_u8 = np.ascontiguousarray(edge_mask, dtype=np.uint8)
         frame_area = float(width * height)
         candidates: list[dict[str, Any]] = []
+        pending_candidate_specs: list[dict[str, Any]] = []
+        collecting_candidate_specs = True
+        native_result_unset = object()
 
         def _odd(value: float) -> int:
             int_value = max(3, int(round(float(value))))
@@ -2165,10 +3699,11 @@ class ModuleADetector:
             source: str,
             contour_area: float | None = None,
             quad_score_hint: float | None = None,
+            native_result_override: Any = native_result_unset,
         ) -> None:
             # 全局候选上限：复杂画面会产生数百个候选，每个都做昂贵的逐框统计
             # （边界/纹理/IoU），不设上限会使单轮飙到 200-500ms 并抢 GIL 拖垮主路径。
-            if len(candidates) >= 64:
+            if not collecting_candidate_specs and len(candidates) >= 64:
                 return
             clipped = _clip_box(box, width, height, min_size=18)
             if clipped is None:
@@ -2184,11 +3719,34 @@ class ModuleADetector:
             quad_score = float(quad_score_hint) if quad_score_hint is not None else 0.65
             aspect = (x2 - x1) / max(1.0, y2 - y1)
             aspect_score = 1.0 if 0.34 <= aspect <= 3.20 else (0.62 if 0.24 <= aspect <= 4.20 else 0.35)
+            if collecting_candidate_specs:
+                pending_candidate_specs.append(
+                    {
+                        "box": clipped,
+                        "source": source,
+                        "contour_area": contour_area,
+                        "quad_score_hint": quad_score_hint,
+                    }
+                )
+                return
             local_edges = edge_mask[y1:y2, x1:x2]
-            if _NATIVE is not None:
+            native_result = (
+                self._native_call(
+                    "a3b",
+                    "a3b_one_box_stats",
+                    edge_mask_u8,
+                    gray,
+                    int(x1),
+                    int(y1),
+                    int(x2),
+                    int(y2),
+                )
+                if native_result_override is native_result_unset
+                else native_result_override
+            )
+            if native_result is not None:
                 (edge_density, border_edge_density, inner_edge_density,
-                 border_mean, inner_mean, gray_std) = _NATIVE.a3b_one_box_stats(
-                    edge_mask_u8, gray, int(x1), int(y1), int(x2), int(y2))
+                 border_mean, inner_mean, gray_std) = native_result
                 edge_score = _clamp(edge_density / 0.16)
                 boundary_score = _clamp(
                     0.70 * (border_edge_density / 0.22)
@@ -2330,41 +3888,8 @@ class ModuleADetector:
             return np.convolve(values.astype(np.float32), kernel, mode="same")
 
         def _peak_lines(values: np.ndarray, limit: int) -> list[tuple[int, float]]:
-            if values.size == 0:
-                return []
-            vmax = float(np.max(values))
-            if vmax <= 1e-6:
-                return []
-            norm = values.astype(np.float32) / vmax
-            threshold = max(0.18, float(np.percentile(norm, 88)) * 0.82)
-            groups: list[tuple[int, float]] = []
-            start: int | None = None
-            for idx, value in enumerate(norm):
-                if value >= threshold and start is None:
-                    start = idx
-                elif value < threshold and start is not None:
-                    end = idx
-                    segment = norm[start:end]
-                    weights = segment + 1e-4
-                    center = int(round(float(np.average(np.arange(start, end), weights=weights))))
-                    groups.append((center, float(np.max(segment))))
-                    start = None
-            if start is not None:
-                end = len(norm)
-                segment = norm[start:end]
-                weights = segment + 1e-4
-                center = int(round(float(np.average(np.arange(start, end), weights=weights))))
-                groups.append((center, float(np.max(segment))))
-            groups.sort(key=lambda item: item[1], reverse=True)
-            selected: list[tuple[int, float]] = []
             min_gap = max(8, int(min(width, height) * 0.035))
-            for center, strength in groups:
-                if all(abs(center - old_center) >= min_gap for old_center, _ in selected):
-                    selected.append((center, strength))
-                if len(selected) >= limit:
-                    break
-            selected.sort(key=lambda item: item[0])
-            return selected
+            return _projection_peak_lines(values, limit, min_gap)
 
         sobel_x = np.abs(cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3))
         sobel_y = np.abs(cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3))
@@ -2391,6 +3916,49 @@ class ModuleADetector:
                             contour_area=None,
                             quad_score_hint=_clamp(0.55 + 0.45 * line_strength),
                         )
+
+        collecting_candidate_specs = False
+        pending_candidate_specs = pending_candidate_specs[:64]
+        batch_native_results: list[Any] | None = None
+        if pending_candidate_specs:
+            raw_batch_results = self._native_call(
+                "a3b",
+                "a3b_boxes_stats",
+                edge_mask_u8,
+                gray,
+                tuple(
+                    tuple(int(value) for value in spec["box"])
+                    for spec in pending_candidate_specs
+                ),
+            )
+            if raw_batch_results is not None:
+                normalized_batch_results = list(raw_batch_results)
+                if len(normalized_batch_results) == len(
+                    pending_candidate_specs
+                ):
+                    batch_native_results = normalized_batch_results
+                else:
+                    self.native_fallback_counts["a3b"] += 1
+                    self.native_last_error = (
+                        "a3b:a3b_boxes_stats:result_length_mismatch:"
+                        f"expected={len(pending_candidate_specs)}:"
+                        f"actual={len(normalized_batch_results)}"
+                    )
+                    self._native_status_dirty = True
+
+        for index, spec in enumerate(pending_candidate_specs):
+            native_result = (
+                batch_native_results[index]
+                if batch_native_results is not None
+                else None
+            )
+            _add_candidate(
+                spec["box"],
+                source=str(spec["source"]),
+                contour_area=spec["contour_area"],
+                quad_score_hint=spec["quad_score_hint"],
+                native_result_override=native_result,
+            )
 
         def _selection_score(item: dict[str, Any]) -> float:
             box = item["bbox"]
@@ -2590,6 +4158,23 @@ class ModuleADetector:
                     scores.get("target_iou", 0.0) >= 0.55
                     and candidate_area_ratio < 0.040
                 )
+            )
+            # The authoritative A3b clip contains a clearly bounded phone
+            # display whose internal person detections make the display plane
+            # look "target-near".  Camera motion can also make the same stable
+            # display look like a background window.  Do not let those scene
+            # heuristics veto a physically strong display plane: the edge band
+            # deliberately excludes the saturated high-edge natural structures
+            # seen in the fixed outdoor normal clip.
+            robust_display_plane = bool(
+                strong_evidence
+                and p_media_raw >= self.theta_media_raw
+                and display_frame >= 0.70
+                and scores.get("border_contrast", 0.0) >= 0.80
+                and 0.40 <= scores.get("edge", 0.0) <= 0.62
+                and scores.get("rect", 0.0) >= 0.60
+                and source_score >= 0.70
+                and candidate_area_ratio >= 0.08
             )
             touches_edge = x1 <= 4 or y1 <= 4 or x2 >= width - 4 or y2 >= height - 4
             large_background_plane = bool(
@@ -2947,6 +4532,14 @@ class ModuleADetector:
                 score_cap = max(score_cap, 0.72)
                 suppressed_reason = "none"
                 background_static_suppressed = False
+            if robust_display_plane and suppressed_reason in (
+                "target_near_small_scene_plane",
+                "background_window_camera_motion",
+                "background_transient_motion_plane",
+            ):
+                score_cap = max(score_cap, 0.72)
+                suppressed_reason = "none"
+                background_static_suppressed = False
             # 纯静止背景最终防线（对应生产代码 _merge_static_image 的 score_cap=0.08 逻辑）
             # 放在 screen_like_evidence 覆写之后，不可被绕过。
             # 判定依据：no target-related + 无运动差异 + 无翻拍物理证据。
@@ -2991,6 +4584,74 @@ class ModuleADetector:
             "a3b_state": a3b_state,
         }
 
+    def _a3b_result_source_frame_units(
+        self,
+        a3b: dict[str, Any],
+    ) -> int:
+        """Convert one new A3b result into source-frame-equivalent coverage.
+
+        ``a3b_result_seq`` remains the dedupe key.  Temporal progress is derived
+        from the result's source lineage so static-image interval, worker delay,
+        and a small number of dropped detector frames do not silently redefine
+        ``media_run`` or the confirmation window.
+        """
+
+        interval_units = max(
+            1,
+            int(a3b.get("a3b_source_interval_frames", 1) or 1),
+        )
+        source_frame_idx: int | None = None
+        try:
+            raw_frame_idx = a3b.get("a3b_source_frame_idx")
+            if raw_frame_idx is not None and not isinstance(
+                raw_frame_idx,
+                bool,
+            ):
+                source_frame_idx = int(raw_frame_idx)
+        except (TypeError, ValueError):
+            source_frame_idx = None
+
+        source_timestamp: float | None = None
+        try:
+            raw_timestamp = a3b.get("a3b_source_timestamp")
+            if raw_timestamp is not None:
+                candidate_timestamp = float(raw_timestamp)
+                if math.isfinite(candidate_timestamp):
+                    source_timestamp = candidate_timestamp
+        except (TypeError, ValueError):
+            source_timestamp = None
+
+        units = interval_units
+        previous_frame_idx = self._a3b_last_consumed_source_frame_idx
+        if (
+            source_frame_idx is not None
+            and previous_frame_idx is not None
+            and source_frame_idx > previous_frame_idx
+        ):
+            units = max(units, source_frame_idx - previous_frame_idx)
+
+        source_fps = 0.0
+        try:
+            source_fps = float(a3b.get("a3b_source_fps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            source_fps = 0.0
+        previous_timestamp = self._a3b_last_consumed_source_timestamp
+        if (
+            source_timestamp is not None
+            and previous_timestamp is not None
+            and source_timestamp > previous_timestamp
+            and math.isfinite(source_fps)
+            and source_fps > 0.0
+        ):
+            timestamp_units = int(
+                round((source_timestamp - previous_timestamp) * source_fps)
+            )
+            units = max(units, timestamp_units)
+
+        self._a3b_last_consumed_source_frame_idx = source_frame_idx
+        self._a3b_last_consumed_source_timestamp = source_timestamp
+        return max(1, int(units))
+
     def _joint_decision(
         self,
         a1: dict[str, Any],
@@ -3005,6 +4666,23 @@ class ModuleADetector:
         blinding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         blinding = blinding or {}
+        adv_threshold = float(
+            a4.get("a4_decision_threshold", self.theta_adv)
+        )
+        classifier_adv_rescue_requested = bool(
+            a4.get("a4_classifier_used", False)
+            and a4.get("a4_patch_baseline_ready", False)
+            and a4.get("a4_classifier_triggered", False)
+        )
+        classifier_adv_rescue_dark_scene_blocked = bool(
+            classifier_adv_rescue_requested
+            and float(exposure.get("underexposed_ratio", 0.0))
+            >= self._a4_classifier_rescue_underexposed_max
+        )
+        classifier_adv_rescue = bool(
+            classifier_adv_rescue_requested
+            and not classifier_adv_rescue_dark_scene_blocked
+        )
         window_frames = int(math.ceil(float(self.process_fps) * 0.5))
         window_frames = int(max(3, min(8, window_frames)))
         adv_hit_required = int(math.ceil(window_frames * (0.67 if exposure["high_false_positive_scene"] else 0.60)))
@@ -3111,7 +4789,7 @@ class ModuleADetector:
         visibility_texture_probe = False
         visibility_texture_rescue = bool(
             bool(a1.get("a1_visibility_hold_active", False))
-            and a4["p_adv"] >= self.theta_adv
+            and bool(a4.get("p_adv_triggered", False))
             and float(a1["a1_feature_score"]) >= 0.55
             and float(a1.get("delta_h_roi_patch_max", 0.0)) >= 0.58
             and float(a1.get("delta_h_patch_concentration", 0.0)) >= 0.72
@@ -3169,7 +4847,7 @@ class ModuleADetector:
         )
         adv_multi_evidence_rescue = bool(
             physical_patch_rescue_signal
-            and a4["p_adv"] >= self.theta_adv
+            and bool(a4.get("p_adv_triggered", False))
             and max_feature >= 0.40
             and float(a4.get("a4_multi_evidence", 0.0)) >= 0.34
             and physical_patch_rescue_evidence
@@ -3235,8 +4913,6 @@ class ModuleADetector:
             and not adv_multi_evidence_rescue
         )
         structural_adv_evidence_rescue = False
-        ta_suspicious = bool(ta_result["suspicious"]) if ta_result is not None else True
-        ta_classifier_bonus = bool(ta_result.get("classifier_bonus", False)) if ta_result is not None else False
         # 场景自适应基线抑制（P0）：用 z-score 对**运动场景也生效**，压制干净高能工地场景误报。
         # 当前最强特征分在本场景滚动分布的正常带内(z<2 且不远超 p80)即视为场景固有高能纹理/运动，
         # 抑制支路A候选；真实攻击会显著超出本场景分布(z≫2)不被误抑。adv 多证据/可见性救援时不抑。
@@ -3258,9 +4934,13 @@ class ModuleADetector:
                 and not adv_multi_evidence_rescue
                 and not structural_adv_evidence_rescue
                 and not visibility_texture_rescue
+                and not classifier_adv_rescue
             )
         adv_candidate_allowed = bool(
-            (a4["p_adv"] >= self.theta_adv or structural_adv_evidence_rescue)
+            (
+                bool(a4.get("p_adv_triggered", False))
+                or structural_adv_evidence_rescue
+            )
             and (max_feature >= 0.48 or adv_multi_evidence_rescue or visibility_texture_rescue)
             and (
                 target_related_feature
@@ -3284,34 +4964,298 @@ class ModuleADetector:
             and not a3_only_background_motion
             and not scene_baseline_normal
         )
+        rule_adv_candidate_allowed = bool(adv_candidate_allowed)
+        if classifier_adv_rescue:
+            adv_candidate_allowed = True
+        localized_patch_context = bool(
+            a3b_reason in {
+                "target_attached_patch_prefers_A1_A2_A3",
+                "target_attached_small_occluder_prefers_A1_A2_A3",
+                "target_attached_small_screen_fragment_prefers_A1_A2_A3",
+                "target_attached_weak_display_plane_prefers_A1_A2_A3",
+            }
+        )
+        localized_a1_attack_support = bool(
+            float(a1["a1_feature_score"]) >= 0.78
+            and float(
+                a1.get("delta_h_roi_patch_max", 0.0)
+            ) >= 0.55
+            and float(
+                a1.get("delta_h_patch_concentration", 0.0)
+            ) >= 0.70
+            and localized_patch_context
+        )
+        glare_attack_support = bool(
+            float(
+                exposure.get("overexposure_ratio", 0.0)
+            ) >= 0.10
+            and float(
+                exposure.get("underexposed_ratio", 0.0)
+            ) < 0.10
+            and max(
+                float(a1["a1_feature_score"]),
+                float(a2["a2_feature_score"]),
+            ) >= 0.78
+        )
+        photometric_attack_support = bool(
+            glare_attack_support
+            or (
+                bool(a2.get("flash_like", False))
+                and float(a2["a2_feature_score"]) >= 0.55
+                and (
+                    float(
+                        exposure.get("exposure_delta", 0.0)
+                    ) >= 0.020
+                    or float(
+                        exposure.get("overexposure_ratio", 0.0)
+                    ) >= 0.10
+                )
+            )
+        )
+        a3_independent_attack_support = bool(
+            localized_a1_attack_support
+            or photometric_attack_support
+            or a3_residual_fallback
+            or no_target_fallback
+        )
+        normal_articulated_target_motion = bool(
+            target_related_feature
+            and (
+                float(a1["a1_feature_score"]) >= 0.78
+                or float(a2["a2_feature_score"]) >= 0.55
+            )
+            and not localized_a1_attack_support
+            and not photometric_attack_support
+            and exposure["exposure_delta"] < 0.020
+            and exposure["overexposure_ratio"] < 0.08
+            and exposure["underexposed_ratio"] < 0.30
+            and (
+                float(
+                    a3.get("flow_background_explain_score", 0.0)
+                ) >= 0.65
+                or (
+                    # Fixed-camera outdoor footage produces strong A2/A3
+                    # responses while people walk across the ROI.  The motion
+                    # is nevertheless temporally aligned with the target and
+                    # exposure-stable, so it must not be treated as a patch.
+                    float(a1["a1_feature_score"]) <= 0.45
+                    and float(a2["a2_feature_score"]) >= 0.78
+                    and float(
+                        a2.get("change_t_motion_aligned", 0.0)
+                    ) >= 0.44
+                    and float(
+                        a2.get("change_t_motion_explain_score", 0.0)
+                    ) >= 0.12
+                    and float(
+                        a3.get("flow_roi_coverage_ratio", 0.0)
+                    ) >= 0.05
+                    and exposure["frame_diff_global"] >= 0.012
+                )
+            )
+            and float(a3.get("flow_local_anomaly_ratio", 0.0)) < 0.18
+            and (
+                float(a3.get("flow_roi_coverage_ratio", 0.0)) >= 0.15
+                or (
+                    float(a1["a1_feature_score"]) < 0.55
+                    and float(a2["a2_feature_score"]) >= 0.55
+                    and float(
+                        a2.get("change_t_motion_aligned", 0.0)
+                    ) >= 0.80
+                    and float(
+                        a2.get(
+                            "change_t_motion_explain_score",
+                            0.0,
+                        )
+                    ) >= 0.30
+                    and float(
+                        a3.get("flow_residual_contrast", 0.0)
+                    ) < 1.20
+                )
+            )
+        )
+        normal_high_contrast_target_texture_motion = bool(
+            localized_a1_attack_support
+            and not photometric_attack_support
+            and exposure["underexposed_ratio"] >= 0.30
+            and float(a2["a2_feature_score"]) >= 0.75
+            and float(
+                a2.get("change_t_motion_aligned", 0.0)
+            ) >= 0.80
+            and float(
+                a2.get("change_t_motion_explain_score", 0.0)
+            ) >= 0.30
+            and exposure["frame_diff_global"] >= 0.020
+            and float(a3.get("flow_local_anomaly_ratio", 0.0)) < 0.18
+            and float(a3.get("flow_roi_coverage_ratio", 0.0)) < 0.10
+        )
+        normal_roi_flow_target_motion = bool(
+            dominant_adv == "A3_FLOW_ARTIFACT"
+            and bool(a3.get("target_related", False))
+            and not localized_a1_attack_support
+            and not photometric_attack_support
+            and float(a1["a1_feature_score"]) <= 0.45
+            and float(a2["a2_feature_score"]) <= 0.32
+            and exposure["frame_diff_global"] < 0.012
+            and exposure["exposure_delta"] < 0.010
+            and float(a2.get("change_t_roi_max", 0.0)) <= 0.22
+            and float(
+                a2.get("change_t_motion_aligned", 0.0)
+            ) >= 0.30
+            and float(
+                a2.get("change_t_motion_explain_score", 0.0)
+            ) >= 0.05
+            and float(a3.get("flow_local_anomaly_ratio", 0.0)) < 0.13
+            and float(a3.get("flow_max_magnitude_norm", 0.0)) < 0.70
+            and float(a3.get("flow_roi_coverage_ratio", 0.0)) >= 0.14
+        )
+        normal_target_motion_exclusion = bool(
+            normal_articulated_target_motion
+            or normal_high_contrast_target_texture_motion
+            or normal_roi_flow_target_motion
+            or (
+                target_related_feature
+                and float(
+                    a3.get("flow_roi_coverage_ratio", 0.0)
+                ) >= 0.15
+                and not a3_independent_attack_support
+            )
+        )
+        if normal_target_motion_exclusion and not classifier_adv_rescue:
+            adv_candidate_allowed = False
+            rule_adv_candidate_allowed = False
+        adv_explicitly_suppressed = bool(
+            normal_target_motion_exclusion and not classifier_adv_rescue
+        )
         media_candidate_allowed = bool(
             a3b["media_candidate_allowed"]
             and not normal_motion_texture_change
         )
-        adv_single_frame_candidate = bool(a4["p_adv_triggered"] and adv_candidate_allowed)
-        adv_physical_support = bool(
-            target_related_feature
+        effective_rule_triggered = bool(
+            a4.get("a4_rule_triggered", False)
+            or (
+                a4.get("p_adv_triggered", False)
+                and not a4.get("a4_classifier_triggered", False)
+            )
+        )
+        rule_adv_single_frame_candidate = bool(
+            rule_adv_candidate_allowed
             and (
-                (
-                    float(a1["a1_feature_score"]) >= 0.78
-                    and float(a1.get("delta_h_roi_patch_max", 0.0)) >= 0.55
-                    and float(a1.get("delta_h_patch_concentration", 0.0)) >= 0.70
-                )
-                or float(a2["a2_feature_score"]) >= 0.55
-                or float(a3["a3_feature_score"]) >= 0.65
-                or (
-                    float(a4.get("a4_multi_evidence", 0.0)) >= 0.60
-                    and max_feature >= 0.60
-                )
-                or visibility_texture_rescue
-                or a3_residual_fallback
+                effective_rule_triggered
+                or structural_adv_evidence_rescue
+            )
+        )
+        adv_single_frame_candidate = bool(
+            rule_adv_single_frame_candidate
+            or classifier_adv_rescue
+        )
+        adv_physical_support = bool(
+            classifier_adv_rescue
+            or (
+                not normal_target_motion_exclusion
+                and (target_related_feature or no_target_fallback)
+                and a3_independent_attack_support
             )
         )
         # 候选连续性桥接(2026-06-30 修 adv_patch 漏报,见 docs/技术.算法/2026-06-30-adv_patch召回根因-*)：
-        # 抑制门在持续高 p_adv 段偶发翻假会把连续候选打散,使 N-of-M 确认失败。近 K 帧内有过被放行的
-        # adv 候选、且本帧 p_adv 仍触发时,即便本帧 adv_candidate_allowed 翻假也桥接为候选。默认关(K=0)。
+        # 抑制门在持续攻击段偶发翻假会把连续候选打散,使 N-of-M 确认失败。桥接只允许跨越分数/阈值
+        # 的短暂断点：本帧仍须有特征与目标/退化上下文，且不能命中任何明确的正常场景/背景运动抑制。
+        # 因此它不会在 scene_baseline_normal、normal_target_motion_exclusion 等门已经否决当前帧时，
+        # 仅凭 raw p_adv 重新制造 candidate。remaining 表示还可容忍的 raw-trigger 断点次数。
         adv_candidate_bridged = False
+        adv_candidate_bridge_eligible = False
+        adv_candidate_bridge_explicit_suppression = bool(
+            not classifier_adv_rescue
+            and (
+                (
+                    flow.get("global_motion_weight", 0.0) >= 0.82
+                    and max_feature < 0.82
+                )
+                or (unsupported_a3_motion and not a3_residual_fallback)
+                or unsupported_a2_motion
+                or normal_motion_texture_change
+                or nonlocal_a1_a3_scene_spike
+                or low_motion_background_like_adv
+                or cold_start_low_motion_adv
+                or stationary_texture_only_adv
+                or background_plane_adv
+                or a3_only_background_motion
+                or scene_baseline_normal
+                or normal_target_motion_exclusion
+            )
+        )
+        adv_candidate_bridge_recent_physical_support = bool(
+            self._adv_cand_bridge_has_physical_support
+        )
+        adv_candidate_bridge_independent_support = bool(
+            adv_physical_support
+            or adv_candidate_bridge_recent_physical_support
+        )
+        adv_explicitly_suppressed = bool(
+            adv_candidate_bridge_explicit_suppression
+        )
+        if classifier_adv_rescue:
+            adv_explicit_suppression_reason = "none"
+        elif normal_roi_flow_target_motion:
+            adv_explicit_suppression_reason = (
+                "normal_roi_flow_target_motion"
+            )
+        elif normal_high_contrast_target_texture_motion:
+            adv_explicit_suppression_reason = (
+                "normal_high_contrast_target_texture_motion"
+            )
+        elif normal_articulated_target_motion:
+            adv_explicit_suppression_reason = (
+                "normal_articulated_target_motion"
+            )
+        elif normal_target_motion_exclusion:
+            adv_explicit_suppression_reason = (
+                "normal_target_motion_exclusion"
+            )
+        elif scene_baseline_normal:
+            adv_explicit_suppression_reason = (
+                "scene_baseline_normal"
+            )
+        elif normal_motion_texture_change:
+            adv_explicit_suppression_reason = (
+                "normal_motion_texture_change"
+            )
+        elif low_motion_background_like_adv:
+            adv_explicit_suppression_reason = (
+                "low_motion_background_like_adv"
+            )
+        elif unsupported_a3_motion:
+            adv_explicit_suppression_reason = (
+                "unsupported_a3_motion"
+            )
+        elif unsupported_a2_motion:
+            adv_explicit_suppression_reason = (
+                "unsupported_a2_motion"
+            )
+        else:
+            adv_explicit_suppression_reason = (
+                "adv_candidate_policy_suppressed"
+                if adv_explicitly_suppressed
+                else "none"
+            )
+        adv_candidate_bridge_blocked = bool(
+            adv_candidate_bridge_explicit_suppression
+        )
+        adv_candidate_bridge_support = bool(
+            max_feature >= 0.40
+            and (
+                target_related_feature
+                or no_target_fallback
+                or a3_residual_fallback
+                or adv_multi_evidence_rescue
+                or visibility_texture_rescue
+            )
+        )
         if adv_single_frame_candidate:
+            self._adv_cand_bridge_has_physical_support = bool(
+                self._adv_cand_bridge_has_physical_support
+                and self._adv_cand_bridge_remaining > 0
+                or adv_physical_support
+            )
             self._adv_cand_bridge_remaining = self._adv_cand_bridge_frames
         elif (
             self._adv_cand_bridge_frames > 0
@@ -3319,40 +5263,139 @@ class ModuleADetector:
             and bool(a4["p_adv_triggered"])
         ):
             self._adv_cand_bridge_remaining -= 1
-            adv_single_frame_candidate = True
-            adv_candidate_bridged = True
+            adv_candidate_bridge_eligible = bool(
+                a4["p_adv_triggered"]
+                and (
+                    adv_candidate_bridge_support
+                    or adv_candidate_bridge_recent_physical_support
+                )
+                and not adv_candidate_bridge_blocked
+            )
+            if adv_candidate_bridge_eligible:
+                adv_single_frame_candidate = True
+                adv_candidate_bridged = True
         # 支路B 致盲候选：p_blind 触发即候选（_compute_blinding 内部已做"曾有目标+退化"门控）
-        blind_single_frame_candidate = bool(blinding.get("p_blind_triggered", False))
+        blind_independent_support = bool(
+            blinding.get("blind_independent_support", False)
+        )
+        blind_explicitly_suppressed = bool(
+            blinding.get("p_blind_triggered", False)
+            and not blind_independent_support
+        )
+        blind_single_frame_candidate = bool(
+            blinding.get("p_blind_triggered", False)
+            and blind_independent_support
+        )
         # A3b 独立触发: demo 默认禁用(背景结构墙/门框误报)。config rebuilt_a3b_independent_trigger
         # 开启时恢复候选, 经收紧门(edge/border_contrast 数据方案)+ N-of-M 确认, 找回画中画翻拍检测。
-        media_gate_ok = bool(media_candidate_allowed)
-        if self._a3b_independent_trigger and self._a3b_tighten_gate and media_gate_ok:
-            _ms = a3b.get("p_media_scores", {}) or {}
-            _edge = float(_ms.get("edge", 0.0))
-            _bc = float(_ms.get("border_contrast", 0.0))
-            _cand = float(_ms.get("candidate_score", 0.0))
-            media_gate_ok = bool(
-                _cand >= self._a3b_gate_candidate_min
-                and self._a3b_gate_edge_min <= _edge <= self._a3b_gate_edge_max
-                and _bc >= self._a3b_gate_border_contrast_min
+        _ms = a3b.get("p_media_scores", {}) or {}
+        _edge = float(_ms.get("edge", 0.0))
+        _bc = float(_ms.get("border_contrast", 0.0))
+        _cand = float(_ms.get("candidate_score", 0.0))
+        media_result_seq = int(a3b.get("a3b_result_seq", 0) or 0)
+        media_result_fresh = bool(
+            a3b.get("a3b_result_fresh", False)
+        )
+        media_result_is_new = bool(
+            media_result_fresh
+            and media_result_seq
+            > self._a3b_last_consumed_result_seq
+        )
+        media_result_consumed = bool(
+            self._a3b_independent_trigger
+            and media_result_is_new
+        )
+        media_tighten_candidate_pass = bool(_cand >= self._a3b_gate_candidate_min)
+        media_tighten_edge_pass = bool(
+            self._a3b_gate_edge_min <= _edge <= self._a3b_gate_edge_max
+        )
+        media_tighten_border_pass = bool(
+            _bc >= self._a3b_gate_border_contrast_min
+        )
+        media_tighten_robust_display_pass = bool(
+            media_candidate_allowed
+            and bool(a3b.get("p_media_strong_evidence", False))
+            and float(a3b.get("p_media_policy", 0.0)) >= self.theta_media
+            and _cand >= max(0.55, self._a3b_gate_candidate_min - 0.15)
+            and 0.40 <= _edge <= max(0.62, self._a3b_gate_edge_max)
+            and _bc >= self._a3b_gate_border_contrast_min
+            and float(_ms.get("display_frame", 0.0)) >= 0.70
+            and float(_ms.get("area_ratio", 0.0)) >= 0.08
+            and float(_ms.get("rect", 0.0)) >= 0.60
+            and float(_ms.get("source_score", 0.0)) >= 0.70
+        )
+        media_bbox = a3b.get("p_media_bbox")
+        media_tighten_aspect_ratio = 0.0
+        if (
+            isinstance(media_bbox, (list, tuple))
+            and len(media_bbox) == 4
+        ):
+            try:
+                media_bbox_width = max(
+                    0.0,
+                    float(media_bbox[2]) - float(media_bbox[0]),
+                )
+                media_bbox_height = max(
+                    0.0,
+                    float(media_bbox[3]) - float(media_bbox[1]),
+                )
+                if media_bbox_height > 0.0:
+                    media_tighten_aspect_ratio = (
+                        media_bbox_width / media_bbox_height
+                    )
+            except (TypeError, ValueError):
+                media_tighten_aspect_ratio = 0.0
+        media_tighten_aspect_pass = bool(
+            self._a3b_gate_aspect_ratio_min
+            <= media_tighten_aspect_ratio
+            <= self._a3b_gate_aspect_ratio_max
+        )
+        media_gate_ok = bool(
+            media_candidate_allowed
+            and (
+                not self._a3b_independent_trigger
+                or media_tighten_aspect_pass
             )
-        # 持续段确认: 过门帧累计 _media_run, 达 floor 才算真候选(挡偶发闪烁负例)。容忍段内间隙。
-        if self._a3b_independent_trigger:
+        )
+        if self._a3b_independent_trigger and self._a3b_tighten_gate and media_gate_ok:
+            media_gate_ok = bool(
+                (
+                    media_tighten_candidate_pass
+                    and media_tighten_edge_pass
+                    and media_tighten_border_pass
+                    and media_tighten_aspect_pass
+                )
+                or (
+                    media_tighten_robust_display_pass
+                    and media_tighten_aspect_pass
+                )
+            )
+        # 持续段确认只消费新的成功后台结果。主循环重复读取同一缓存 seq
+        # 可以维持现有确认/hold，但不得伪装成新的独立 A3b 证据。
+        media_source_frame_units = 0
+        if media_result_consumed:
+            media_source_frame_units = (
+                self._a3b_result_source_frame_units(a3b)
+            )
+            self._a3b_last_consumed_result_seq = media_result_seq
             if media_gate_ok:
-                self._media_run += 1
+                if self._media_run_gap > self._a3b_media_run_gap_tol:
+                    self._media_run = 0
+                self._media_run += media_source_frame_units
                 self._media_run_gap = 0
-            elif self._media_run > 0 and self._media_run_gap < self._a3b_media_run_gap_tol:
-                self._media_run_gap += 1
-            else:
-                self._media_run = 0
-                self._media_run_gap = 0
+            elif self._media_run > 0:
+                self._media_run_gap += media_source_frame_units
+                if self._media_run_gap > self._a3b_media_run_gap_tol:
+                    self._media_run = 0
+                    self._media_run_gap = 0
         media_single_frame_candidate = bool(
             self._a3b_independent_trigger
+            and media_result_fresh
             and media_gate_ok
             and self._media_run >= self._a3b_media_run_floor
         )
         single_frame_candidate = bool(adv_single_frame_candidate or blind_single_frame_candidate)
-        if adv_single_frame_candidate:
+        if rule_adv_single_frame_candidate:
             self.adv_hits.append(1)
             self.adv_scores.append(float(a4["p_adv"]))
             self.adv_support_hits.append(1 if adv_physical_support else 0)
@@ -3360,26 +5403,66 @@ class ModuleADetector:
             self.adv_hits.append(0)
             self.adv_scores.append(0.0)
             self.adv_support_hits.append(0)
+        if classifier_adv_rescue_dark_scene_blocked:
+            self.classifier_adv_hits.clear()
+        self.classifier_adv_hits.append(
+            1 if classifier_adv_rescue else 0
+        )
         if blind_single_frame_candidate:
             self.blind_hits.append(1)
             self.blind_scores.append(float(blinding.get("p_blind", 0.0)))
         else:
             self.blind_hits.append(0)
             self.blind_scores.append(0.0)
-        if media_single_frame_candidate:
-            self.media_hits.append(1)
-            self.media_scores.append(float(a3b["p_media_policy"]))
-        else:
-            self.media_hits.append(0)
-            self.media_scores.append(0.0)
-        adv_count = sum(list(self.adv_hits)[-window_frames:])
+        if media_result_consumed:
+            media_vote_units = min(
+                self.max_history,
+                max(1, media_source_frame_units),
+            )
+            for _ in range(media_vote_units):
+                if media_single_frame_candidate:
+                    self.media_hits.append(1)
+                    self.media_scores.append(
+                        float(a3b["p_media_policy"])
+                    )
+                else:
+                    self.media_hits.append(0)
+                    self.media_scores.append(0.0)
+        rule_adv_count = sum(list(self.adv_hits)[-window_frames:])
+        classifier_adv_count = sum(
+            list(self.classifier_adv_hits)[
+                -self.a4_classifier_alarm_window:
+            ]
+        )
+        adv_count = max(rule_adv_count, classifier_adv_count)
         adv_support_count = sum(list(self.adv_support_hits)[-window_frames:])
         media_count = sum(list(self.media_hits)[-window_frames:])
         blind_count = sum(list(self.blind_hits)[-window_frames:])
-        adv_confirmed = bool(adv_count >= adv_hit_required and adv_support_count >= 1)
-        media_confirmed = bool(media_count >= media_hit_required)
+        rule_adv_confirmed = bool(
+            rule_adv_count >= adv_hit_required
+            and adv_support_count >= 1
+        )
+        classifier_adv_confirmed = bool(
+            classifier_adv_count
+            >= self.a4_classifier_alarm_required_hits
+        )
+        adv_confirmed = bool(
+            rule_adv_confirmed or classifier_adv_confirmed
+        )
+        media_confirmed = bool(
+            media_result_fresh
+            and media_gate_ok
+            and media_count >= media_hit_required
+        )
         # 支路B 确认：致盲攻击持续多帧（与高误报场景一致用更高占比），需曾有目标语境
-        blind_hit_required = int(math.ceil(window_frames * (0.67 if exposure["high_false_positive_scene"] else 0.60)))
+        blind_confirm_ratio = max(
+            self._blind_confirm_ratio,
+            0.67 if exposure["high_false_positive_scene"] else 0.0,
+        )
+        blind_hit_required = max(
+            3,
+            int(math.ceil(window_frames * blind_confirm_ratio)),
+        )
         blind_confirmed = bool(blind_count >= blind_hit_required)
         p_media_confirmed_score = (
             float(max(list(self.media_scores)[-window_frames:] or [0.0]))
@@ -3387,7 +5470,7 @@ class ModuleADetector:
         )
         adv_primary_preferred = bool(
             adv_confirmed
-            and a4["p_adv"] >= max(self.theta_adv, 0.70)
+            and a4["p_adv"] >= max(adv_threshold, 0.70)
             and (
                 max(float(a1["a1_feature_score"]), float(a2["a2_feature_score"])) >= 0.78
                 or (
@@ -3412,7 +5495,7 @@ class ModuleADetector:
         # adv_candidate_allowed 被 scene_baseline_normal 等否决——这正是捕获"持续攻击"的关键)。
         # 容忍段内 1 帧掉落(补丁下偶发翻假), 掉落 2 帧则视为段结束。段结束且从未升级时, 把该段
         # 长度学入 _benign_run_ref(本场景良性突发尺度, 带慢衰减); 已升级的段不污染参考(冻结)。
-        raw_adv_trigger = bool(float(a4["p_adv"]) >= self.theta_adv)
+        raw_adv_trigger = bool(a4.get("p_adv_triggered", False))
         # 无目标纯背景静止帧(pure_static_background 及 background_*_suppressed 家族, 且无 target_related):
         # p_adv 高属 XGBoost 对静止纹理的伪响应, 逐帧门已否决其为候选; 不计入持续段, 防止凭空升级。
         adv_static_bg_no_evidence = bool(
@@ -3425,12 +5508,26 @@ class ModuleADetector:
         recent_target_present = (
             sum(self.recent_target_presence) >= self._sustained_adv_recent_target_min
         )
+        sustained_adv_has_independent_support = bool(
+            adv_physical_support
+        )
+        sustained_adv_support_requirement_satisfied = bool(
+            sustained_adv_has_independent_support
+            or not self._sustained_adv_require_physical_support
+        )
+        sustained_adv_scene_allowed = bool(
+            not adv_explicitly_suppressed
+        )
         sustained_hit = bool(
             raw_adv_trigger
             and (target_related_feature or not self._sustained_adv_require_target)
             and not adv_static_bg_no_evidence
             and recent_target_present
-            and (adv_physical_support or not self._sustained_adv_require_physical_support)
+            # sustained escalation 只能救援“仍有有效候选或独立物理证据”的持续段。
+            # 若逐帧策略已明确判为 scene baseline normal，且本帧也没有 physical
+            # support，则不得仅凭 raw p_adv 推翻抑制并升级为 confirmed。
+            and sustained_adv_support_requirement_satisfied
+            and sustained_adv_scene_allowed
         )
         if sustained_hit:
             self._adv_run += 1
@@ -3467,8 +5564,11 @@ class ModuleADetector:
             self._blind_target_established = True
         blind_no_target = len(rois) == 0
         blind_degrade_evidence = (
-            float(blinding.get("sharp_drop", 0.0)) >= self._blind_sustained_degrade_min
-            or float(blinding.get("glare_blind", 0.0)) >= self._blind_sustained_degrade_min
+            blind_independent_support
+            and (
+                float(blinding.get("sharp_drop", 0.0)) >= self._blind_sustained_degrade_min
+                or float(blinding.get("glare_blind", 0.0)) >= self._blind_sustained_degrade_min
+            )
         )
         blind_run_hit = bool(
             self._blind_sustained_enabled
@@ -3493,6 +5593,7 @@ class ModuleADetector:
         global_suppressed_reason = "none"
         alert_confirmed = False
         primary_channel = "none"
+        alert_confirmation_source = "none"
         current_adv_overrides_stale_media = bool(
             adv_confirmed
             and adv_single_frame_candidate
@@ -3502,53 +5603,144 @@ class ModuleADetector:
         if (
             (adv_primary_preferred or current_adv_overrides_stale_media)
             and adv_confirmed
+            and not adv_explicitly_suppressed
             and not global_suppressed
         ):
             alert_confirmed = True
             primary_channel = "adv"
+            alert_confirmation_source = "adv_temporal"
         elif media_confirmed and not global_suppressed:
             alert_confirmed = True
             primary_channel = "media"
-        elif adv_confirmed and not global_suppressed:
+            alert_confirmation_source = "media_temporal"
+        elif (
+            adv_confirmed
+            and not adv_explicitly_suppressed
+            and not global_suppressed
+        ):
             alert_confirmed = True
             primary_channel = "adv"
-        elif blind_confirmed and not global_suppressed:
+            alert_confirmation_source = "adv_temporal"
+        elif (
+            blind_confirmed
+            and not blind_explicitly_suppressed
+            and not global_suppressed
+        ):
             alert_confirmed = True
             primary_channel = "blind"
+            alert_confirmation_source = "blind_temporal"
 
         # 持续对抗升级: 逐帧候选被 scene_baseline_normal 打散、上面各支未确认时, 若长窗内原始
         # p_adv 持续占优则强制升级为 adv 确认(绕过逐帧门, 不改动 adv_candidate_allowed 本身)。
-        if not alert_confirmed and sustained_adv_escalated and not global_suppressed:
+        if (
+            not alert_confirmed
+            and sustained_adv_escalated
+            and not adv_explicitly_suppressed
+            and not global_suppressed
+        ):
             alert_confirmed = True
             primary_channel = "adv"
+            alert_confirmation_source = "adv_sustained"
 
         # 致盲持续升级: 完全致盲(持续丢目标)时 adv/blind 逐帧通道双失效, 用"确立后持续缺席+退化佐证"
         # 的连续段作证据强制升级为 blind 确认(绕过逐帧 p_blind N-of-M)。修 glare 008/016 完全致盲漏检。
-        if not alert_confirmed and blind_sustained_escalated and not global_suppressed:
+        if (
+            not alert_confirmed
+            and blind_sustained_escalated
+            and not blind_explicitly_suppressed
+            and not global_suppressed
+        ):
             alert_confirmed = True
             primary_channel = "blind"
+            alert_confirmation_source = "blind_sustained"
 
         # --- 报警保持窗口（2026-06-30 行为调优，修复"风机出现时断警告"）---
         # 一旦确认，维持 _alert_hold_frames 帧；期间逐帧候选短暂不足也保持 ATTACK，
         # 期间再次确认则刷新保持。global_suppressed（明确抑制）时不保持。
         alert_held = False
-        if alert_confirmed:
-            self._alert_hold_remaining = self._alert_hold_frames
-            self._alert_hold_channel = primary_channel
+        alert_hold_refresh_signal = False
+        alert_hold_refresh_source = "none"
+        alert_hold_blocked_reason = "none"
+        if (
+            self._alert_hold_channel == "adv"
+            and adv_explicitly_suppressed
+        ):
+            alert_hold_blocked_reason = (
+                adv_explicit_suppression_reason
+            )
         elif (
-            self._alert_hold_frames > 0
-            and self._alert_hold_remaining > 0
+            self._alert_hold_channel == "blind"
+            and blind_explicitly_suppressed
+        ):
+            alert_hold_blocked_reason = (
+                "blind_independent_support_missing"
+            )
+        alert_hold_window_frames = (
+            self._a3b_alert_hold_frames
+            if primary_channel == "media"
+            else self._alert_hold_frames
+        )
+        if alert_confirmed:
+            self._alert_hold_remaining = alert_hold_window_frames
+            self._alert_hold_channel = primary_channel
+        elif alert_hold_blocked_reason != "none":
+            self._alert_hold_remaining = 0
+            self._alert_hold_channel = "none"
+        elif (
+            self._alert_hold_remaining > 0
             and not global_suppressed
         ):
-            # 攻击传感器仍在响(原始 p_adv>=theta_adv)时刷新保持窗, 而非单调递减:
-            # 消除"攻击持续但报警断裂"。p_adv 掉回阈下则按原帧数递减收尾。
-            if self._alert_hold_refresh_on_padv and raw_adv_trigger:
-                self._alert_hold_remaining = self._alert_hold_frames
+            # 只允许原确认通道的当前有效 candidate 刷新保持窗。旧逻辑仅凭
+            # raw p_adv>=theta_adv 就续命，会让 blind/media 告警被无关 adv 分数
+            # 延长，也会在 adv_candidate 已消失或被抑制后无限保持。
+            if self._alert_hold_channel == "adv":
+                alert_hold_refresh_signal = bool(
+                    adv_single_frame_candidate
+                )
+                alert_hold_refresh_source = "adv_candidate"
+            elif self._alert_hold_channel == "blind":
+                alert_hold_refresh_signal = bool(
+                    blind_single_frame_candidate
+                )
+                alert_hold_refresh_source = "blind_candidate"
+            elif self._alert_hold_channel == "media":
+                alert_hold_refresh_signal = bool(
+                    media_single_frame_candidate
+                )
+                alert_hold_refresh_source = "media_candidate"
+            if (
+                self._alert_hold_refresh_on_padv
+                and alert_hold_refresh_signal
+            ):
+                self._alert_hold_remaining = (
+                    self._a3b_alert_hold_frames
+                    if self._alert_hold_channel == "media"
+                    else self._alert_hold_frames
+                )
             else:
                 self._alert_hold_remaining -= 1
             alert_confirmed = True
             alert_held = True
             primary_channel = self._alert_hold_channel if self._alert_hold_channel != "none" else "adv"
+            alert_confirmation_source = f"{primary_channel}_hold"
+
+        adv_score_over_threshold = bool(
+            a4.get("p_adv_triggered", False)
+        )
+        if adv_single_frame_candidate:
+            adv_confirmation_blocked_reason = "none"
+        elif not adv_score_over_threshold:
+            adv_confirmation_blocked_reason = (
+                "score_below_threshold"
+            )
+        elif adv_explicitly_suppressed:
+            adv_confirmation_blocked_reason = (
+                adv_explicit_suppression_reason
+            )
+        else:
+            adv_confirmation_blocked_reason = (
+                "candidate_policy_rejected"
+            )
 
         if media_single_frame_candidate and adv_single_frame_candidate:
             candidate_source = "BOTH"
@@ -3587,25 +5779,158 @@ class ModuleADetector:
             "window_frames": int(window_frames),
             "adv_hit_required": int(adv_hit_required),
             "adv_support_count": int(adv_support_count),
+            "rule_adv_count": int(rule_adv_count),
+            "rule_adv_confirmed": bool(rule_adv_confirmed),
+            "classifier_adv_window": int(
+                self.a4_classifier_alarm_window
+            ),
+            "classifier_adv_hit_required": int(
+                self.a4_classifier_alarm_required_hits
+            ),
+            "classifier_adv_count": int(classifier_adv_count),
+            "classifier_adv_confirmed": bool(
+                classifier_adv_confirmed
+            ),
             "media_hit_required": int(media_hit_required),
             "blind_hit_required": int(blind_hit_required),
+            "blind_confirm_ratio": float(blind_confirm_ratio),
             "adv_count": int(adv_count),
             "media_count": int(media_count),
             "blind_count": int(blind_count),
             "alert_held": bool(alert_held),
             "alert_hold_remaining": int(self._alert_hold_remaining),
+            "alert_hold_window_frames": int(
+                self._a3b_alert_hold_frames
+                if self._alert_hold_channel == "media"
+                else self._alert_hold_frames
+            ),
         }
         return {
             "adv_single_frame_candidate": bool(adv_single_frame_candidate),
+            "rule_adv_single_frame_candidate": bool(
+                rule_adv_single_frame_candidate
+            ),
+            "adv_score_over_threshold": bool(
+                adv_score_over_threshold
+            ),
+            "adv_confirmation_blocked_reason": (
+                adv_confirmation_blocked_reason
+            ),
+            "adv_explicitly_suppressed": bool(
+                adv_explicitly_suppressed
+            ),
+            "adv_explicit_suppression_reason": (
+                adv_explicit_suppression_reason
+            ),
+            "localized_a1_attack_support": bool(
+                localized_a1_attack_support
+            ),
+            "localized_patch_context": bool(
+                localized_patch_context
+            ),
+            "photometric_attack_support": bool(
+                photometric_attack_support
+            ),
+            "glare_attack_support": bool(
+                glare_attack_support
+            ),
+            "adv_candidate_bridged": bool(adv_candidate_bridged),
+            "adv_candidate_bridge_eligible": bool(
+                adv_candidate_bridge_eligible
+            ),
+            "adv_candidate_bridge_support": bool(
+                adv_candidate_bridge_support
+            ),
+            "adv_candidate_bridge_blocked": bool(
+                adv_candidate_bridge_blocked
+            ),
+            "adv_candidate_bridge_recent_physical_support": bool(
+                adv_candidate_bridge_recent_physical_support
+            ),
+            "adv_candidate_bridge_independent_support": bool(
+                adv_candidate_bridge_independent_support
+            ),
+            "adv_candidate_bridge_explicit_suppression": bool(
+                adv_candidate_bridge_explicit_suppression
+            ),
+            "adv_candidate_bridge_remaining": int(
+                self._adv_cand_bridge_remaining
+            ),
             "media_single_frame_candidate": bool(media_single_frame_candidate),
             "single_frame_candidate": bool(single_frame_candidate),
             "candidate_source": candidate_source,
             "adv_candidate_allowed": bool(adv_candidate_allowed),
+            "classifier_adv_rescue": bool(classifier_adv_rescue),
+            "classifier_adv_rescue_requested": bool(
+                classifier_adv_rescue_requested
+            ),
+            "classifier_adv_rescue_dark_scene_blocked": bool(
+                classifier_adv_rescue_dark_scene_blocked
+            ),
+            "classifier_adv_rescue_underexposed_max": float(
+                self._a4_classifier_rescue_underexposed_max
+            ),
+            "normal_target_motion_exclusion": bool(
+                normal_target_motion_exclusion
+            ),
+            "normal_articulated_target_motion": bool(
+                normal_articulated_target_motion
+            ),
+            "normal_high_contrast_target_texture_motion": bool(
+                normal_high_contrast_target_texture_motion
+            ),
+            "normal_roi_flow_target_motion": bool(
+                normal_roi_flow_target_motion
+            ),
+            "a3_independent_attack_support": bool(
+                a3_independent_attack_support
+            ),
             "media_candidate_allowed": bool(media_candidate_allowed),
+            "media_tighten_gate_enabled": bool(self._a3b_tighten_gate),
+            "media_tighten_candidate_score": float(_cand),
+            "media_tighten_edge": float(_edge),
+            "media_tighten_border_contrast": float(_bc),
+            "media_tighten_aspect_ratio": float(
+                media_tighten_aspect_ratio
+            ),
+            "media_tighten_candidate_pass": bool(media_tighten_candidate_pass),
+            "media_tighten_edge_pass": bool(media_tighten_edge_pass),
+            "media_tighten_border_pass": bool(media_tighten_border_pass),
+            "media_tighten_robust_display_pass": bool(
+                media_tighten_robust_display_pass
+            ),
+            "media_tighten_aspect_pass": bool(
+                media_tighten_aspect_pass
+            ),
+            "media_gate_ok": bool(media_gate_ok),
+            "media_result_seq": int(media_result_seq),
+            "media_result_fresh": bool(media_result_fresh),
+            "media_result_consumed": bool(media_result_consumed),
+            "media_source_frame_units": int(
+                media_source_frame_units
+            ),
+            "media_last_consumed_result_seq": int(
+                self._a3b_last_consumed_result_seq
+            ),
+            "media_run": int(self._media_run),
+            "media_run_gap": int(self._media_run_gap),
+            "media_run_floor": int(self._a3b_media_run_floor),
+            "media_count": int(media_count),
+            "media_hit_required": int(media_hit_required),
             "adv_confirmed": bool(adv_confirmed),
             "media_confirmed": bool(media_confirmed),
             "blind_confirmed": bool(blind_confirmed),
             "blind_single_frame_candidate": bool(blind_single_frame_candidate),
+            "blind_independent_support": bool(blind_independent_support),
+            "blind_explicitly_suppressed": bool(
+                blind_explicitly_suppressed
+            ),
+            "blind_degrade_evidence": bool(blind_degrade_evidence),
+            "blind_sustained_run": int(self._blind_run),
+            "blind_sustained_floor": int(self._blind_sustained_floor),
+            "blind_sustained_escalated": bool(
+                blind_sustained_escalated
+            ),
             "p_blind": float(blinding.get("p_blind", 0.0)),
             "blind_type": str(blinding.get("blind_type", "none")),
             "scene_baseline_normal": bool(scene_baseline_normal),
@@ -3621,9 +5946,24 @@ class ModuleADetector:
             "sustained_adv_benign_ref": float(self._benign_run_ref),
             "sustained_adv_seconds": float(self._sustained_adv_seconds),
             "sustained_adv_escalated": bool(sustained_adv_escalated),
+            "sustained_adv_has_independent_support": bool(
+                sustained_adv_has_independent_support
+            ),
+            "sustained_adv_support_requirement_satisfied": bool(
+                sustained_adv_support_requirement_satisfied
+            ),
+            "sustained_adv_requires_physical_support": bool(
+                self._sustained_adv_require_physical_support
+            ),
+            "sustained_adv_scene_allowed": bool(
+                sustained_adv_scene_allowed
+            ),
             "p_media_confirmed_score": float(p_media_confirmed_score),
             "alert_confirmed": bool(alert_confirmed),
             "alert_level": alert_level,
+            "alert_confirmation_source": (
+                alert_confirmation_source
+            ),
             "primary_channel": primary_channel,
             "dominant_input": dominant_input,
             "public_reason": public_reason,
@@ -3646,6 +5986,13 @@ class ModuleADetector:
             "unsupported_a3_motion": bool(unsupported_a3_motion),
             "a3_only_background_motion": bool(a3_only_background_motion),
             "reason_codes": reason_codes,
+            "alert_hold_refresh_signal": bool(
+                alert_hold_refresh_signal
+            ),
+            "alert_hold_refresh_source": alert_hold_refresh_source,
+            "alert_hold_blocked_reason": (
+                alert_hold_blocked_reason
+            ),
             "process_fps": float(self.process_fps),
         }
 
@@ -3731,6 +6078,21 @@ class ModuleADetector:
             "p_media_confirmed_score": float(joint["p_media_confirmed_score"]),
             "media_confirmed": bool(joint["media_confirmed"]),
             "adv_single_frame_candidate": bool(joint["adv_single_frame_candidate"]),
+            "adv_score_over_threshold": bool(
+                joint.get("adv_score_over_threshold", False)
+            ),
+            "adv_confirmation_blocked_reason": str(
+                joint.get(
+                    "adv_confirmation_blocked_reason",
+                    "none",
+                )
+            ),
+            "adv_explicitly_suppressed": bool(
+                joint.get("adv_explicitly_suppressed", False)
+            ),
+            "a3_independent_attack_support": bool(
+                joint.get("a3_independent_attack_support", False)
+            ),
             "media_single_frame_candidate": bool(joint["media_single_frame_candidate"]),
             "single_frame_candidate": bool(joint["single_frame_candidate"]),
             "candidate_source": joint["candidate_source"],
@@ -3749,6 +6111,12 @@ class ModuleADetector:
             "unsupported_a3_motion": bool(joint.get("unsupported_a3_motion", False)),
             "a3_only_background_motion": bool(joint.get("a3_only_background_motion", False)),
             "alert_confirmed": bool(joint["alert_confirmed"]),
+            "alert_confirmation_source": str(
+                joint.get("alert_confirmation_source", "none")
+            ),
+            "alert_hold_blocked_reason": str(
+                joint.get("alert_hold_blocked_reason", "none")
+            ),
             "dominant_input": joint["dominant_input"],
             "primary_channel": joint["primary_channel"],
             "p_blind": float(joint.get("p_blind", 0.0)),
@@ -3860,8 +6228,11 @@ class ModuleADetector:
             )
             no_current_target = (self.recent_target_presence[-1] == 0) if self.recent_target_presence else True
             degrade_evidence = (
-                float(blinding.get("sharp_drop", 0.0)) >= self._blind_suspect_degrade_min
-                or float(blinding.get("glare_blind", 0.0)) >= self._blind_suspect_degrade_min
+                bool(blinding.get("blind_independent_support", True))
+                and (
+                    float(blinding.get("sharp_drop", 0.0)) >= self._blind_suspect_degrade_min
+                    or float(blinding.get("glare_blind", 0.0)) >= self._blind_suspect_degrade_min
+                )
             )
             if recent_target_established and no_current_target and degrade_evidence:
                 return

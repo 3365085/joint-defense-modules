@@ -148,6 +148,11 @@ class ModelSecurityService:
             "trust_store_ok": checked.ok,
             "host_fingerprint_status": checked.host_fingerprint_status,
             "host_fingerprint_hash": checked.host_fingerprint_hash,
+            "trust_store_seal_schema_version": checked.seal_schema_version,
+            "trust_store_signing_key_status": checked.signing_key_status,
+            "trust_store_signing_key_id": checked.signing_key_id,
+            "trust_store_signing_key_protection": checked.signing_key_protection,
+            "trust_store_transition_pending": checked.transition_pending,
             "registry_path": checked.registry_path,
             "registry_seal_path": checked.registry_seal_path,
             "registry_hash": checked.registry_hash,
@@ -1475,6 +1480,9 @@ class ModelSecurityService:
 
     def scan(self, *, scan_type: str = "quick", profile: str = "default", custom_model: dict[str, Any] | None = None, trust_if_low_risk: bool = False) -> dict[str, Any]:
         del trust_if_low_risk
+        integrity = self._trust_store_integrity()
+        if not integrity.ok:
+            raise ValueError(f"trust_store_compromised:{integrity.reason}")
         cfg, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
         budget = ScanBudget()
         cache_dir = self.storage.activation_cache_dir
@@ -1537,6 +1545,9 @@ class ModelSecurityService:
         custom_model: dict[str, Any] | None = None,
         auto_purify: bool | None = None,
     ) -> dict[str, Any]:
+        integrity = self._trust_store_integrity()
+        if not integrity.ok:
+            raise ValueError(f"trust_store_compromised:{integrity.reason}")
         if self._scan_thread and self._scan_thread.is_alive():
             return {"started": False, "reason": "scan_already_running"}
         self._stop_requested = False

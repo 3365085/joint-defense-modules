@@ -658,9 +658,10 @@
           <div class="sourceHint" id="modelSecuritySummary">详细扫描、净化、报告和白名单管理请打开安全中心。</div>
           <div class="sourceHint" id="runtimeModelSummary">正在读取下次启动使用的运行模型。</div>
           <div class="sourceHint" id="runtimeModelIdentity">源模型与 TensorRT engine 的 hash 绑定将在启动后显示。</div>
+          <div class="sourceHint" id="modelSecurityDeviceSummary">执行设备：等待B模块状态。</div>
+          <div class="sourceHint" id="modelSecurityWorkflowSummary">自动闭环：等待扫描、净化、复扫、导出与运行选择状态。</div>
           <div class="actions">
             <button class="secondary" id="openModelSecurityCenterBtn" type="button">打开安全中心</button>
-            <button class="secondary" id="resetCustomModelBtn" type="button" style="display:none;">下次使用默认模型</button>
           </div>
         </section>
         <label>画面叠加</label>
@@ -756,6 +757,14 @@
   </main>  <script src="/static/overlay_timeline.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
+    function getStored(key, fallback = "") {
+      try {
+        const value = localStorage.getItem(key);
+        return value === null ? fallback : value;
+      } catch (_) {
+        return fallback;
+      }
+    }
     let streamNonce = 0;
     let cameraDevicesLoaded = false;
     let lastOverlayStatus = null;
@@ -806,22 +815,18 @@
       let enabled = false;
       let path = "";
       let family = "auto";
-      let sourcePtPath = "";
       let classNamesRaw = "";
       try {
         enabled = localStorage.getItem("moduleA.lastCustomModelEnabled") === "true";
         path = localStorage.getItem("moduleA.lastModelPath") || "";
         family = localStorage.getItem("moduleA.lastCustomModelFamily") || "auto";
-        sourcePtPath = localStorage.getItem("moduleA.lastSourcePtPath") || "";
         classNamesRaw = localStorage.getItem("moduleA.lastCustomClassNames") || "";
       } catch (_) {}
-      if (/\.(pt|pth)$/i.test(path)) sourcePtPath = path;
       const options = {
         enabled: enabled && !!path,
         path,
         backend: "auto",
         model_family: family,
-        source_pt_path: sourcePtPath,
       };
       if (classNamesRaw) {
         options.class_names = classNamesRaw.split(",").map((item) => item.trim()).filter(Boolean);
@@ -830,23 +835,20 @@
     }
 
     function runtimeModelSelectionSummary(modelSecurity = {}) {
-      void modelSecurity;
       const custom = customModelOptions();
       if (custom.enabled) {
-        if (modelSecurityBypassEnabled()) {
-          return `本机自定义模型测试 · ${custom.path} · 绕过B模块准入，不写入白名单。`;
+        const recommended = modelSecurity.recommended_runtime_model || {};
+        if (recommended.path && recommended.path !== custom.path) {
+          return `已选择原模型 · ${custom.path}；普通启动将由B模块替换为净化可信模型 · ${recommended.path}。如需观察原模型投毒效果，请使用安全中心“仅测试：绕过B模块安全准入”。`;
         }
-        return `本机自定义模型测试 · ${custom.path} · 启动前由B模块执行安全准入。`;
+        return `自定义运行模型 · ${custom.path} · 启动前由B模块执行安全准入。`;
       }
-      return "生产运行已锁定 mask_bd_v4_clean_baseline.pt → TensorRT FP16；不接受自定义或历史 YOLO 模型。";
+      return "默认使用 mask_bd_v4_clean_baseline.pt 及其绑定的 TensorRT FP16；在安全中心开启后可选择其他模型，并由B模块执行安全准入。";
     }
 
     function renderRuntimeModelSelection(modelSecurity = {}) {
       const summary = $("runtimeModelSummary");
-      const resetButton = $("resetCustomModelBtn");
-      const custom = customModelOptions();
       if (summary) summary.textContent = runtimeModelSelectionSummary(modelSecurity);
-      if (resetButton) resetButton.style.display = custom.enabled ? "" : "none";
     }
 
     function shortHash(value) {
@@ -857,6 +859,18 @@
     function renderAuthoritativeModel(status = {}) {
       const target = $("runtimeModelIdentity");
       if (!target) return;
+      const runtimeCustom = status.custom_model || {};
+      if (runtimeCustom.enabled && runtimeCustom.path) {
+        const sourcePt = runtimeCustom.source_pt_path || runtimeCustom.path;
+        if (status.test_custom_model_bypass) {
+          target.textContent = `测试绕过B模块 · 实际直接运行原始模型 ${runtimeCustom.path} · 后端 ${runtimeCustom.backend || status.backend || "-"}`;
+        } else if (runtimeCustom.path.includes("_净化完毕") || sourcePt.includes("_净化完毕")) {
+          target.textContent = `B模块已替换为净化运行模型 · 实际运行 ${runtimeCustom.path} · 绑定净化PT ${sourcePt} · 后端 ${runtimeCustom.backend || status.backend || "-"}`;
+        } else {
+          target.textContent = `B模块准入后的自定义运行模型 · ${runtimeCustom.path} · 源PT ${sourcePt} · 后端 ${runtimeCustom.backend || status.backend || "-"}`;
+        }
+        return;
+      }
       const model = status.authoritative_model || {};
       const source = model.source || {};
       const engine = model.engine || {};
@@ -869,14 +883,6 @@
         `${valid} · PT ${source.path || "-"} · SHA ${shortHash(source.sha256)} · ` +
         `engine ${engine.path || status.artifact || "-"} · SHA ${shortHash(engine.sha256)} · ` +
         `类别 ${(model.class_names || []).join(", ") || "-"}`;
-    }
-
-    function modelSecurityBypassEnabled() {
-      try {
-        return localStorage.getItem("moduleA.testBypassModelSecurity") === "true";
-      } catch (_) {
-        return false;
-      }
     }
 
     function modelFamilyLabel(value) {
@@ -1723,7 +1729,7 @@
 
     function modelSecurityCompactSummary(ms, status) {
       if (!customModelOptions().enabled) {
-        return "默认生产运行使用唯一权威 PT 及其哈希绑定 TensorRT engine；B模块准入仅用于本机自定义模型测试入口。";
+        return "默认生产运行使用唯一权威 PT 及其哈希绑定 TensorRT engine；在安全中心启用自定义模型后，主监控台会通过正常启动入口执行B模块准入。";
       }
       const reasonText = modelSecurityReasonLabel(ms.blocking_reason);
       const suffix = "详细扫描、净化、报告和白名单管理请打开安全中心。";
@@ -1757,6 +1763,58 @@
       return `模型安全状态尚未确认。${suffix}`;
     }
 
+    function firstModelSecurityValue(...values) {
+      return values.find((value) => value !== undefined && value !== null && value !== "");
+    }
+
+    function renderModelSecurityExecution(ms) {
+      const deviceCandidate = firstModelSecurityValue(ms.device_policy, ms.device_status);
+      const device = deviceCandidate && typeof deviceCandidate === "object" ? deviceCandidate : {};
+      const requested = firstModelSecurityValue(ms.requested_device, ms.device_requested, device.requested_device, device.requested);
+      const effective = firstModelSecurityValue(ms.effective_device, ms.device_effective, device.effective_device, device.effective, device.runtime_device);
+      const cuda = firstModelSecurityValue(ms.cuda_available, device.cuda_available, device.cuda);
+      const fallback = firstModelSecurityValue(ms.device_fallback_reason, ms.fallback_reason, device.fallback_reason, device.reason);
+      const deviceParts = [
+        `请求 ${requested == null ? "未上报" : requested}`,
+        `实际 ${effective == null ? "未上报" : effective}`,
+        `CUDA ${cuda === true ? "可用" : cuda === false ? "不可用" : "未上报"}`,
+      ];
+      if (fallback) deviceParts.push(`回退 ${fallback}`);
+      $("modelSecurityDeviceSummary").textContent = `执行设备：${deviceParts.join(" · ")}。CPU兼容，但CUDA获得最佳演示性能。`;
+
+      if (!customModelOptions().enabled) {
+        $("modelSecurityWorkflowSummary").textContent = "自动闭环：生产权威模型不走自定义准入流程，运行模型固定为哈希绑定加速产物。";
+        return;
+      }
+      const status = String(ms.admission_status || ms.status || "unknown");
+      const scan = ms.scanning || status === "scanning" ? "扫描中" : ms.last_scan_completed || ms.last_scan_time ? "扫描已完成" : "扫描待执行";
+      const purify = ms.purifying || status === "purifying"
+        ? "净化/复扫中"
+        : ms.purification_status === "scan_clean_trusted"
+          ? "净化复扫通过"
+          : ms.purification_status && ms.purification_status !== "idle"
+            ? `净化 ${ms.purification_status}`
+            : "净化未触发";
+      const exportState = String(ms.last_export_job?.state || ms.auto_export_status || ms.accelerated_export_status || "");
+      const exportText = ms.exporting || exportState === "running"
+        ? "导出中"
+        : exportState === "completed"
+          ? "导出已完成"
+          : exportState === "failed"
+            ? "导出失败"
+            : "自动导出未启动";
+      const validationObject = ms.export_validation || ms.accelerated_validation || ms.accelerated_artifact_validation || {};
+      const validation = String(ms.export_validation_status || ms.accelerated_validation_status || validationObject.status || (validationObject.valid === true ? "passed" : validationObject.valid === false ? "failed" : ""));
+      const validationText = validation ? `验证 ${validation}` : "产物验证未上报";
+      const selectedRuntime = ms.runtime_selection?.selected || ms.selected_runtime_model || {};
+      const runtime = ms.runtime_replacement?.enabled || selectedRuntime.path
+        ? "运行候选已选择（不代表正在运行）"
+        : ms.allowed
+          ? "准入模型就绪（未声明已运行）"
+          : "运行模型待选择";
+      $("modelSecurityWorkflowSummary").textContent = `自动闭环：${scan} → ${purify} → ${exportText} → ${validationText} → ${runtime}。`;
+    }
+
     function renderModelSecurity(ms) {
       ms = ms || {};
       lastModelSecurity = ms;
@@ -1770,6 +1828,7 @@
       const summaryNode = $("modelSecuritySummary");
       if (summaryNode) summaryNode.textContent = modelSecurityCompactSummary(ms, status);
       renderRuntimeModelSelection(ms);
+      renderModelSecurityExecution(ms);
       const alertStates = ["blocked_scan_required", "unverifiable", "suspicious", "review", "clean_export_required", "purified_alternative_available", "purifying", "exporting", "planned", "error"];
       pill.className = "pill " + ((status === "trusted" || status === "production_authoritative") ? "live" : alertStates.includes(status) ? "alert" : "");
     }
@@ -1997,15 +2056,6 @@
     $("openModelSecurityCenterBtn").onclick = () => {
       window.location.href = "/model-security";
     };
-    $("resetCustomModelBtn").onclick = async () => {
-      try {
-        localStorage.setItem("moduleA.lastCustomModelEnabled", "false");
-        localStorage.setItem("moduleA.testBypassModelSecurity", "false");
-      } catch (_) {}
-      renderRuntimeModelSelection(lastModelSecurity || {});
-      setError("");
-      await refreshModelSecurity();
-    };
 
     $("enableStaticImage").onchange = () => {
       featureOptionOverrides.static_image_enabled = true;
@@ -2032,18 +2082,19 @@
         }
         modelSecurityBlockState = null;
         hideAllPreview();
-        if (modelSecurityBypassEnabled()) {
-          showEmpty("测试绕过安全准入", "本次启动会直接运行当前模型，不做B模块阻断，也不会写入白名单。");
-        } else {
-          showEmpty("正在检查模型安全准入", "B模块正在核对白名单、源PT和扫描报告；如果需要净化，会自动净化并使用净化PT启动A模块。");
-        }
         await syncDrawingOptions();
         const sourceType = $("sourceType").value;
         const featureOverrides = featureOptions();
         const customModel = customModelOptions();
-        const useCustomModelTestEntry = Boolean(customModel.enabled);
-        const bypassModelSecurity = Boolean(
-          useCustomModelTestEntry && modelSecurityBypassEnabled()
+        const bypassModelSecurity = getStored("moduleA.testBypassModelSecurity", "false") === "true";
+        if (bypassModelSecurity && !customModel.enabled) {
+          throw new Error("已开启绕过B模块，请先在安全中心选择并启用自定义模型。");
+        }
+        showEmpty(
+          bypassModelSecurity ? "测试绕过启动中" : "正在检查模型安全准入",
+          bypassModelSecurity
+            ? "已开启B模块绕过，主监控台将直接运行当前自定义模型。"
+            : "普通入口只启动已通过B模块准入的模型；未准入模型会被阻断并按需扫描，不会绕过B模块。",
         );
         const body = {
           source_type: sourceType,
@@ -2051,14 +2102,16 @@
           profile: currentRuntimeProfile(),
           realtime: true,
           custom_model: customModel,
-          test_bypass_model_security: bypassModelSecurity,
           ready_timeout_s: 45,
         };
+        if (bypassModelSecurity) {
+          body.test_bypass_model_security = true;
+        }
         if (Object.keys(featureOverrides).length) {
           body.feature_options = featureOverrides;
         }
         saveLastPaths();
-        const startEndpoint = useCustomModelTestEntry ? "/api/test/start" : "/api/start";
+        const startEndpoint = bypassModelSecurity ? "/api/test/start" : "/api/start";
         const data = await api(startEndpoint, body);
         modelSecurityBlockState = null;
         const status = normalizeLifecycleStatus(data.status || {});

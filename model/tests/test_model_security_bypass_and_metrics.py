@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import pickle
 from pathlib import Path
+from types import SimpleNamespace
 import zipfile
 
+import pytest
 from fastapi.testclient import TestClient
 
 from defense.model_security import ModelSecurityService
@@ -1081,7 +1083,17 @@ def test_external_contract_noise_does_not_drive_full_scan_asr():
     assert filtered["summary"]["max_asr"] == 0.0
 
 
-def test_accelerated_export_writes_trusted_record_and_catalog(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize(
+    ("export_format", "expected_suffix", "expected_backend"),
+    [("onnx", ".onnx", "onnx"), ("engine", ".engine", "tensorrt")],
+)
+def test_accelerated_export_writes_next_to_trusted_source_and_registers_lineage(
+    tmp_path: Path,
+    monkeypatch,
+    export_format: str,
+    expected_suffix: str,
+    expected_backend: str,
+):
     source = tmp_path / "clean.pt"
     source.write_bytes(b"trusted-source" * 128)
     svc = _offline_model_security_service(tmp_path)
@@ -1117,25 +1129,177 @@ def test_accelerated_export_writes_trusted_record_and_catalog(tmp_path: Path, mo
     )
 
     def fake_export(*, source_pt: Path, target_path: Path, export_format: str) -> Path:
-        assert export_format == "onnx"
+        assert export_format == expected_suffix.removeprefix(".")
+        assert source_pt == source
         target_path.write_bytes(b"exported-onnx" * 128)
         return target_path
 
     monkeypatch.setattr(svc, "_run_export_tool", fake_export)
 
-    result = svc.export_accelerated_model(export_format="onnx", custom_model=custom_model)
+    result = svc.export_accelerated_model(export_format=export_format, custom_model=custom_model)
 
     assert result["state"] == "completed"
-    assert result["backend"] == "onnx"
-    assert Path(result["exported_model_path"]).exists()
-    assert Path(result["exported_model_path"]).parent == svc.storage.exports_dir
-    assert "已验证" in Path(result["exported_model_path"]).name
-    assert svc.registry.get(result["exported_fingerprint"]) is not None
+    assert result["backend"] == expected_backend
+    exported_path = Path(result["exported_model_path"])
+    assert exported_path.exists()
+    assert exported_path.parent == source.parent
+    assert exported_path.suffix == expected_suffix
+    assert exported_path.stem.startswith(f"{source.stem}_")
+    record = svc.registry.get(result["exported_fingerprint"])
+    assert record is not None
+    assert record.source_model_hash == fp.model_hash
+    assert record.source_model_path == str(source)
+    accelerated_status = svc.status(
+        custom_model={
+            "enabled": True,
+            "path": str(exported_path),
+            "backend": expected_backend,
+            "model_family": "ultralytics",
+        }
+    )
+    assert accelerated_status["allowed"] is True
+    assert accelerated_status["source_pt_path"] == str(source)
+    assert accelerated_status["source_pt_hash"] == fp.model_hash
     catalog = svc.output_catalog(category="accelerated_model")
     assert catalog["count"] == 1
     assert catalog["artifacts"][0]["status"] == "trusted"
     all_catalog = svc.runtime_catalog()
     assert all_catalog["count"] >= 2
+
+
+@pytest.mark.parametrize(
+    ("export_format", "expected_suffix", "expected_backend"),
+    [("onnx", ".onnx", "onnx"), ("engine", ".engine", "tensorrt")],
+)
+def test_accelerated_export_from_purified_pt_binds_purified_and_original_lineage(
+    tmp_path: Path,
+    monkeypatch,
+    export_format: str,
+    expected_suffix: str,
+    expected_backend: str,
+):
+    poisoned = tmp_path / "poisoned.pt"
+    purified = tmp_path / "poisoned_净化完毕.pt"
+    poisoned.write_bytes(b"poisoned-source" * 128)
+    purified.write_bytes(b"trusted-purified" * 128)
+    svc = _offline_model_security_service(tmp_path)
+    custom_model = {
+        "enabled": True,
+        "path": str(purified),
+        "backend": "pytorch",
+        "model_family": "ultralytics",
+        "source_pt_path": str(purified),
+    }
+    fp = svc.current_fingerprint(custom_model=custom_model)
+    report = ModelSecurityReport(
+        fingerprint=fp.to_dict(),
+        scan_type="full",
+        status="clean",
+        risk_score=0.0,
+        source_model_path=str(purified),
+        source_model_hash=fp.model_hash,
+    )
+    svc._write_report(report)
+    original_hash = "sha256:" + sha256_file(poisoned)
+    svc.registry.mark_trusted(
+        fp.fingerprint,
+        risk_score=0.0,
+        report_path=report.report_path,
+        runtime_model_hash=fp.model_hash,
+        runtime_model_path=str(purified),
+        source_model_hash=fp.model_hash,
+        source_model_path=str(purified),
+        original_source_model_hash=original_hash,
+        original_source_model_path=str(poisoned),
+        scanner_version=fp.scanner_version,
+        class_names_hash=fp.class_names_hash,
+        ppe_mapping_hash=fp.ppe_mapping_hash,
+        approval_source="purified_full_scan",
+    )
+
+    purified_status = svc.status(custom_model=custom_model)
+    assert purified_status["allowed"] is True
+    assert purified_status["admission_status"] == "trusted"
+
+    poisoned_custom_model = {
+        "enabled": True,
+        "path": str(poisoned),
+        "backend": "pytorch",
+        "model_family": "ultralytics",
+        "source_pt_path": str(poisoned),
+    }
+    poisoned_status = svc.status(custom_model=poisoned_custom_model)
+    assert poisoned_status["allowed"] is False
+    assert poisoned_status["admission_status"] not in {
+        "trusted",
+        "purified_alternative_available",
+    }
+    assert svc.trusted_purified_runtime_model(custom_model=poisoned_custom_model) is None
+
+    def fake_export(*, source_pt: Path, target_path: Path, export_format: str) -> Path:
+        assert source_pt == purified
+        assert export_format == expected_suffix.removeprefix(".")
+        target_path.write_bytes(b"purified-accelerated" * 128)
+        return target_path
+
+    monkeypatch.setattr(svc, "_run_export_tool", fake_export)
+
+    result = svc.export_accelerated_model(export_format=export_format, custom_model=custom_model)
+
+    exported_path = Path(result["exported_model_path"])
+    assert exported_path.parent == purified.parent
+    assert exported_path.stem.startswith(f"{purified.stem}_")
+    assert exported_path.suffix == expected_suffix
+    assert result["backend"] == expected_backend
+    record = svc.registry.get(result["exported_fingerprint"])
+    assert record is not None
+    assert record.source_model_hash == fp.model_hash
+    assert record.source_model_path == str(purified)
+    assert record.original_source_model_hash == original_hash
+    assert record.original_source_model_path == str(poisoned)
+
+    accelerated_status = svc.status(
+        custom_model={
+            "enabled": True,
+            "path": str(exported_path),
+            "backend": expected_backend,
+            "model_family": "ultralytics",
+        }
+    )
+    assert accelerated_status["allowed"] is True
+    assert accelerated_status["admission_status"] == "trusted"
+    assert accelerated_status["source_pt_path"] == str(purified)
+
+
+def test_legacy_purified_lineage_outside_source_directory_is_not_reused(tmp_path: Path):
+    poisoned = tmp_path / "models" / "poisoned.pt"
+    expected_purified = poisoned.with_name("poisoned_净化完毕.pt")
+    legacy_purified = tmp_path / "runtime" / "model_security" / "purified" / "legacy.pt"
+    poisoned.parent.mkdir(parents=True)
+    legacy_purified.parent.mkdir(parents=True)
+    poisoned.write_bytes(b"poisoned" * 128)
+    legacy_purified.write_bytes(b"purified" * 128)
+    service = _offline_model_security_service(tmp_path)
+
+    legacy_record = SimpleNamespace(
+        source_model_hash="sha256:purified",
+        source_model_path=str(legacy_purified),
+        original_source_model_hash="sha256:poisoned",
+        original_source_model_path=str(poisoned),
+        runtime_model_path=str(legacy_purified),
+        backend="pytorch",
+    )
+    current_record = SimpleNamespace(
+        source_model_hash="sha256:purified",
+        source_model_path=str(expected_purified),
+        original_source_model_hash="sha256:poisoned",
+        original_source_model_path=str(poisoned),
+        runtime_model_path=str(expected_purified),
+        backend="pytorch",
+    )
+
+    assert service._trusted_lineage_path_current(legacy_record) is False
+    assert service._trusted_lineage_path_current(current_record) is True
 
 
 def test_clear_model_security_logs_removes_all_entries(tmp_path: Path):
@@ -1219,6 +1383,7 @@ def test_fastapi_start_can_bypass_model_security_for_test_only(tmp_path: Path):
     class FakeModelSecurity:
         def __init__(self) -> None:
             self.events = []
+            self.purification_starts = []
 
         def status(self, **_kwargs) -> dict:
             return {
@@ -1226,7 +1391,31 @@ def test_fastapi_start_can_bypass_model_security_for_test_only(tmp_path: Path):
                 "allowed": False,
                 "admission_status": "suspicious",
                 "blocking_reason": "last_full_scan_suspicious",
+                "can_purify": True,
             }
+
+        def prepare_runtime_for_start(
+            self,
+            *,
+            profile: str,
+            custom_model: dict,
+            auto_remediate: bool,
+        ) -> dict:
+            assert profile == "default"
+            assert custom_model["path"] == "D:/tmp/poisoned.pt"
+            assert auto_remediate is False
+            return {
+                "allowed": False,
+                "custom_model": None,
+                "model_security": self.status(),
+                "scan": None,
+                "purification": None,
+                "runtime_replacement": None,
+            }
+
+        def start_background_purification(self, **kwargs) -> dict:
+            self.purification_starts.append(kwargs)
+            return {"started": True, "fingerprint": "sha256:poisoned", "scan_after": True}
 
         def _log_event(self, event: str, **fields) -> None:
             self.events.append((event, fields))
@@ -1247,8 +1436,25 @@ def test_fastapi_start_can_bypass_model_security_for_test_only(tmp_path: Path):
         "backend": "pytorch",
         "model_family": "yolov5",
     }
-    res = client.post(
+    blocked = client.post(
         "/api/start",
+        json={
+            "source_type": "file",
+            "source": "D:/tmp/source.mp4",
+            "profile": "default",
+            "custom_model": custom_model,
+        },
+    )
+
+    assert blocked.status_code == 409
+    blocked_payload = blocked.json()
+    assert blocked_payload["error"] == "model_security_blocked"
+    assert blocked_payload["model_security"]["admission_status"] == "suspicious"
+    assert engine.started_with is None
+    assert len(security.purification_starts) == 1
+
+    res = client.post(
+        "/api/test/start",
         json={
             "source_type": "file",
             "source": "D:/tmp/source.mp4",
@@ -1283,10 +1489,9 @@ def test_fastapi_start_can_bypass_model_security_for_test_only(tmp_path: Path):
         },
     )
 
-    assert res.status_code == 200
-    assert engine.started_with["profile"] == "desktop_rtx"
-    assert engine.started_with["custom_model"] == disabled_custom_model
-    assert security.events[1][0] == "model_security_bypass_start"
+    assert res.status_code == 403
+    assert res.json()["error"] == "test_security_bypass_endpoint_required"
+    assert len(security.events) == 1
 
 
 def test_file_realtime_preview_drops_unmatched_interpolated_tracks():
@@ -1429,6 +1634,29 @@ def test_fastapi_start_returns_json_when_source_file_is_missing(tmp_path: Path):
             raise FileNotFoundError("视频文件不存在或不可访问: D:/missing.mp4")
 
     class FakeModelSecurity:
+        def prepare_runtime_for_start(
+            self,
+            *,
+            profile: str,
+            custom_model: dict,
+            auto_remediate: bool,
+        ) -> dict:
+            assert profile == "default"
+            assert auto_remediate is False
+            return {
+                "allowed": True,
+                "custom_model": custom_model,
+                "model_security": {
+                    "enabled": True,
+                    "allowed": True,
+                    "admission_status": "trusted",
+                    "blocking_reason": "",
+                },
+                "scan": None,
+                "purification": None,
+                "runtime_replacement": None,
+            }
+
         def status(self, **_kwargs) -> dict:
             return {
                 "enabled": True,
@@ -1451,7 +1679,6 @@ def test_fastapi_start_returns_json_when_source_file_is_missing(tmp_path: Path):
             "source_type": "file",
             "source": "D:/missing.mp4",
             "profile": "default",
-            "test_bypass_model_security": True,
         },
     )
 

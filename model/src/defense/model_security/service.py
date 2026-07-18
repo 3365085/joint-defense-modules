@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pickletools
 import shutil
+import tempfile
 import threading
 import zipfile
 from copy import deepcopy
@@ -10,14 +11,32 @@ from pathlib import Path
 from typing import Any
 
 from defense.runtime.artifacts import resolve_artifact_candidate
+from defense.runtime.authoritative_model import (
+    AuthoritativeModelValidationError,
+    validate_artifact_binding,
+)
 from defense.runtime.catalog import list_artifacts, register_artifact
 from defense.runtime.config import DEFAULT_CONFIG_PATH, infer_backend_from_model_path, load_runtime_config, project_root
 
+from .accelerated_artifacts import (
+    build_accelerated_artifact_registry_evidence,
+    create_accelerated_artifact_metadata,
+    load_accelerated_artifact_metadata,
+    validate_accelerated_artifact,
+    write_accelerated_artifact_metadata,
+)
+from .device_policy import ModelSecurityDevicePolicy, resolve_model_security_device
 from .fingerprint import ModelFingerprint, SCANNER_VERSION, build_model_fingerprint, sha256_file
 from .integrity import TrustStoreIntegrity, verify_trust_store, write_trust_store_seal
-from .purifier import known_poisoned_attack_metrics, run_new_purification
+from .purifier import (
+    known_poisoned_attack_metrics,
+    promote_purified_candidate,
+    purified_model_output_path,
+    run_new_purification,
+)
 from .registry import ModelTrustRegistry
 from .reports import ModelPurificationReport, ModelSecurityReport, ScanBudget, now_iso
+from .runtime_adapter import apply_model_security_device_policy
 from .scanner import _class_name_map, full_scan, quick_scan
 from .storage import ModelSecurityStorage
 
@@ -119,6 +138,7 @@ class ModelSecurityService:
         self.log_path = self.storage.log_path
         self.registry = ModelTrustRegistry(self.storage.registry_path, on_save=self._write_registry_seal)
         self._lock = threading.Lock()
+        self._auto_export_lock = threading.Lock()
         self._scan_thread: threading.Thread | None = None
         self._stop_requested = False
         self._last_report: ModelSecurityReport | None = None
@@ -296,11 +316,15 @@ class ModelSecurityService:
         )
 
     def _export_target_path(self, source_pt: Path, *, suffix: str, backend: str) -> Path:
-        marker = "净化完毕" if "净化完毕" in source_pt.stem else "已验证"
-        return self._unique_export_path(self.storage.exports_dir / f"{source_pt.stem}_{marker}_{backend}_加速{suffix}")
+        return source_pt.with_name(f"{source_pt.stem}_{backend}_加速{suffix}")
 
     def _config(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> dict[str, Any]:
-        return load_runtime_config(config_path=self.config_path, profile=profile or "default", custom_model=custom_model or {})
+        custom = custom_model or {}
+        return load_runtime_config(
+            config_path=self.config_path,
+            profile=profile or "default",
+            custom_model=custom,
+        )
 
     def _config_and_fingerprint(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> tuple[dict[str, Any], ModelFingerprint]:
         cfg = self._config(profile=profile, custom_model=custom_model)
@@ -313,6 +337,19 @@ class ModelSecurityService:
         _, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
         return fp
 
+    @staticmethod
+    def _scan_budget(config: dict[str, Any], device_policy: ModelSecurityDevicePolicy) -> ScanBudget:
+        model_security = config.get("model_security", {}) if isinstance(config.get("model_security"), dict) else {}
+        return ScanBudget(
+            max_layers=max(1, int(model_security.get("max_layers", 4))),
+            max_probes=max(1, int(model_security.get("max_probes", 8))),
+            batch_size=max(1, int(model_security.get("batch_size", 1))),
+            device=device_policy.effective_device,
+            time_budget_s=max(1.0, float(model_security.get("time_budget_s", 30.0))),
+            early_trust_score=float(model_security.get("early_trust_score", 0.03)),
+            early_suspicious_score=float(model_security.get("early_suspicious_score", 0.85)),
+        )
+
     def _resolve_candidate(self, value: Any) -> Path | None:
         if value is None:
             return None
@@ -320,6 +357,57 @@ class ModelSecurityService:
         if not text:
             return None
         return resolve_artifact_candidate(text, self.root)
+
+    @staticmethod
+    def _normalized_sha256(value: Any) -> str:
+        return str(value or "").strip().lower().removeprefix("sha256:")
+
+    def _source_pt_from_runtime_hash(
+        self,
+        runtime_path: Path,
+        runtime_hash: str | None,
+    ) -> list[Path]:
+        normalized_runtime_hash = self._normalized_sha256(runtime_hash)
+        if not normalized_runtime_hash:
+            return []
+        if not runtime_path.is_file() or sha256_file(runtime_path).lower() != normalized_runtime_hash:
+            return []
+
+        candidates: list[Path] = []
+        for record in self.registry.list_records():
+            if self._normalized_sha256(getattr(record, "runtime_model_hash", None)) != normalized_runtime_hash:
+                continue
+            source_path = self._resolve_candidate(getattr(record, "source_model_path", None))
+            expected_source_hash = self._normalized_sha256(getattr(record, "source_model_hash", None))
+            if (
+                source_path is not None
+                and source_path.is_file()
+                and source_path.suffix.lower() in {".pt", ".pth"}
+                and expected_source_hash
+                and sha256_file(source_path).lower() == expected_source_hash
+            ):
+                candidates.append(source_path)
+
+        try:
+            metadata_path = self.storage.accelerated_metadata_path(normalized_runtime_hash)
+        except ValueError:
+            metadata_path = None
+        if metadata_path is not None and metadata_path.is_file():
+            try:
+                metadata, _metadata_path = load_accelerated_artifact_metadata(metadata_path)
+                source_path = self._resolve_candidate(metadata.source_pt_path)
+                if (
+                    self._normalized_sha256(metadata.artifact_sha256) == normalized_runtime_hash
+                    and source_path is not None
+                    and source_path.is_file()
+                    and source_path.suffix.lower() in {".pt", ".pth"}
+                    and sha256_file(source_path).lower()
+                    == self._normalized_sha256(metadata.source_pt_sha256)
+                ):
+                    candidates.append(source_path)
+            except Exception:
+                pass
+        return self._dedupe_paths(candidates)
 
     def _source_pt_candidates(self, config: dict[str, Any], fp: ModelFingerprint) -> list[Path]:
         candidates: list[Path] = []
@@ -329,15 +417,13 @@ class ModelSecurityService:
         runtime_path = self._resolve_candidate(custom.get("path")) if custom_enabled else None
         if runtime_path and runtime_path.suffix.lower() in {".pt", ".pth"}:
             candidates.append(runtime_path)
+        elif runtime_path and runtime_path.is_file():
+            candidates.extend(self._source_pt_from_runtime_hash(runtime_path, fp.model_hash))
         for key in ("source_pt_path", "source_model_path", "source_path"):
             p = self._resolve_candidate(custom.get(key))
             if p:
                 candidates.append(p)
         if custom_enabled:
-            if runtime_path:
-                if runtime_path.suffix.lower() not in {".pt", ".pth"}:
-                    candidates.append(runtime_path.with_suffix(".pt"))
-                    candidates.append(runtime_path.parent / "best.pt")
             return self._dedupe_paths(candidates)
 
         model_security = config.get("model_security", {}) if isinstance(config.get("model_security"), dict) else {}
@@ -394,7 +480,7 @@ class ModelSecurityService:
             elif isinstance(value, list):
                 roots.extend(str(item) for item in value)
         heldout_cfg = self.root / "configs" / "model_security" / "heldout_sets.yaml"
-        if heldout_cfg.exists():
+        if not roots and heldout_cfg.exists():
             try:
                 import yaml
 
@@ -417,9 +503,10 @@ class ModelSecurityService:
                 existing.append(str(p))
         return {"usable": bool(existing), "roots": resolved, "existing_roots": existing}
 
-    @staticmethod
-    def _trusted_record_matches(rec: Any, fp: ModelFingerprint, source_pt_hash: str | None) -> bool:
+    def _trusted_record_matches(self, rec: Any, fp: ModelFingerprint, source_pt_hash: str | None) -> bool:
         if not rec or not rec.approved_for_runtime:
+            return False
+        if not self._trusted_lineage_path_current(rec):
             return False
         if rec.scanner_version != SCANNER_VERSION:
             return False
@@ -431,7 +518,135 @@ class ModelSecurityService:
             return False
         if not rec.source_model_hash or rec.source_model_hash != source_pt_hash:
             return False
+        backend = str(getattr(rec, "backend", "") or "").strip().lower()
+        if backend in {"tensorrt", "onnx"}:
+            metrics = rec.security_metrics if isinstance(rec.security_metrics, dict) else {}
+            metadata_path = metrics.get("accelerated_artifact_metadata_path")
+            if not metadata_path:
+                return False
+            validation = validate_accelerated_artifact(
+                fp.model_path,
+                metadata=metadata_path,
+                trusted_source_sha256=source_pt_hash,
+                trusted_record=rec,
+            )
+            if not validation.valid:
+                return False
         return True
+
+    @staticmethod
+    def _runtime_record_priority(record: Any) -> int:
+        backend = str(getattr(record, "backend", "") or "").strip().lower()
+        if not backend:
+            runtime_path = Path(str(getattr(record, "runtime_model_path", "") or ""))
+            backend = infer_backend_from_model_path(runtime_path, "")
+        return {"tensorrt": 0, "onnx": 1, "pytorch": 2}.get(backend, 9)
+
+    def _trusted_lineage_path_current(self, record: Any) -> bool:
+        source_hash = str(getattr(record, "source_model_hash", "") or "")
+        original_hash = str(getattr(record, "original_source_model_hash", "") or "")
+        if not source_hash or not original_hash or source_hash == original_hash:
+            return True
+
+        original_path_value = str(getattr(record, "original_source_model_path", "") or "")
+        source_path_value = str(getattr(record, "source_model_path", "") or "")
+        runtime_path_value = str(getattr(record, "runtime_model_path", "") or "")
+        if not original_path_value or not source_path_value or not runtime_path_value:
+            return False
+
+        expected_source_pt = purified_model_output_path(original_path_value)
+        source_path = Path(source_path_value)
+        runtime_path = Path(runtime_path_value)
+        if source_path.resolve() != expected_source_pt.resolve():
+            return False
+
+        backend = str(getattr(record, "backend", "") or "").strip().lower()
+        if not backend:
+            backend = infer_backend_from_model_path(runtime_path, "")
+        if backend == "pytorch":
+            return runtime_path.resolve() == expected_source_pt.resolve()
+        if backend == "onnx":
+            expected_runtime = self._export_target_path(
+                expected_source_pt,
+                suffix=".onnx",
+                backend="onnx",
+            )
+            return runtime_path.resolve() == expected_runtime.resolve()
+        if backend == "tensorrt":
+            expected_runtime = self._export_target_path(
+                expected_source_pt,
+                suffix=".engine",
+                backend="tensorrt",
+            )
+            return runtime_path.resolve() == expected_runtime.resolve()
+        return False
+
+    @staticmethod
+    def _purification_report_path_current(report: ModelPurificationReport | None) -> bool:
+        if report is None or report.status != "scan_clean_trusted":
+            return True
+        if not report.source_model_path or not report.purified_model_path:
+            return False
+        expected_path = purified_model_output_path(report.source_model_path)
+        return Path(report.purified_model_path).resolve() == expected_path.resolve()
+
+    def _trusted_runtime_records_for_source(self, source_hash: str | None) -> list[Any]:
+        if not source_hash:
+            return []
+        records: list[Any] = []
+        for record in self.registry.list_records():
+            if not record.approved_for_runtime or record.scanner_version != SCANNER_VERSION:
+                continue
+            if not self._trusted_lineage_path_current(record):
+                continue
+            if getattr(record, "source_model_hash", None) != source_hash:
+                continue
+            runtime_path = Path(str(getattr(record, "runtime_model_path", "") or ""))
+            if not runtime_path.exists() or not runtime_path.is_file():
+                continue
+            backend = str(getattr(record, "backend", "") or "").strip().lower()
+            if backend in {"tensorrt", "onnx"}:
+                metrics = getattr(record, "security_metrics", None)
+                metrics = metrics if isinstance(metrics, dict) else {}
+                metadata_path = metrics.get("accelerated_artifact_metadata_path")
+                trusted_source_hash = getattr(record, "source_model_hash", None)
+                if not metadata_path or not trusted_source_hash:
+                    continue
+                validation = validate_accelerated_artifact(
+                    runtime_path,
+                    metadata=metadata_path,
+                    trusted_source_sha256=trusted_source_hash,
+                    trusted_record=record,
+                )
+                if not validation.valid:
+                    continue
+            records.append(record)
+        records.sort(key=self._runtime_record_priority)
+        return records
+
+    def _runtime_model_from_record(
+        self,
+        record: Any,
+        source_fp: ModelFingerprint,
+        device_policy: ModelSecurityDevicePolicy | None = None,
+    ) -> dict[str, Any] | None:
+        runtime_path = Path(str(getattr(record, "runtime_model_path", "") or ""))
+        if not runtime_path.exists() or not runtime_path.is_file():
+            return None
+        policy = device_policy or resolve_model_security_device()
+        backend = str(getattr(record, "backend", "") or "").strip().lower()
+        if backend == "tensorrt" and not policy.uses_cuda:
+            return None
+        if runtime_path.suffix.lower() in {".pt", ".pth"}:
+            runtime_model = self._runtime_model_for_purified_path(runtime_path, source_fp)
+        else:
+            source_pt = Path(str(getattr(record, "source_model_path", "") or ""))
+            if not source_pt.exists() or source_pt.suffix.lower() not in {".pt", ".pth"}:
+                return None
+            runtime_model = self._runtime_model_for_accelerated_export(runtime_path, source_pt, source_fp)
+        runtime_model.pop("status", None)
+        runtime_model["device"] = policy.effective_device
+        return runtime_model
 
     def _mark_clean_full_scan_trusted(self, report: ModelSecurityReport, fp: ModelFingerprint) -> None:
         """Persist a trusted record from a clean canonical full scan."""
@@ -477,6 +692,21 @@ class ModelSecurityService:
             approval_source="full_scan",
         )
 
+    def _revoke_trust_after_nonclean_full_scan(self, report: ModelSecurityReport, fp: ModelFingerprint) -> None:
+        record = self.registry.get(fp.fingerprint)
+        if record is None:
+            return
+        if not self.registry.delete(fp.fingerprint):
+            return
+        self._log_event(
+            "whitelist_revoked",
+            status=report.status,
+            message="完整扫描未通过，已撤销当前运行模型白名单",
+            fingerprint=fp.fingerprint,
+            report_path=report.report_path,
+            risk_score=report.risk_score,
+        )
+
     def _full_clean_report_matches_runtime(self, report: ModelSecurityReport | None, fp: ModelFingerprint, source_hash: str | None) -> bool:
         if not report or report.scan_type != "full" or report.status not in {"trusted", "clean"}:
             return False
@@ -504,6 +734,7 @@ class ModelSecurityService:
             "new_algorithm_family_strict_audit",
             "seven_experiment_known_poisoned_archive",
             "seven_experiment_purified_archive",
+            "hash_bound_adaptive_family_evidence_revalidation",
         }
 
     @staticmethod
@@ -605,6 +836,56 @@ class ModelSecurityService:
         candidate: dict[str, Any],
         budget: ScanBudget,
     ) -> ModelSecurityReport | None:
+        adaptive_evidence = candidate.get("adaptive_evidence")
+        if candidate.get("candidate_source") == "adaptive_family_route":
+            if not isinstance(adaptive_evidence, dict) or adaptive_evidence.get("accepted") is not True:
+                return None
+            expected_hash = str(candidate.get("output_model_hash") or "")
+            actual_hash = "sha256:" + sha256_file(candidate_path)
+            if expected_hash and expected_hash != actual_hash:
+                return None
+            if str(adaptive_evidence.get("evidence_candidate_hash") or "") != actual_hash:
+                return None
+            try:
+                structural_probe = quick_scan(
+                    fp,
+                    budget=budget,
+                    cache_dir=self.storage.activation_cache_dir,
+                ).to_dict()
+            except Exception as exc:
+                structural_probe = {"status": "unverifiable", "error": str(exc)}
+            route = str(candidate.get("algorithm_route") or "adaptive_family_route")
+            model_id = str(candidate.get("model_id") or "unknown")
+            risk = float(adaptive_evidence.get("risk_score") or 0.0)
+            return ModelSecurityReport(
+                fingerprint=fp.to_dict(),
+                scan_type="full",
+                status="clean",
+                risk_score=float(round(risk, 4)),
+                reasons=[
+                    "adaptive candidate hash matches the registered purified artifact",
+                    "family-specific acceptance evidence is explicit and hash-bound",
+                    "current structural probe completed; this is evidence revalidation, not a new strict release claim",
+                    f"model_id={model_id}, route={route}",
+                ],
+                completed_at=now_iso(),
+                budget=budget.to_dict(),
+                diagnostics={
+                    "validation_scope": "hash_bound_adaptive_family_evidence_revalidation",
+                    "adaptive_model_id": model_id,
+                    "adaptive_goal": candidate.get("goal"),
+                    "adaptive_route": route,
+                    "adaptive_algorithm": candidate.get("algorithm"),
+                    "adaptive_release_status": candidate.get("release_status"),
+                    "strict_absolute_release": bool(candidate.get("strict_absolute_release")),
+                    "adaptive_evidence_path": candidate.get("evidence_path"),
+                    "adaptive_evidence": adaptive_evidence,
+                    "quick_structural_probe": structural_probe,
+                },
+                source_model_path=str(candidate_path),
+                source_model_hash=actual_hash,
+                runtime_artifact_path=fp.model_path,
+            )
         strict = candidate.get("new_algorithm_strict_audit")
         if not isinstance(strict, dict):
             return None
@@ -739,6 +1020,23 @@ class ModelSecurityService:
             return True
         return bool(self._last_export_job and self._last_export_job.get("fingerprint") == fingerprint)
 
+    def _active_model_security_tasks(self) -> list[str]:
+        tasks: list[str] = []
+        if self._scan_thread and self._scan_thread.is_alive():
+            tasks.append("scan")
+        if self._purify_thread and self._purify_thread.is_alive():
+            tasks.append("purification")
+        if self._export_thread and self._export_thread.is_alive():
+            tasks.append("export")
+        return tasks
+
+    def _ensure_trust_mutation_idle(self) -> None:
+        active_tasks = self._active_model_security_tasks()
+        if active_tasks:
+            raise ValueError(
+                "model_security_background_task_running:" + ",".join(active_tasks)
+            )
+
     @staticmethod
     def _runtime_model_for_purified_path(path: str | Path, fp: ModelFingerprint) -> dict[str, Any]:
         purified_path = Path(path)
@@ -773,16 +1071,6 @@ class ModelSecurityService:
             return "onnx", ".onnx", "onnx"
         raise ValueError("unsupported_export_format")
 
-    @staticmethod
-    def _unique_export_path(base: Path) -> Path:
-        if not base.exists():
-            return base
-        for idx in range(2, 1000):
-            candidate = base.with_name(f"{base.stem}_{idx}{base.suffix}")
-            if not candidate.exists():
-                return candidate
-        raise RuntimeError("cannot allocate export output path")
-
     def _trusted_pt_for_export(
         self,
         *,
@@ -805,17 +1093,22 @@ class ModelSecurityService:
             source_fp = build_model_fingerprint(source_cfg, root=self.root)
             return source_pt, source_fp, source_runtime, current_status
 
-        purification = self._load_purification_report(fp.fingerprint, source_hash=source_hash)
-        if purification and purification.status == "scan_clean_trusted" and purification.purified_model_path:
-            purified_path = Path(purification.purified_model_path)
-            if purified_path.exists() and purified_path.suffix.lower() in {".pt", ".pth"}:
-                purified_runtime = self._runtime_model_for_purified_path(purified_path, fp)
-                purified_runtime.pop("status", None)
-                purified_status = self.status(profile=profile, custom_model=purified_runtime)
-                if bool(purified_status.get("allowed", False)):
-                    purified_cfg = self._config(profile=profile, custom_model=purified_runtime)
-                    purified_fp = build_model_fingerprint(purified_cfg, root=self.root)
-                    return purified_path, purified_fp, purified_runtime, purified_status
+        for record in self._trusted_runtime_records_for_source(source_hash):
+            trusted_path = Path(str(getattr(record, "runtime_model_path", "") or ""))
+            if (
+                getattr(record, "source_model_hash", None) != source_hash
+                or trusted_path.suffix.lower() not in {".pt", ".pth"}
+                or not trusted_path.is_file()
+            ):
+                continue
+            trusted_runtime = self._runtime_model_for_purified_path(trusted_path, fp)
+            trusted_runtime.pop("status", None)
+            trusted_status = self.status(profile=profile, custom_model=trusted_runtime)
+            if not bool(trusted_status.get("allowed", False)):
+                continue
+            trusted_cfg = self._config(profile=profile, custom_model=trusted_runtime)
+            trusted_fp = build_model_fingerprint(trusted_cfg, root=self.root)
+            return trusted_path, trusted_fp, trusted_runtime, trusted_status
 
         raise ValueError("export_requires_trusted_source_pt")
 
@@ -826,22 +1119,34 @@ class ModelSecurityService:
             raise RuntimeError(f"ultralytics_export_unavailable:{exc}") from exc
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        fmt, suffix, _ = self._export_format(export_format)
-        model = YOLO(str(source_pt))
-        kwargs: dict[str, Any] = {"format": fmt, "imgsz": 640}
-        if fmt == "engine":
-            kwargs["half"] = True
-        result = model.export(**kwargs)
-        candidates: list[Path] = []
-        if result:
-            candidates.append(Path(str(result)))
-        candidates.append(source_pt.with_suffix(suffix))
-        candidates.append(source_pt.parent / f"{source_pt.stem}{suffix}")
-        exported = next((p for p in candidates if p.exists() and p.is_file()), None)
-        if exported is None:
-            raise RuntimeError("export_output_not_found")
-        if exported.resolve() != target_path.resolve():
-            shutil.copy2(exported, target_path)
+        fmt, _suffix, _backend = self._export_format(export_format)
+        with tempfile.TemporaryDirectory(prefix="module_b_export_") as temporary_dir:
+            staged_source = Path(temporary_dir) / "source.pt"
+            shutil.copy2(source_pt, staged_source)
+            model = YOLO(str(staged_source))
+            kwargs: dict[str, Any] = {"format": fmt, "imgsz": 640}
+            if fmt == "engine":
+                kwargs["half"] = True
+            result = model.export(**kwargs)
+            raw_results = result if isinstance(result, (list, tuple)) else [result]
+            candidates = [Path(str(value)) for value in raw_results if value]
+            exported = next((path for path in candidates if path.exists() and path.is_file()), None)
+            if exported is None:
+                raise RuntimeError("export_output_not_found")
+            temporary_target: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=target_path.parent,
+                    prefix=f".{target_path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary_file:
+                    temporary_target = Path(temporary_file.name)
+                shutil.copy2(exported, temporary_target)
+                temporary_target.replace(target_path)
+            finally:
+                if temporary_target is not None:
+                    temporary_target.unlink(missing_ok=True)
         return target_path
 
     def export_accelerated_model(
@@ -880,6 +1185,25 @@ class ModelSecurityService:
             exported_cfg = self._config(profile=profile, custom_model=runtime_model)
             exported_fp = build_model_fingerprint(exported_cfg, root=self.root)
             exported_hash = "sha256:" + sha256_file(exported_path)
+            export_parameters = {
+                "format": fmt,
+                "image_size": source_fp.image_size or 640,
+                "half": backend == "tensorrt",
+                "runtime_devices": ["cuda"] if backend == "tensorrt" else ["cpu", "cuda"],
+            }
+            artifact_metadata = create_accelerated_artifact_metadata(
+                artifact_path=exported_path,
+                source_pt_path=source_pt,
+                artifact_format=fmt,
+                export_parameters=export_parameters,
+                metadata={
+                    "source_fingerprint": source_fp.fingerprint,
+                    "report_path": source_status.get("report_path"),
+                    "purification_report_path": source_status.get("purification_report_path"),
+                },
+            )
+            metadata_path = self.storage.accelerated_metadata_path(artifact_metadata.artifact_sha256)
+            write_accelerated_artifact_metadata(artifact_metadata, metadata_path)
             security_metrics = dict(source_status.get("security_metrics") or {})
             security_metrics.update(
                 {
@@ -891,7 +1215,13 @@ class ModelSecurityService:
                     "accelerated_export_source_hash": source_hash,
                 }
             )
-            self.registry.mark_trusted(
+            security_metrics.update(
+                build_accelerated_artifact_registry_evidence(
+                    artifact_metadata,
+                    metadata_path=metadata_path,
+                )
+            )
+            trusted_record = self.registry.mark_trusted(
                 exported_fp.fingerprint,
                 risk_score=float(source_status.get("risk_score") or 0.0),
                 report_path=source_status.get("report_path"),
@@ -912,6 +1242,18 @@ class ModelSecurityService:
                 security_metrics=security_metrics,
                 approval_source="trusted_source_pt_export",
             )
+            validation = validate_accelerated_artifact(
+                exported_path,
+                metadata=metadata_path,
+                trusted_source_sha256=source_hash,
+                trusted_record=trusted_record,
+            )
+            if not validation.valid:
+                self.registry.delete(exported_fp.fingerprint)
+                raise RuntimeError(
+                    "accelerated_artifact_validation_failed:"
+                    + ",".join(validation.reasons)
+                )
             catalog_record = self._register_output(
                 path=exported_path,
                 category="accelerated_model",
@@ -925,6 +1267,8 @@ class ModelSecurityService:
                     "backend": backend,
                     "source_fingerprint": source_fp.fingerprint,
                     "runtime_model": runtime_model,
+                    "artifact_metadata_path": str(metadata_path),
+                    "artifact_derivation_sha256": artifact_metadata.derivation_sha256,
                     "report_path": source_status.get("report_path"),
                     "purification_report_path": source_status.get("purification_report_path"),
                 },
@@ -939,6 +1283,8 @@ class ModelSecurityService:
                 "backend": backend,
                 "exported_model_path": str(exported_path),
                 "exported_model_hash": exported_hash,
+                "artifact_metadata_path": str(metadata_path),
+                "artifact_validation": validation.to_dict(),
                 "catalog_record": catalog_record,
                 "completed_at": now_iso(),
             }
@@ -970,6 +1316,246 @@ class ModelSecurityService:
             self._last_error = str(exc)
             self._log_event("export_failed", status="error", message=str(exc), fingerprint=source_fp.fingerprint, export_format=fmt)
             raise
+
+    @staticmethod
+    def _automatic_export_formats(
+        config: dict[str, Any],
+        device_policy: ModelSecurityDevicePolicy,
+    ) -> list[str]:
+        model_security = config.get("model_security", {})
+        model_security = model_security if isinstance(model_security, dict) else {}
+        enabled = bool(model_security.get("auto_export")) or bool(
+            model_security.get("auto_export_accelerated")
+        )
+        if not enabled:
+            return []
+
+        raw_formats = model_security.get("auto_export_formats")
+        if isinstance(raw_formats, str):
+            requested = [part.strip() for part in raw_formats.split(",") if part.strip()]
+        elif isinstance(raw_formats, (list, tuple)):
+            requested = [str(item).strip() for item in raw_formats if str(item).strip()]
+        else:
+            configured = str(model_security.get("auto_export_format") or "auto").strip().lower()
+            requested = [configured]
+
+        normalized: list[str] = []
+        for value in requested:
+            if value.lower() in {"auto", "automatic", "best"}:
+                normalized.extend(["onnx", "engine"] if device_policy.uses_cuda else ["onnx"])
+                continue
+            try:
+                fmt, _suffix, _backend = ModelSecurityService._export_format(value)
+            except ValueError:
+                continue
+            if fmt not in normalized:
+                normalized.append(fmt)
+
+        if not device_policy.uses_cuda:
+            return ["onnx"]
+        if bool(model_security.get("auto_export_onnx_fallback", True)) and "onnx" not in normalized:
+            normalized.insert(0, "onnx")
+        return [fmt for fmt in ("onnx", "engine") if fmt in normalized]
+
+    def _auto_export_trusted_runtime(
+        self,
+        *,
+        profile: str,
+        custom_model: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        with self._auto_export_lock:
+            return self._auto_export_trusted_runtime_locked(
+                profile=profile,
+                custom_model=custom_model,
+            )
+
+    def _auto_export_trusted_runtime_locked(
+        self,
+        *,
+        profile: str,
+        custom_model: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        config = self._config(profile=profile, custom_model=custom_model)
+        device_policy = resolve_model_security_device(config)
+        formats = self._automatic_export_formats(config, device_policy)
+        result: dict[str, Any] = {
+            "enabled": bool(formats),
+            "formats": formats,
+            "device_policy": device_policy.to_dict(),
+            "exports": [],
+            "skipped": [],
+            "errors": [],
+        }
+        if not formats:
+            return result
+
+        source_pt, _source_fp, _source_runtime, _source_status = self._trusted_pt_for_export(
+            profile=profile,
+            custom_model=custom_model,
+        )
+        source_hash = "sha256:" + sha256_file(source_pt)
+        result["source_pt_path"] = str(source_pt)
+        result["source_pt_hash"] = source_hash
+        adopted = self._adopt_authoritative_accelerated_runtime(
+            config=config,
+            source_pt=source_pt,
+            source_hash=source_hash,
+            source_status=_source_status,
+        )
+        if adopted is not None:
+            result["adopted_authoritative_runtime"] = adopted
+        existing_records = [
+            record
+            for record in self._trusted_runtime_records_for_source(source_hash)
+            if getattr(record, "source_model_hash", None) == source_hash
+        ]
+        for fmt in formats:
+            _normalized, suffix, backend = self._export_format(fmt)
+            expected_path = self._export_target_path(source_pt, suffix=suffix, backend=backend)
+            matching_export_exists = any(
+                str(getattr(record, "backend", "") or "").strip().lower() == backend
+                and Path(str(getattr(record, "runtime_model_path", "") or "")) == expected_path
+                and expected_path.is_file()
+                for record in existing_records
+            )
+            if matching_export_exists:
+                result["skipped"].append({"format": fmt, "reason": "trusted_export_exists"})
+                continue
+            try:
+                export_result = self.export_accelerated_model(
+                    export_format=fmt,
+                    profile=profile,
+                    custom_model=custom_model,
+                )
+            except Exception as exc:
+                result["errors"].append({"format": fmt, "error": str(exc)})
+                continue
+            result["exports"].append(export_result)
+        result["state"] = "completed" if not result["errors"] else (
+            "partial" if result["exports"] or result["skipped"] else "failed"
+        )
+        return result
+
+    def _adopt_authoritative_accelerated_runtime(
+        self,
+        *,
+        config: dict[str, Any],
+        source_pt: Path,
+        source_hash: str,
+        source_status: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        runtime = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
+        if not bool(runtime.get("production_unique_model", False)):
+            return None
+        try:
+            authoritative = validate_artifact_binding(config, self.root)
+        except AuthoritativeModelValidationError:
+            return None
+        if not authoritative:
+            return None
+
+        runtime_path = Path(str(authoritative.get("engine_path") or ""))
+        if not runtime_path.is_file():
+            return None
+        runtime_model = {
+            "enabled": True,
+            "path": str(runtime_path),
+            "backend": "tensorrt",
+            "model_family": "yolov8",
+            "source_pt_path": str(source_pt),
+        }
+        runtime_config = self._config(profile=str(runtime.get("profile") or "default"))
+        runtime_fp = build_model_fingerprint(runtime_config, root=self.root)
+        existing = self.registry.get(runtime_fp.fingerprint)
+        if existing and self._trusted_record_matches(existing, runtime_fp, source_hash):
+            return {
+                "state": "trusted_existing",
+                "path": str(runtime_path),
+                "fingerprint": runtime_fp.fingerprint,
+            }
+
+        export_parameters = {
+            "format": "engine",
+            "image_size": runtime_fp.image_size or 640,
+            "half": True,
+            "runtime_devices": ["cuda"],
+            "origin": "authoritative_artifact_binding",
+        }
+        artifact_metadata = create_accelerated_artifact_metadata(
+            artifact_path=runtime_path,
+            source_pt_path=source_pt,
+            artifact_format="engine",
+            export_parameters=export_parameters,
+            metadata={
+                "authoritative_metadata_path": authoritative.get("metadata_path"),
+                "source_fingerprint": source_status.get("fingerprint"),
+                "report_path": source_status.get("report_path"),
+            },
+            exporter="defense.runtime.authoritative_model",
+        )
+        metadata_path = self.storage.accelerated_metadata_path(artifact_metadata.artifact_sha256)
+        write_accelerated_artifact_metadata(artifact_metadata, metadata_path)
+        security_metrics = dict(source_status.get("security_metrics") or {})
+        security_metrics.update(
+            build_accelerated_artifact_registry_evidence(
+                artifact_metadata,
+                metadata_path=metadata_path,
+            )
+        )
+        trusted_record = self.registry.mark_trusted(
+            runtime_fp.fingerprint,
+            risk_score=float(source_status.get("risk_score") or 0.0),
+            report_path=source_status.get("report_path"),
+            scanner_version=SCANNER_VERSION,
+            notes="trusted authoritative TensorRT artifact bound to clean source PT",
+            runtime_model_hash=runtime_fp.model_hash,
+            runtime_model_path=runtime_fp.model_path,
+            source_model_hash=source_hash,
+            source_model_path=str(source_pt),
+            original_source_model_hash=source_hash,
+            original_source_model_path=str(source_pt),
+            backend=runtime_fp.backend,
+            model_family=runtime_fp.model_family,
+            image_size=runtime_fp.image_size,
+            class_names_hash=runtime_fp.class_names_hash,
+            ppe_mapping_hash=runtime_fp.ppe_mapping_hash,
+            security_metrics=security_metrics,
+            approval_source="auto_export_from_trusted_pt",
+        )
+        validation = validate_accelerated_artifact(
+            runtime_path,
+            metadata=metadata_path,
+            trusted_source_sha256=source_hash,
+            trusted_record=trusted_record,
+        )
+        if not validation.valid:
+            self.registry.delete(runtime_fp.fingerprint)
+            raise RuntimeError(
+                "authoritative_artifact_adoption_failed:"
+                + ",".join(validation.reasons)
+            )
+        self._register_output(
+            path=runtime_path,
+            category="accelerated_model",
+            artifact_type="authoritative_tensorrt_runtime_model",
+            fingerprint=runtime_fp.fingerprint,
+            source_path=source_pt,
+            source_hash=source_hash,
+            status="trusted",
+            metadata={
+                "artifact_metadata_path": str(metadata_path),
+                "artifact_derivation_sha256": artifact_metadata.derivation_sha256,
+                "authoritative_metadata_path": authoritative.get("metadata_path"),
+                "runtime_model": runtime_model,
+            },
+        )
+        return {
+            "state": "trusted",
+            "path": str(runtime_path),
+            "fingerprint": runtime_fp.fingerprint,
+            "metadata_path": str(metadata_path),
+            "validation": validation.to_dict(),
+        }
 
     def start_background_export(
         self,
@@ -1014,6 +1600,8 @@ class ModelSecurityService:
     ) -> dict[str, Any] | None:
         if report is None or report.status != "scan_clean_trusted" or not report.purified_model_path:
             return None
+        if not self._purification_report_path_current(report):
+            return None
         purified_path = Path(report.purified_model_path)
         if not purified_path.exists() or not purified_path.is_file() or purified_path.suffix.lower() not in {".pt", ".pth"}:
             return None
@@ -1032,6 +1620,7 @@ class ModelSecurityService:
     def admission_status(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
             cfg, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
+            device_policy = resolve_model_security_device(cfg)
             integrity = self._trust_store_integrity()
             source_pt = self._source_pt_path(cfg, fp)
             source_hash = "sha256:" + sha256_file(source_pt) if source_pt and source_pt.exists() else None
@@ -1062,10 +1651,25 @@ class ModelSecurityService:
                 last_purification = None
             if last_purification is None:
                 last_purification = self._load_purification_report(fp.fingerprint, source_hash=source_hash)
+            if not self._purification_report_path_current(last_purification):
+                last_purification = None
             scan_job = self._last_job_for_fingerprint(self._last_scan_job, fp.fingerprint)
             purification_job = self._last_job_for_fingerprint(self._last_purification_job, fp.fingerprint)
             exporting = self._is_exporting()
             export_job = dict(self._last_export_job) if self._last_export_job else None
+            source_runtime_records = self._trusted_runtime_records_for_source(source_hash) if integrity.ok else []
+            source_runtime_model = (
+                next(
+                    (
+                        runtime_model
+                        for record in source_runtime_records
+                        if (runtime_model := self._runtime_model_from_record(record, fp, device_policy)) is not None
+                    ),
+                    None,
+                )
+                if source_runtime_records
+                else None
+            )
 
             status = "blocked_scan_required"
             allowed = False
@@ -1076,6 +1680,9 @@ class ModelSecurityService:
             if not integrity.ok:
                 status = "trust_store_compromised"
                 reason = integrity.reason
+            elif purifying:
+                status = "purifying"
+                reason = "purification_running"
             elif rec and self._trusted_record_matches(rec, fp, source_hash):
                 status = "trusted"
                 allowed = True
@@ -1083,12 +1690,9 @@ class ModelSecurityService:
                 risk = rec.risk_score
                 report_path = rec.report_path
                 last_scan = rec.last_scan_time
-            elif purifying:
-                status = "purifying"
-                reason = "purification_running"
-            elif last_purification and last_purification.status == "scan_clean_trusted":
+            elif source_runtime_model is not None:
                 status = "purified_alternative_available"
-                reason = "purified_pt_clean_but_runtime_not_selected"
+                reason = "trusted_runtime_for_source_available"
             elif last_report and last_report.status in {"review", "suspicious", "unverifiable"}:
                 status = last_report.status
                 reason = f"last_full_scan_{last_report.status}"
@@ -1114,23 +1718,18 @@ class ModelSecurityService:
             )
             can_scan = bool(not scanning and not purifying and integrity.ok and not allowed)
             recommended_runtime_model = None
-            if last_purification and last_purification.status == "scan_clean_trusted" and last_purification.purified_model_path:
-                recommended_runtime_model = self._runtime_model_for_purified_path(last_purification.purified_model_path, fp)
-                purified_status = self._trusted_purified_status(profile=profile, source_fp=fp, report=last_purification)
-                if purified_status is not None:
-                    recommended_runtime_model["fingerprint"] = purified_status.get("fingerprint")
-                    recommended_runtime_model["model_hash"] = purified_status.get("model_hash")
-                    recommended_runtime_model["admission_status"] = purified_status.get("admission_status")
-                    recommended_runtime_model["allowed"] = purified_status.get("allowed")
+            if source_runtime_model is not None:
+                recommended_runtime_model = dict(source_runtime_model)
+                recommended_runtime_model["allowed"] = True
+                recommended_runtime_model["admission_status"] = "trusted"
             can_export = bool(
                 not scanning
                 and not purifying
                 and not exporting
                 and integrity.ok
-                and (
-                    (allowed and source_pt is not None and source_pt.exists())
-                    or (last_purification and last_purification.status == "scan_clean_trusted" and last_purification.purified_model_path)
-                )
+                and allowed
+                and source_pt is not None
+                and source_pt.exists()
             )
 
             trusted_record_match = bool(rec and self._trusted_record_matches(rec, fp, source_hash))
@@ -1164,6 +1763,16 @@ class ModelSecurityService:
                 "can_purify": can_purify,
                 "can_export_accelerated": can_export,
                 "recommended_runtime_model": recommended_runtime_model,
+                "trusted_runtime_candidate_count": len(source_runtime_records),
+                "device_policy": device_policy.to_dict(),
+                "requested_device": device_policy.requested_device,
+                "effective_device": device_policy.effective_device,
+                "cuda_available": device_policy.cuda_available,
+                "cuda_device_name": device_policy.cuda_device_name,
+                "device_fallback_reason": device_policy.fallback_reason,
+                "cpu_compatible": device_policy.cpu_compatible,
+                "cuda_recommended": device_policy.cuda_recommended,
+                "performance_note": device_policy.performance_note,
                 "last_scan_job": scan_job,
                 "last_purification_job": purification_job,
                 "last_export_job": export_job,
@@ -1245,49 +1854,56 @@ class ModelSecurityService:
         profile: str = "default",
         custom_model: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Return a trusted purified PT custom-model override for the current blocked model."""
+        """Return the best trusted runtime derived from the requested source PT."""
 
         cfg, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
+        device_policy = resolve_model_security_device(cfg)
         source_pt = self._source_pt_path(cfg, fp)
         source_hash = "sha256:" + sha256_file(source_pt) if source_pt and source_pt.exists() else None
-        report = self._load_purification_report(fp.fingerprint, source_hash=source_hash)
-        if (
-            report is None
-            or report.status != "scan_clean_trusted"
-            or not report.purified_model_path
-        ):
-            return None
-        purified_path = Path(report.purified_model_path)
-        if not purified_path.exists() or not purified_path.is_file() or purified_path.suffix.lower() not in {".pt", ".pth"}:
-            return None
-
-        runtime_model = self._runtime_model_for_purified_path(purified_path, fp)
-        runtime_model.pop("status", None)
-        purified_status = self.admission_status(profile=profile, custom_model=runtime_model)
-        if not bool(purified_status.get("allowed", False)):
-            return None
-        if not self.registry.get(str(purified_status.get("fingerprint") or "")):
-            return None
-
-        self._log_event(
-            "purified_runtime_selected",
-            status="trusted",
-            message="已自动选择净化后可信PT作为A模块运行模型",
-            source_fingerprint=fp.fingerprint,
-            source_model_path=fp.model_path,
-            source_model_hash=fp.model_hash,
-            source_pt_hash=source_hash,
-            purified_fingerprint=purified_status.get("fingerprint"),
-            purified_model_path=str(purified_path),
-            purified_model_hash=purified_status.get("model_hash"),
-            purification_report_path=report.report_path,
-            scan_report_path=report.scan_report_path,
-        )
-        return {
-            "custom_model": runtime_model,
-            "model_security": purified_status,
-            "source_model_security": self.admission_status(profile=profile, custom_model=custom_model),
-        }
+        candidates: list[tuple[dict[str, Any], str | None, str | None]] = []
+        for record in self._trusted_runtime_records_for_source(source_hash):
+            runtime_model = self._runtime_model_from_record(record, fp, device_policy)
+            if runtime_model is not None:
+                candidates.append(
+                    (
+                        runtime_model,
+                        getattr(record, "purification_report_path", None),
+                        getattr(record, "report_path", None),
+                    )
+                )
+        seen: set[str] = set()
+        for runtime_model, purification_report_path, scan_report_path in candidates:
+            runtime_path = Path(str(runtime_model.get("path") or ""))
+            candidate_key = str(runtime_path.resolve()) if runtime_path.exists() else str(runtime_path)
+            if not candidate_key or candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            runtime_status = self.admission_status(profile=profile, custom_model=runtime_model)
+            if not bool(runtime_status.get("allowed", False)):
+                continue
+            if not self.registry.get(str(runtime_status.get("fingerprint") or "")):
+                continue
+            self._log_event(
+                "trusted_runtime_selected",
+                status="trusted",
+                message="已自动选择源模型绑定的最佳可信运行格式",
+                source_fingerprint=fp.fingerprint,
+                source_model_path=fp.model_path,
+                source_model_hash=fp.model_hash,
+                source_pt_hash=source_hash,
+                selected_fingerprint=runtime_status.get("fingerprint"),
+                selected_model_path=str(runtime_path),
+                selected_model_hash=runtime_status.get("model_hash"),
+                selected_backend=runtime_status.get("backend"),
+                purification_report_path=purification_report_path,
+                scan_report_path=scan_report_path,
+            )
+            return {
+                "custom_model": runtime_model,
+                "model_security": runtime_status,
+                "source_model_security": self.admission_status(profile=profile, custom_model=custom_model),
+            }
+        return None
 
     def prepare_runtime_for_start(
         self,
@@ -1301,6 +1917,7 @@ class ModelSecurityService:
         requested_model = custom_model or {}
         scan_result: dict[str, Any] | None = None
         purification_result: dict[str, Any] | None = None
+        auto_export_result: dict[str, Any] | None = None
         runtime_replacement: dict[str, Any] | None = None
         admission = self.ensure_admitted(profile=profile, custom_model=requested_model)
 
@@ -1311,6 +1928,7 @@ class ModelSecurityService:
                 "model_security": model_security,
                 "scan": scan_result,
                 "purification": purification_result,
+                "auto_export": auto_export_result,
                 "runtime_replacement": runtime_replacement,
             }
 
@@ -1321,29 +1939,85 @@ class ModelSecurityService:
                 "model_security": model_security,
                 "scan": scan_result,
                 "purification": purification_result,
+                "auto_export": auto_export_result,
                 "runtime_replacement": runtime_replacement,
             }
 
+        def select_allowed_runtime(
+            source_security: dict[str, Any],
+            *,
+            replacement_required: bool = False,
+        ) -> dict[str, Any]:
+            nonlocal auto_export_result, runtime_replacement
+            if auto_remediate:
+                try:
+                    auto_export_result = self._auto_export_trusted_runtime(
+                        profile=profile,
+                        custom_model=requested_model,
+                    )
+                except Exception as exc:
+                    auto_export_result = {
+                        "enabled": True,
+                        "state": "failed",
+                        "errors": [{"error": str(exc)}],
+                    }
+            if (
+                not requested_model.get("enabled")
+                and str(source_security.get("backend") or "").lower()
+                in {"onnx", "tensorrt"}
+            ):
+                refreshed_security = self.status(
+                    profile=profile,
+                    custom_model=requested_model,
+                )
+                if bool(refreshed_security.get("allowed", False)):
+                    return allowed(requested_model, refreshed_security)
+            replacement = self.trusted_purified_runtime_model(
+                profile=profile,
+                custom_model=requested_model,
+            )
+            if replacement and replacement.get("custom_model") and replacement.get("model_security", {}).get("allowed"):
+                replacement_model = dict(replacement["custom_model"])
+                requested_path = str(requested_model.get("path") or "")
+                replacement_path = str(replacement_model.get("path") or "")
+                replacement_backend = str(replacement_model.get("backend") or "").lower()
+                configured_path = str(source_security.get("model_path") or "")
+                if (
+                    not requested_model.get("enabled")
+                    and configured_path
+                    and replacement_path
+                    and Path(replacement_path).resolve() == Path(configured_path).resolve()
+                ):
+                    return allowed(requested_model, dict(replacement["model_security"]))
+                should_replace = replacement_required or bool(requested_model.get("enabled")) or replacement_backend != "pytorch"
+                if should_replace and replacement_path and (
+                    replacement_required or not requested_path or Path(replacement_path) != Path(requested_path)
+                ):
+                    model_security = dict(replacement["model_security"])
+                    model_security["runtime_replacement"] = {
+                        "enabled": True,
+                        "path": replacement_model.get("path"),
+                        "backend": replacement_model.get("backend"),
+                        "model_family": replacement_model.get("model_family"),
+                        "source_pt_path": replacement_model.get("source_pt_path"),
+                    }
+                    runtime_replacement = {
+                        "mode": (
+                            "trusted_accelerated_runtime"
+                            if replacement_backend in {"onnx", "tensorrt"}
+                            else "purified_runtime"
+                        ),
+                        "source_model_security": replacement.get("source_model_security") or source_security,
+                    }
+                    return allowed(replacement_model, model_security)
+            return blocked(source_security) if replacement_required else allowed(requested_model, source_security)
+
         if bool(admission.get("allowed", False)):
-            return allowed(requested_model, admission)
+            return select_allowed_runtime(admission)
 
         status = str(admission.get("admission_status") or admission.get("status") or "")
         if status == "purified_alternative_available":
-            replacement = self.trusted_purified_runtime_model(profile=profile, custom_model=requested_model)
-            if replacement and replacement.get("custom_model") and replacement.get("model_security", {}).get("allowed"):
-                model_security = dict(replacement["model_security"])
-                model_security["runtime_replacement"] = {
-                    "enabled": True,
-                    "path": replacement["custom_model"].get("path"),
-                    "backend": replacement["custom_model"].get("backend"),
-                    "model_family": replacement["custom_model"].get("model_family"),
-                    "source_pt_path": replacement["custom_model"].get("source_pt_path"),
-                }
-                runtime_replacement = {
-                    "mode": "purified_runtime",
-                    "source_model_security": replacement.get("source_model_security") or admission,
-                }
-                return allowed(replacement["custom_model"], model_security)
+            return select_allowed_runtime(admission, replacement_required=True)
 
         if not auto_remediate:
             return blocked(admission)
@@ -1354,8 +2028,12 @@ class ModelSecurityService:
             scan_result = self.scan(scan_type="full", profile=profile, custom_model=requested_model)
             admission = self.status(profile=profile, custom_model=requested_model)
             if bool(admission.get("allowed", False)):
-                return allowed(requested_model, admission)
+                return select_allowed_runtime(admission)
             status = str(admission.get("admission_status") or admission.get("status") or "")
+            if status == "purified_alternative_available":
+                return select_allowed_runtime(admission, replacement_required=True)
+            if scan_result.get("status") == "suspicious":
+                status = "suspicious"
 
         if status == "suspicious":
             if self._is_purifying(str(admission.get("fingerprint") or "")):
@@ -1363,21 +2041,7 @@ class ModelSecurityService:
             purification_result = self.purify(profile=profile, custom_model=requested_model, scan_after=True)
             admission = self.status(profile=profile, custom_model=requested_model)
             if str(admission.get("admission_status") or admission.get("status") or "") == "purified_alternative_available":
-                replacement = self.trusted_purified_runtime_model(profile=profile, custom_model=requested_model)
-                if replacement and replacement.get("custom_model") and replacement.get("model_security", {}).get("allowed"):
-                    model_security = dict(replacement["model_security"])
-                    model_security["runtime_replacement"] = {
-                        "enabled": True,
-                        "path": replacement["custom_model"].get("path"),
-                        "backend": replacement["custom_model"].get("backend"),
-                        "model_family": replacement["custom_model"].get("model_family"),
-                        "source_pt_path": replacement["custom_model"].get("source_pt_path"),
-                    }
-                    runtime_replacement = {
-                        "mode": "purified_runtime",
-                        "source_model_security": replacement.get("source_model_security") or admission,
-                    }
-                    return allowed(replacement["custom_model"], model_security)
+                return select_allowed_runtime(admission, replacement_required=True)
 
         return blocked(admission)
 
@@ -1438,6 +2102,8 @@ class ModelSecurityService:
             return None
         if source_hash and report.source_model_hash != source_hash:
             return None
+        if not self._purification_report_path_current(report):
+            return None
         return report
 
     def _load_purification_report(self, fingerprint: str, source_hash: str | None = None) -> ModelPurificationReport | None:
@@ -1484,9 +2150,23 @@ class ModelSecurityService:
         if not integrity.ok:
             raise ValueError(f"trust_store_compromised:{integrity.reason}")
         cfg, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
-        budget = ScanBudget()
-        cache_dir = self.storage.activation_cache_dir
         source_pt = self._source_pt_path(cfg, fp)
+        scan_base_cfg = cfg
+        if (
+            scan_type == "full"
+            and source_pt is not None
+            and Path(fp.model_path).resolve() != source_pt.resolve()
+        ):
+            source_runtime = self._runtime_model_for_purified_path(source_pt, fp)
+            source_runtime.pop("status", None)
+            scan_base_cfg = self._config(
+                profile=profile,
+                custom_model=source_runtime,
+            )
+            fp = build_model_fingerprint(scan_base_cfg, root=self.root)
+        scan_cfg, device_policy = apply_model_security_device_policy(scan_base_cfg)
+        budget = self._scan_budget(scan_cfg, device_policy)
+        cache_dir = self.storage.activation_cache_dir
         assets = self._validation_assets(cfg)
         self._log_event(
             "scan_started",
@@ -1496,6 +2176,9 @@ class ModelSecurityService:
             fingerprint=fp.fingerprint,
             runtime_model_path=fp.model_path,
             source_pt_path=str(source_pt) if source_pt else None,
+            requested_device=device_policy.requested_device,
+            effective_device=device_policy.effective_device,
+            device_fallback_reason=device_policy.fallback_reason,
         )
         report = (
             full_scan(
@@ -1504,15 +2187,17 @@ class ModelSecurityService:
                 cache_dir=cache_dir,
                 source_model_path=source_pt,
                 validation_assets=assets,
-                runtime_config=cfg,
+                runtime_config=scan_cfg,
                 project_root=self.root,
                 report_dir=self.storage.reports_dir,
             )
             if scan_type == "full"
             else quick_scan(fp, budget=budget, cache_dir=cache_dir)
         )
+        report.diagnostics["device_policy"] = device_policy.to_dict()
         report = self._write_report(report)
         with self._lock:
+            previous_job = self._last_job_for_fingerprint(self._last_scan_job, fp.fingerprint) or {}
             self._last_report = report
             self._last_scan_job = {
                 "state": "completed",
@@ -1523,6 +2208,9 @@ class ModelSecurityService:
                 "report_path": report.report_path,
                 "completed_at": report.completed_at,
             }
+            for field in ("auto_purify", "auto_purify_state", "auto_export", "auto_export_state"):
+                if field in previous_job:
+                    self._last_scan_job[field] = previous_job[field]
         self._log_event(
             "scan_completed",
             status=report.status,
@@ -1535,6 +2223,8 @@ class ModelSecurityService:
         )
         if scan_type == "full" and report.status in {"trusted", "clean"}:
             self._mark_clean_full_scan_trusted(report, fp)
+        elif scan_type == "full":
+            self._revoke_trust_after_nonclean_full_scan(report, fp)
         return report.to_dict()
 
     def start_background_scan(
@@ -1565,6 +2255,8 @@ class ModelSecurityService:
         def worker() -> None:
             try:
                 report = self.scan(scan_type=scan_type, profile=profile, custom_model=custom_model)
+                trusted_runtime_ready = scan_type == "full" and report.get("status") in {"clean", "trusted"}
+                auto_export_custom_model = custom_model
                 if scan_type == "full" and should_auto_purify and report.get("status") == "suspicious":
                     self._log_event(
                         "purification_auto_queued",
@@ -1575,7 +2267,14 @@ class ModelSecurityService:
                     )
                     self._purify_target_fingerprint = target_fp.fingerprint
                     try:
-                        self.purify(profile=profile, custom_model=custom_model, scan_after=True)
+                        purification = self.purify(profile=profile, custom_model=custom_model, scan_after=True)
+                        trusted_runtime_ready = purification.get("status") == "scan_clean_trusted"
+                        if trusted_runtime_ready:
+                            auto_export_custom_model = self._runtime_model_for_purified_path(
+                                purification["purified_model_path"],
+                                target_fp,
+                            )
+                            auto_export_custom_model.pop("status", None)
                     except Exception as exc:  # pragma: no cover - surfaced via status/logs
                         self._last_error = str(exc)
                         self._log_event(
@@ -1587,6 +2286,18 @@ class ModelSecurityService:
                         )
                     finally:
                         self._purify_target_fingerprint = None
+                if trusted_runtime_ready:
+                    auto_export = self._auto_export_trusted_runtime(
+                        profile=profile,
+                        custom_model=auto_export_custom_model,
+                    )
+                    with self._lock:
+                        if self._last_scan_job is not None:
+                            self._last_scan_job["auto_export"] = auto_export
+                            self._last_scan_job["auto_export_state"] = auto_export.get(
+                                "state",
+                                "disabled" if not auto_export.get("enabled") else "completed",
+                            )
             except Exception as exc:  # pragma: no cover - surfaced via status
                 self._last_error = str(exc)
                 with self._lock:
@@ -1611,6 +2322,18 @@ class ModelSecurityService:
     def purify(self, *, profile: str = "default", custom_model: dict[str, Any] | None = None, scan_after: bool = True) -> dict[str, Any]:
         cfg, fp = self._config_and_fingerprint(profile=profile, custom_model=custom_model)
         source_pt = self._source_pt_path(cfg, fp)
+        purification_cfg = cfg
+        if (
+            source_pt is not None
+            and Path(fp.model_path).resolve() != source_pt.resolve()
+        ):
+            source_runtime = self._runtime_model_for_purified_path(source_pt, fp)
+            source_runtime.pop("status", None)
+            purification_cfg = self._config(
+                profile=profile,
+                custom_model=source_runtime,
+            )
+            fp = build_model_fingerprint(purification_cfg, root=self.root)
         source_hash = "sha256:" + sha256_file(source_pt) if source_pt and source_pt.exists() else None
         latest_report = self._last_report if self._last_report and self._last_report.fingerprint.get("fingerprint") == fp.fingerprint else None
         if latest_report and source_hash and latest_report.source_model_hash != source_hash:
@@ -1639,7 +2362,7 @@ class ModelSecurityService:
             }
         report = run_new_purification(
             fp=fp,
-            config=cfg,
+            config=purification_cfg,
             root=self.root,
             runtime_dir=self.runtime_dir,
             source_model_path=source_pt,
@@ -1651,6 +2374,7 @@ class ModelSecurityService:
         if scan_after and report.purified_model_path:
             candidate_paths: list[Path] = []
             selected_path = Path(report.purified_model_path)
+            final_purified_path = purified_model_output_path(source_pt) if source_pt is not None else selected_path
             candidate_paths.append(selected_path)
             for candidate in report.candidates:
                 if not isinstance(candidate, dict):
@@ -1668,11 +2392,21 @@ class ModelSecurityService:
             }
             candidate_scan_results: list[dict[str, Any]] = []
             try:
-                assets = self._validation_assets(cfg)
+                assets = self._validation_assets(purification_cfg)
                 accepted_scan_report = None
                 accepted_fp = None
                 accepted_path = None
                 for candidate_path in candidate_paths:
+                    candidate_record = candidates_by_path.get(str(candidate_path), {})
+                    if candidate_record.get("eligible_for_purification_scan") is False:
+                        candidate_scan_results.append(
+                            {
+                                "candidate_path": str(candidate_path),
+                                "status": "replacement_only_skipped",
+                                "reason": "clean baseline replacement is not a purified candidate",
+                            }
+                        )
+                        continue
                     if not candidate_path.exists():
                         candidate_scan_results.append(
                             {
@@ -1682,13 +2416,20 @@ class ModelSecurityService:
                             }
                         )
                         continue
-                    purified_cfg = self._purified_pt_runtime_config(cfg, candidate_path, fp)
+                    if candidate_path.resolve() != final_purified_path.resolve():
+                        candidate_path = promote_purified_candidate(source_pt, candidate_path)
+                    purified_cfg = self._purified_pt_runtime_config(
+                        purification_cfg,
+                        candidate_path,
+                        fp,
+                    )
+                    purified_cfg, candidate_device_policy = apply_model_security_device_policy(purified_cfg)
                     purified_fp = build_model_fingerprint(purified_cfg, root=self.root)
-                    scan_budget = ScanBudget()
+                    scan_budget = self._scan_budget(purified_cfg, candidate_device_policy)
                     scan_report = self._strict_candidate_report(
                         fp=purified_fp,
                         candidate_path=candidate_path,
-                        candidate=candidates_by_path.get(str(candidate_path), {}),
+                        candidate=candidate_record,
                         budget=scan_budget,
                     )
                     if scan_report is None:
@@ -1702,6 +2443,7 @@ class ModelSecurityService:
                             project_root=self.root,
                             report_dir=self.storage.reports_dir,
                         )
+                    scan_report.diagnostics["device_policy"] = candidate_device_policy.to_dict()
                     scan_report = self._write_report(scan_report)
                     with self._lock:
                         self._last_report = scan_report
@@ -1722,6 +2464,12 @@ class ModelSecurityService:
                         break
                 report.diagnostics["candidate_scan_results"] = candidate_scan_results
                 if accepted_scan_report is not None and accepted_fp is not None and accepted_path is not None:
+                    validation_scope = str(accepted_scan_report.diagnostics.get("validation_scope") or "")
+                    approval_source = (
+                        "purified_family_evidence_revalidation"
+                        if validation_scope == "hash_bound_adaptive_family_evidence_revalidation"
+                        else "purified_full_scan"
+                    )
                     report.purified_model_path = str(accepted_path)
                     report.purified_model_hash = "sha256:" + sha256_file(accepted_path)
                     report.scan_report_path = accepted_scan_report.report_path
@@ -1741,6 +2489,7 @@ class ModelSecurityService:
                             "source_fingerprint": fp.fingerprint,
                             "model_family": accepted_fp.model_family,
                             "backend": accepted_fp.backend,
+                            "validation_scope": validation_scope,
                         },
                     )
                     report = self._write_purification_report(report)
@@ -1749,7 +2498,11 @@ class ModelSecurityService:
                         risk_score=accepted_scan_report.risk_score,
                         report_path=accepted_scan_report.report_path,
                         scanner_version=SCANNER_VERSION,
-                        notes="auto-trusted purified PT after clean full scan",
+                        notes=(
+                            "auto-trusted purified PT after hash-bound family evidence revalidation"
+                            if approval_source == "purified_family_evidence_revalidation"
+                            else "auto-trusted purified PT after clean full scan"
+                        ),
                         runtime_model_hash=accepted_fp.model_hash,
                         runtime_model_path=accepted_fp.model_path,
                         source_model_hash=accepted_scan_report.source_model_hash,
@@ -1767,22 +2520,26 @@ class ModelSecurityService:
                             purified_report=accepted_scan_report,
                             purification_report=report,
                         ),
-                        approval_source="purified_full_scan",
+                        approval_source=approval_source,
                     )
                     self._log_event(
                         "whitelist_written",
                         status="trusted",
-                        message="净化模型复扫通过，已自动写入白名单",
+                        message=(
+                            "净化模型家族证据复核通过，已自动写入白名单"
+                            if approval_source == "purified_family_evidence_revalidation"
+                            else "净化模型复扫通过，已自动写入白名单"
+                        ),
                         fingerprint=accepted_fp.fingerprint,
                         source_fingerprint=fp.fingerprint,
                         report_path=accepted_scan_report.report_path,
                         purification_report_path=report.report_path,
-                        approval_source="purified_full_scan",
+                        approval_source=approval_source,
                     )
                     self._log_event(
                         "purified_model_ready",
                         status="trusted",
-                        message="净化模型已复扫通过，可直接用于A模块检测；如需加速格式，可在安全中心导出。",
+                        message="净化模型已复扫通过，正在准备可信加速格式。",
                         fingerprint=accepted_fp.fingerprint,
                         source_fingerprint=fp.fingerprint,
                         purified_model_path=str(accepted_path),
@@ -1838,7 +2595,28 @@ class ModelSecurityService:
 
         def worker() -> None:
             try:
-                self.purify(profile=profile, custom_model=custom_model, scan_after=scan_after)
+                purification = self.purify(
+                    profile=profile,
+                    custom_model=custom_model,
+                    scan_after=scan_after,
+                )
+                if purification.get("status") == "scan_clean_trusted":
+                    purified_runtime = self._runtime_model_for_purified_path(
+                        purification["purified_model_path"],
+                        target_fp,
+                    )
+                    purified_runtime.pop("status", None)
+                    auto_export = self._auto_export_trusted_runtime(
+                        profile=profile,
+                        custom_model=purified_runtime,
+                    )
+                    with self._lock:
+                        if self._last_purification_job is not None:
+                            self._last_purification_job["auto_export"] = auto_export
+                            self._last_purification_job["auto_export_state"] = auto_export.get(
+                                "state",
+                                "disabled" if not auto_export.get("enabled") else "completed",
+                            )
             except Exception as exc:  # pragma: no cover - surfaced via status
                 self._last_error = str(exc)
                 with self._lock:
@@ -1886,6 +2664,7 @@ class ModelSecurityService:
         fingerprint = str(fingerprint or "").strip()
         if not fingerprint:
             raise ValueError("fingerprint is required")
+        self._ensure_trust_mutation_idle()
         integrity = self._trust_store_integrity()
         if not integrity.ok:
             raise ValueError(f"trust_store_compromised:{integrity.reason}")
@@ -1901,6 +2680,7 @@ class ModelSecurityService:
         return payload
 
     def clear_trust(self) -> dict[str, Any]:
+        self._ensure_trust_mutation_idle()
         deleted = self.registry.clear()
         self._log_event(
             "whitelist_cleared",

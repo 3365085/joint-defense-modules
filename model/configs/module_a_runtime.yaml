@@ -275,6 +275,26 @@ model_security:
   external_eval_suspicious_asr: 0.50
   external_eval_conf: 0.26
   external_eval_iou: 0.70
+  external_eval_roots:
+    - runtime/model_security/adaptive_delivery/validation/05_固定ASR攻击图库16模型
+    - runtime/model_security/adaptive_delivery/validation/06_固定语义攻击与干净图库
+  auto_export_accelerated: true
+  auto_export_format: auto
+  auto_export_onnx_fallback: true
+  require_accelerated_metadata: true
+  prefer_accelerated_runtime: true
+  cpu_compatible: true
+  cuda_recommended: true
+  detox:
+    adaptive_routes_enabled: true
+    adaptive_registry_path: configs/model_security/adaptive_purification_registry.json
+    adaptive_workspace_root: .
+    adaptive_assets_root: runtime/model_security/adaptive_delivery
+    clean_anchor_path: 'D:/联合防御模块/素材/model/yolov8/mask_bd_v4_clean_baseline.pt'
+    alpha_grid: [0.2, 0.4, 0.6, 0.8]
+    use_yolo_template: true
+    max_candidates: 5
+    max_rounds: 1
 
 profiles:
   desktop_rtx:

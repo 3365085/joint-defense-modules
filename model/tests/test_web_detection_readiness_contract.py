@@ -150,6 +150,7 @@ class AutoRemediateModelSecurity:
     def __init__(self, purified_path: str) -> None:
         self.purified_path = purified_path
         self.prepare_calls: list[dict] = []
+        self.purification_calls: list[dict] = []
 
     def prepare_runtime_for_start(self, **payload) -> dict:
         self.prepare_calls.append(payload)
@@ -190,6 +191,24 @@ class AutoRemediateModelSecurity:
             "scan": {"status": "suspicious", "scan_type": "full"},
             "purification": {"status": "scan_clean_trusted", "purified_model_path": self.purified_path},
             "runtime_replacement": {"mode": "purified_runtime"},
+        }
+
+    def start_background_purification(self, **payload) -> dict:
+        self.purification_calls.append(payload)
+        return {
+            "started": True,
+            "fingerprint": "sha256:suspicious",
+            "scan_after": bool(payload.get("scan_after")),
+        }
+
+    def status(self, **_payload) -> dict:
+        return {
+            "allowed": False,
+            "status": "purifying",
+            "admission_status": "purifying",
+            "whitelist_hit": False,
+            "blocking_reason": "purification_running",
+            "purifying": True,
         }
 
 
@@ -328,7 +347,7 @@ def test_web_start_purifying_model_blocks_without_duplicate_work_or_engine_start
     assert engine.started_with is None
 
 
-def test_web_start_rejects_purified_runtime_replacement_in_production(tmp_path) -> None:
+def test_web_start_accepts_trusted_purified_runtime_replacement(tmp_path) -> None:
     purified = tmp_path / "purified.pt"
     purified.write_bytes(b"trusted-purified")
     engine = ReadyDetectionEngine()
@@ -345,17 +364,17 @@ def test_web_start_rejects_purified_runtime_replacement_in_production(tmp_path) 
         },
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 200
     data = response.json()
-    assert data["ok"] is False
-    assert data["error"] == "production_model_replacement_forbidden"
+    assert data["ok"] is True
     assert data["model_security"]["admission_status"] == "trusted"
     assert data["model_security"]["runtime_replacement"]["path"] == str(purified)
-    assert engine.started_with is None
+    assert data["model_security_runtime_replacement"]["mode"] == "purified_runtime"
+    assert engine.started_with["custom_model"]["path"] == str(purified)
     assert security.runtime_resolve_calls[0]["profile"] == "desktop_rtx"
 
 
-def test_web_start_rejects_custom_model_before_auto_remediation(tmp_path) -> None:
+def test_web_start_routes_custom_model_through_b_and_blocks_when_unadmitted(tmp_path) -> None:
     purified = tmp_path / "auto_purified.pt"
     purified.write_bytes(b"trusted-purified")
     engine = ReadyDetectionEngine()
@@ -381,9 +400,14 @@ def test_web_start_rejects_custom_model_before_auto_remediation(tmp_path) -> Non
     assert response.status_code == 409
     data = response.json()
     assert data["ok"] is False
-    assert data["error"] == "production_model_locked"
+    assert data["error"] == "model_security_blocked"
+    assert data["model_security"]["admission_status"] == "purifying"
     assert engine.started_with is None
-    assert security.prepare_calls == []
+    assert len(security.prepare_calls) == 1
+    assert security.prepare_calls[0]["auto_remediate"] is False
+    assert security.prepare_calls[0]["custom_model"]["path"] == "poisoned.pt"
+    assert len(security.purification_calls) == 1
+    assert security.purification_calls[0]["scan_after"] is True
 
 
 def test_web_overlay_returns_detection_records() -> None:

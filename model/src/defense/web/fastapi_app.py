@@ -9,8 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from defense.runtime import MonitorEngine, PipelineCache, list_profiles, sample_sources, scan_camera_devices
-from defense.runtime.authoritative_model import authoritative_source_path, resolve_project_path
-from defense.runtime.config import DEFAULT_CONFIG_PATH, load_runtime_config, project_root
+from defense.runtime.config import DEFAULT_CONFIG_PATH, project_root
 from defense.runtime.evidence import (
     evidence_path_from_token,
     list_evidence_events,
@@ -93,34 +92,9 @@ async def _body(request: Request) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _production_unique_model_enabled(
-    config_path: str | Path,
-    *,
-    profile: str,
-) -> bool:
-    config = load_runtime_config(
-        config_path=config_path,
-        profile=profile,
-        custom_model={},
-    )
-    runtime = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
-    return bool(runtime.get("production_unique_model", False))
-
-
 def _localhost_test_entry_enabled(request: Request) -> bool:
     host = str(getattr(request.app.state, "bind_host", "") or "").strip().lower()
     return host in {"127.0.0.1", "localhost", "::1", "[::1]"}
-
-
-def _is_redundant_authoritative_model_selection(custom_model: Any) -> bool:
-    """Recognize stale Web selections that point at the locked source PT itself."""
-    if not isinstance(custom_model, dict):
-        return False
-    raw_path = str(custom_model.get("path") or "").strip()
-    if not raw_path:
-        return False
-    root = project_root()
-    return resolve_project_path(raw_path, root) == authoritative_source_path(root)
 
 
 def _start_blocked_payload(
@@ -163,7 +137,7 @@ def _resolve_model_security_start(
 ) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any] | None]:
     preparer = getattr(service, "prepare_runtime_for_start", None)
     if callable(preparer):
-        prepared = preparer(profile=profile, custom_model=custom_model, auto_remediate=True)
+        prepared = preparer(profile=profile, custom_model=custom_model, auto_remediate=False)
         if bool(prepared.get("allowed", False)) and prepared.get("custom_model") is not None:
             return prepared["custom_model"], prepared.get("model_security", {}), {
                 "scan": prepared.get("scan"),
@@ -266,32 +240,26 @@ def create_app(
         payload = await _body(request)
         profile = normalize_profile(payload.get("profile", "default"))
         custom_model = payload.get("custom_model") or {}
-        production_unique_model = _production_unique_model_enabled(
-            request.app.state.config_path,
-            profile=profile,
-        )
         model_security_service = _model_security(request.app)
-        bypass_security_for_test = bool(
-            payload.get("test_bypass_model_security")
-            or payload.get("bypass_model_security_for_test")
-            or payload.get("bypass_model_security")
-        )
         test_start_endpoint = request.url.path in {
             "/api/test/start",
             "/api/test/runs/start",
         }
-        # Older/open Web pages may still submit the authoritative PT through the
-        # former custom-model fields.  It is not a real model replacement: drop
-        # that stale selection (and its stale bypass flag) so the production
-        # path loads the hash-bound TensorRT artifact instead of rejecting the
-        # user's start request.  Any different path remains forbidden below.
-        if (
-            production_unique_model
-            and not test_start_endpoint
-            and _is_redundant_authoritative_model_selection(custom_model)
-        ):
-            custom_model = {}
-            bypass_security_for_test = False
+        bypass_security_requested = bool(
+            payload.get("test_bypass_model_security")
+            or payload.get("bypass_model_security_for_test")
+            or payload.get("bypass_model_security")
+        )
+        if bypass_security_requested and not test_start_endpoint:
+            return _json(
+                {
+                    "ok": False,
+                    "error": "test_security_bypass_endpoint_required",
+                    "message": "绕过B模块安全准入仅允许使用本机安全中心的显式测试入口。",
+                },
+                status_code=403,
+            )
+        bypass_security_for_test = bool(test_start_endpoint and bypass_security_requested)
         test_custom_model_requested = bool(
             isinstance(custom_model, dict)
             and custom_model.get("enabled")
@@ -314,37 +282,6 @@ def create_app(
                     "message": "自定义模型测试入口仅允许本机 Web 服务使用。",
                 },
                 status_code=403,
-            )
-        production_test_entry = bool(
-            production_unique_model
-            and test_start_endpoint
-        )
-        if production_unique_model and not production_test_entry and bool(
-            isinstance(custom_model, dict)
-            and (
-                custom_model.get("enabled")
-                or str(custom_model.get("path") or "").strip()
-            )
-        ):
-            return _json(
-                {
-                    "ok": False,
-                    "error": "production_model_locked",
-                    "message": (
-                        "生产运行已锁定唯一 YOLO 模型 "
-                        "mask_bd_v4_clean_baseline.pt，禁止自定义模型覆盖。"
-                    ),
-                },
-                status_code=409,
-            )
-        if production_unique_model and bypass_security_for_test and not production_test_entry:
-            return _json(
-                {
-                    "ok": False,
-                    "error": "production_security_bypass_forbidden",
-                    "message": "生产运行禁止绕过模型安全准入。",
-                },
-                status_code=409,
             )
         if bypass_security_for_test:
             try:
@@ -392,7 +329,11 @@ def create_app(
         start_runtime_replacement = runtime_replacement.get("runtime_replacement") if isinstance(runtime_replacement, dict) else runtime_replacement
         if runtime_custom_model is None:
             admission_status = admission.get("admission_status")
-            if admission_status == "blocked_scan_required" and scan_result is None:
+            if (
+                admission_status == "blocked_scan_required"
+                and bool(admission.get("can_scan", False))
+                and scan_result is None
+            ):
                 scan_result = model_security_service.start_background_scan(
                     scan_type="full",
                     profile=profile,
@@ -400,7 +341,11 @@ def create_app(
                     auto_purify=True,
                 )
                 admission = model_security_service.status(profile=profile, custom_model=custom_model)
-            elif admission_status == "suspicious" and purification_result is None:
+            elif (
+                admission_status == "suspicious"
+                and bool(admission.get("can_purify", False))
+                and purification_result is None
+            ):
                 purification_result = model_security_service.start_background_purification(
                     profile=profile,
                     custom_model=custom_model,
@@ -408,22 +353,6 @@ def create_app(
                 )
                 admission = model_security_service.status(profile=profile, custom_model=custom_model)
             return _json(_start_blocked_payload(admission, scan_result=scan_result, purification_result=purification_result), status_code=409)
-        if production_unique_model and not production_test_entry and bool(
-            isinstance(runtime_custom_model, dict)
-            and runtime_custom_model.get("enabled")
-        ):
-            return _json(
-                {
-                    "ok": False,
-                    "error": "production_model_replacement_forbidden",
-                    "message": (
-                        "模型安全服务返回了替换模型，但 Module A 生产运行只允许"
-                        "权威模型及其绑定的 TensorRT engine。"
-                    ),
-                    "model_security": admission,
-                },
-                status_code=409,
-            )
         engine = _engine(request.app)
         try:
             start_kwargs = {
@@ -434,7 +363,7 @@ def create_app(
                 "feature_options": payload.get("feature_options") or None,
                 "custom_model": runtime_custom_model,
             }
-            if production_test_entry:
+            if bypass_security_for_test:
                 start_kwargs["allow_test_custom_model"] = True
             run_id = engine.start(
                 **start_kwargs,
@@ -899,14 +828,18 @@ def create_app(
         try:
             result = _model_security(request.app).delete_trust(str(payload.get("fingerprint", "")))
         except ValueError as exc:
-            code = 409 if str(exc).startswith("trust_store_compromised") else 400
+            code = 409 if str(exc).startswith(("trust_store_compromised", "model_security_background_task_running")) else 400
             return _json({"ok": False, "error": str(exc)}, status_code=code)
         return _json({"ok": True, "trust": result, "model_security": _model_security(request.app).status()})
 
     @app.post("/api/model-security/trust/clear")
     async def model_security_trust_clear(request: Request) -> JSONResponse:
         require_http_access(request)
-        result = _model_security(request.app).clear_trust()
+        try:
+            result = _model_security(request.app).clear_trust()
+        except ValueError as exc:
+            code = 409 if str(exc).startswith(("trust_store_compromised", "model_security_background_task_running")) else 400
+            return _json({"ok": False, "error": str(exc)}, status_code=code)
         return _json({"ok": True, "trust": result, "model_security": _model_security(request.app).status()})
 
     @app.websocket("/ws/runs/{run_id}")

@@ -70,6 +70,23 @@
     .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
     .actionGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 8px; }
     .pathGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+    .flowGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .flowStep {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+      min-height: 86px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      background: #11161b;
+    }
+    .flowStep.ok { border-color: rgba(70, 211, 154, .45); }
+    .flowStep.warn { border-color: rgba(255, 200, 87, .55); }
+    .flowStep.bad { border-color: rgba(255, 77, 94, .6); }
+    .flowStep b { font-size: 13px; }
+    .flowStep span { color: var(--muted); font-size: 12px; }
+    .flowStep em { color: var(--text); font-size: 12px; font-style: normal; overflow-wrap: anywhere; }
     .compactForm {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -209,7 +226,7 @@
     details.panel > summary.panelHeader::-webkit-details-marker { display: none; }
     details.panel:not([open]) .content { display: none; }
     @media (max-width: 980px) {
-      header, main, .grid2, .grid3, .pathGrid, .compactForm { grid-template-columns: 1fr; }
+      header, main, .grid2, .grid3, .pathGrid, .compactForm, .flowGrid { grid-template-columns: 1fr; }
       .compactForm .wide { grid-column: auto; }
     }
   </style>
@@ -229,19 +246,13 @@
           <div id="configPill" class="pill">未保存</div>
         </div>
         <div class="content">
-          <div class="notice">默认生产运行使用唯一权威模型及其 TensorRT engine。配置变更会立即应用；启用自定义模型后会进入本机测试入口，默认仍由B模块准入，只有显式勾选测试绕过才会跳过B模块。</div>
+          <div class="notice">默认生产运行使用唯一权威模型及其 TensorRT engine。配置变更会立即同步到主监控台；启用自定义模型后，主监控台会将其作为正常运行模型并由B模块执行安全准入。加速模型按运行模型哈希自动核对源 PT 绑定，无需手工选择源 PT。</div>
           <div class="compactForm">
             <label class="checkLine wide"><input id="enableCustomModel" type="checkbox" />使用自定义模型</label>
             <label class="wide">自定义模型路径
               <div class="fieldRow">
                 <input id="customModelPath" placeholder="选择 .pt / .engine / .onnx 模型文件" />
                 <button id="browseModelBtn" type="button" style="width:auto;">浏览模型</button>
-              </div>
-            </label>
-            <label class="wide">同源原始 PT（加速模型准入必填）
-              <div class="fieldRow">
-                <input id="sourcePtPath" placeholder="选择与加速模型同源的 .pt 文件" />
-                <button id="browseSourcePtBtn" type="button" style="width:auto;">浏览PT</button>
               </div>
             </label>
             <label>模型族
@@ -259,10 +270,36 @@
               </select>
             </label>
             <div class="field"><strong>后端：</strong><span id="resolvedBackend">自动匹配</span><br /><strong>模型族：</strong><span id="resolvedFamily">自动识别</span></div>
-            <label class="checkLine wide"><input id="testBypassModelSecurity" type="checkbox" />测试入口：绕过B模块安全准入直接运行当前模型</label>
+            <label class="checkLine wide"><input id="testBypassModelSecurity" type="checkbox" />允许主监控台使用任意自定义模型并绕过B模块安全准入</label>
           </div>
-          <div class="notice warn">自定义模型仅用于本机测试，不改变生产权威模型。未勾选绕过时必须通过B模块准入；勾选绕过后不会写入白名单。</div>
+          <div class="notice warn">开启后，返回主监控台点击“开始检测”将直接运行当前选择的自定义模型，不执行B模块扫描、净化或白名单准入；关闭后恢复正常B模块准入流程。</div>
           <div id="modelConfigMessage" class="field"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panelHeader">
+          <div class="title">B模块自动闭环与执行设备</div>
+          <div id="pipelinePill" class="pill">等待状态</div>
+        </div>
+        <div class="content">
+          <div id="deviceNotice" class="notice">CPU模式兼容；使用 NVIDIA CUDA 可获得最佳净化、复扫和 TensorRT 演示性能。</div>
+          <div class="grid3">
+            <div class="metric"><b id="requestedDevice">未上报</b><span>请求设备</span></div>
+            <div class="metric"><b id="effectiveDevice">未上报</b><span>实际设备</span></div>
+            <div class="metric"><b id="cudaAvailable">未上报</b><span>CUDA 可用性</span></div>
+          </div>
+          <div class="field"><strong>设备回退原因：</strong><span id="deviceFallbackReason">未上报</span></div>
+          <div class="flowGrid" aria-label="B模块自动闭环状态">
+            <article id="flowScan" class="flowStep"><b>1. 完整扫描</b><span>等待状态</span><em>陌生 PT 才会触发</em></article>
+            <article id="flowPurify" class="flowStep"><b>2. 自动净化</b><span>等待状态</span><em>仅风险模型触发</em></article>
+            <article id="flowRescan" class="flowStep"><b>3. 候选复扫</b><span>等待状态</span><em>复扫通过才可提升</em></article>
+            <article id="flowExport" class="flowStep"><b>4. 加速导出</b><span>等待状态</span><em>区分自动/手工触发</em></article>
+            <article id="flowValidation" class="flowStep"><b>5. 加速产物验证</b><span>等待状态</span><em>未上报不视为通过</em></article>
+            <article id="flowTrust" class="flowStep"><b>6. 加速模型白名单</b><span>等待状态</span><em>绑定源 PT 哈希</em></article>
+            <article id="flowRuntime" class="flowStep"><b>7. 运行模型选择</b><span>等待状态</span><em>仅展示实际选择结果</em></article>
+          </div>
+          <div id="pipelineNotice" class="notice">流程状态只依据后端任务、白名单和运行选择证据；未上报阶段不会显示为完成。</div>
         </div>
       </section>
 
@@ -382,6 +419,7 @@
     let taskPollTimer = null;
     let lastBusyState = false;
     let taskRefreshInFlight = false;
+    let lastTrustRecords = [];
 
     function getStored(key, fallback = "") {
       try {
@@ -430,15 +468,9 @@
       const backend = "auto";
       const family = $("customModelFamily") ? $("customModelFamily").value : getStored("moduleA.lastCustomModelFamily", "auto");
       const classNamesRaw = $("customClassNames") ? $("customClassNames").value : getStored("moduleA.lastCustomClassNames", "");
-      let sourcePtPath = $("sourcePtPath") ? $("sourcePtPath").value.trim() : getStored("moduleA.lastSourcePtPath", "");
-      if (/\.(pt|pth)$/i.test(path)) sourcePtPath = path;
-      const options = {enabled: enabled && !!path, path, backend, model_family: family, source_pt_path: sourcePtPath};
+      const options = {enabled: enabled && !!path, path, backend, model_family: family};
       if (classNamesRaw) options.class_names = classNamesRaw.split(",").map((item) => item.trim()).filter(Boolean);
       return options;
-    }
-
-    function modelSecurityBypassEnabled() {
-      return getStored("moduleA.testBypassModelSecurity", "false") === "true";
     }
 
     function loadModelConfig() {
@@ -446,21 +478,15 @@
       const customEnabled = getStored("moduleA.lastCustomModelEnabled", "false") === "true";
       $("enableCustomModel").checked = customEnabled;
       $("customModelPath").value = getStored("moduleA.lastModelPath", "");
-      $("sourcePtPath").value = getStored("moduleA.lastSourcePtPath", "");
       $("customModelFamily").value = getStored("moduleA.lastCustomModelFamily", "auto");
       $("customClassNames").value = getStored("moduleA.lastCustomClassNames", "");
-      $("testBypassModelSecurity").checked = customEnabled && modelSecurityBypassEnabled();
-      if (!customEnabled) setStored("moduleA.testBypassModelSecurity", "false");
+      $("testBypassModelSecurity").checked = getStored("moduleA.testBypassModelSecurity", "false") === "true";
       syncModelConfigControls();
     }
 
     function saveModelConfig(options = {}) {
       setStored("moduleA.lastCustomModelEnabled", $("enableCustomModel").checked ? "true" : "false");
       setStored("moduleA.lastModelPath", $("customModelPath").value.trim());
-      if (/\.(pt|pth)$/i.test($("customModelPath").value.trim())) {
-        $("sourcePtPath").value = $("customModelPath").value.trim();
-      }
-      setStored("moduleA.lastSourcePtPath", $("sourcePtPath").value.trim());
       setStored("moduleA.lastCustomModelFamily", $("customModelFamily").value || "auto");
       setStored("moduleA.lastCustomClassNames", $("customClassNames").value || "");
       setStored("moduleA.testBypassModelSecurity", $("testBypassModelSecurity").checked ? "true" : "false");
@@ -476,8 +502,6 @@
       }
       $("customModelPath").disabled = !enabled;
       $("browseModelBtn").disabled = !enabled;
-      $("sourcePtPath").disabled = !enabled;
-      $("browseSourcePtBtn").disabled = !enabled;
       $("customModelFamily").disabled = !enabled;
       $("customClassNames").disabled = !enabled;
       $("testBypassModelSecurity").disabled = !enabled;
@@ -579,6 +603,217 @@
 
     function metricsOf(obj) {
       return (obj && typeof obj.security_metrics === "object" && obj.security_metrics) ? obj.security_metrics : {};
+    }
+
+    function firstDefined(...values) {
+      return values.find((value) => value !== undefined && value !== null && value !== "");
+    }
+
+    function objectValue(value) {
+      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    }
+
+    function normalizedState(value) {
+      return String(value || "").trim().toLowerCase();
+    }
+
+    function renderFlowStep(id, state, label, detail) {
+      const node = $(id);
+      if (!node) return;
+      const tones = { complete: "ok", ready: "ok", running: "warn", pending: "", skipped: "", failed: "bad", blocked: "bad" };
+      node.className = `flowStep ${tones[state] || ""}`.trim();
+      node.querySelector("span").textContent = label || "等待状态";
+      node.querySelector("em").textContent = detail || "--";
+      node.dataset.state = state || "pending";
+    }
+
+    function renderDeviceStatus(ms) {
+      const device = objectValue(firstDefined(ms.device_policy, ms.device_status, ms.execution_device, ms.compute_device));
+      const requested = firstDefined(
+        ms.requested_device,
+        ms.device_requested,
+        device.requested_device,
+        device.requested,
+        device.configured_device,
+      );
+      const effective = firstDefined(
+        ms.effective_device,
+        ms.device_effective,
+        device.effective_device,
+        device.effective,
+        device.runtime_device,
+      );
+      const cuda = firstDefined(ms.cuda_available, device.cuda_available, device.cuda);
+      const fallbackReason = firstDefined(
+        ms.device_fallback_reason,
+        ms.fallback_reason,
+        device.fallback_reason,
+        device.reason,
+      );
+      const performanceNote = firstDefined(ms.performance_note, device.performance_note);
+      $("requestedDevice").textContent = requested == null ? "未上报" : String(requested);
+      $("effectiveDevice").textContent = effective == null ? "未上报" : String(effective);
+      $("cudaAvailable").textContent = cuda === true ? "可用" : cuda === false ? "不可用" : "未上报";
+      $("deviceFallbackReason").textContent = fallbackReason == null ? "未上报" : String(fallbackReason || "无");
+      const notice = $("deviceNotice");
+      if (cuda === false || fallbackReason) {
+        notice.textContent = `${performanceNote || "CPU模式兼容，但 NVIDIA CUDA 才能获得最佳净化、复扫和 TensorRT 演示性能。"}${fallbackReason ? ` 当前回退：${fallbackReason}` : ""}`;
+        notice.className = "notice warn";
+      } else if (cuda === true) {
+        notice.textContent = `CUDA 可用${effective ? `，当前实际设备：${effective}` : ""}。CPU仍兼容，但 CUDA 可获得最佳演示性能。`;
+        notice.className = "notice ok";
+      } else {
+        notice.textContent = "CPU模式兼容；CUDA可用性尚未由后端上报。使用 NVIDIA CUDA 可获得最佳净化、复扫和 TensorRT 演示性能。";
+        notice.className = "notice";
+      }
+    }
+
+    function renderAutomationPipeline(ms) {
+      const productionDefault = !$("enableCustomModel").checked;
+      const status = normalizedState(ms.admission_status || ms.status);
+      const scanJob = objectValue(ms.last_scan_job);
+      const purificationJob = objectValue(ms.last_purification_job);
+      const exportJob = objectValue(ms.last_export_job);
+      const autoExport = objectValue(firstDefined(ms.automatic_export, ms.auto_export, ms.accelerated_export));
+      const validation = objectValue(firstDefined(ms.export_validation, ms.accelerated_validation, ms.accelerated_artifact_validation, ms.runtime_validation));
+      const runtimeSelection = objectValue(firstDefined(ms.runtime_selection, ms.selected_runtime));
+      const selectedRuntime = objectValue(firstDefined(runtimeSelection.selected, runtimeSelection.runtime_model, ms.selected_runtime_model));
+      const purificationStatus = normalizedState(ms.purification_status);
+      const scanState = normalizedState(firstDefined(scanJob.state, scanJob.status));
+      const purificationState = normalizedState(firstDefined(purificationJob.state, purificationJob.status));
+      const exportState = normalizedState(firstDefined(autoExport.state, autoExport.status, ms.auto_export_status, ms.accelerated_export_status, exportJob.state, exportJob.status));
+      const explicitValidationState = firstDefined(validation.state, validation.status, ms.export_validation_status, ms.accelerated_validation_status);
+      const validationState = normalizedState(
+        explicitValidationState !== undefined
+          ? explicitValidationState
+          : validation.valid === true
+            ? "passed"
+            : validation.valid === false
+              ? "failed"
+              : "",
+      );
+      const selectionState = normalizedState(firstDefined(runtimeSelection.state, runtimeSelection.status, ms.runtime_selection_status));
+      const runtimeReplacement = objectValue(ms.runtime_replacement);
+      const runtimeSelected = Boolean(runtimeReplacement.enabled || selectedRuntime.path || selectionState === "selected");
+      const automaticExportReported = Boolean(
+        Object.keys(autoExport).length
+        || ms.auto_export_status
+        || ms.automatic_export_status
+        || String(exportJob.trigger || exportJob.source || "").toLowerCase().includes("auto")
+      );
+      const exportedFingerprint = firstDefined(exportJob.exported_fingerprint, autoExport.exported_fingerprint, autoExport.fingerprint);
+      const acceleratedTrusted = Boolean(
+        firstDefined(ms.accelerated_whitelist_hit, autoExport.whitelist_hit) === true
+        || (exportedFingerprint && lastTrustRecords.some((record) => record.fingerprint === exportedFingerprint))
+      );
+
+      if (productionDefault) {
+        ["flowScan", "flowPurify", "flowRescan", "flowExport", "flowValidation", "flowTrust"].forEach((id) => {
+          renderFlowStep(id, "skipped", "生产默认不适用", "仅启用自定义模型时走此准入闭环");
+        });
+        renderFlowStep("flowRuntime", "ready", "生产默认模型", ms.runtime_artifact_path || ms.model_path || "等待运行状态");
+        $("pipelinePill").textContent = "生产权威路径";
+        $("pipelinePill").className = "pill ok";
+        $("pipelineNotice").textContent = "当前未启用自定义模型；生产运行固定使用权威 PT 及其哈希绑定加速产物。";
+        $("pipelineNotice").className = "notice ok";
+        renderDeviceStatus(ms);
+        return;
+      }
+
+      if (ms.scanning || status === "scanning" || scanState === "running") {
+        renderFlowStep("flowScan", "running", "扫描中", scanJob.started_at || "完整扫描正在运行");
+      } else if (["failed", "error"].includes(scanState)) {
+        renderFlowStep("flowScan", "failed", "扫描失败", scanJob.error || ms.error || "查看日志");
+      } else if (scanState === "completed" || ms.last_scan_completed || ms.last_scan_time) {
+        renderFlowStep("flowScan", "complete", "扫描已完成", statusLabel(scanJob.status || status));
+      } else {
+        renderFlowStep("flowScan", "pending", "待执行", "陌生 PT 未命中白名单时触发");
+      }
+
+      if (ms.purifying || status === "purifying" || purificationState === "running") {
+        renderFlowStep("flowPurify", "running", "净化中", purificationJob.started_at || "风险模型正在净化");
+      } else if (["failed", "error"].includes(purificationState) || purificationStatus.includes("failed") || purificationStatus.includes("no_clean")) {
+        renderFlowStep("flowPurify", "failed", "净化失败", purificationJob.error || ms.error || purificationStatus);
+      } else if (purificationStatus === "scan_clean_trusted") {
+        renderFlowStep("flowPurify", "complete", "净化候选已通过", ms.purified_model_path || "候选复扫证据已确认");
+      } else if (purificationStatus === "planned") {
+        renderFlowStep("flowPurify", "pending", "仅生成净化计划", "尚无净化候选完成证据");
+      } else if (purificationStatus === "purified") {
+        renderFlowStep("flowPurify", "ready", "净化候选已生成", "等待候选复扫结果");
+      } else if (purificationState === "completed" || (purificationStatus && purificationStatus !== "idle")) {
+        renderFlowStep("flowPurify", "pending", "任务已结束，结果待确认", statusLabel(purificationStatus || purificationJob.status));
+      } else {
+        renderFlowStep("flowPurify", "skipped", status === "trusted" ? "未触发" : "待判定", status === "trusted" ? "当前扫描结果未要求净化" : "仅 suspicious 模型触发");
+      }
+
+      if (purificationStatus === "scan_clean_trusted") {
+        renderFlowStep("flowRescan", "complete", "复扫通过", ms.purified_model_path || "净化候选已提升");
+      } else if (purificationStatus.includes("failed") || purificationStatus.includes("no_clean")) {
+        renderFlowStep("flowRescan", "failed", "复扫未通过", purificationStatus);
+      } else if (ms.purifying || purificationState === "running") {
+        renderFlowStep("flowRescan", "running", "等待/执行复扫", "候选生成后进行复扫");
+      } else {
+        renderFlowStep("flowRescan", "pending", "待执行", "没有已完成的候选复扫证据");
+      }
+
+      if (["running", "exporting"].includes(exportState) || ms.exporting || status === "exporting") {
+        renderFlowStep("flowExport", "running", automaticExportReported ? "自动导出中" : "导出中（触发方式未上报）", exportJob.target_path || exportJob.backend || "正在生成加速产物");
+      } else if (["failed", "error"].includes(exportState)) {
+        renderFlowStep("flowExport", "failed", automaticExportReported ? "自动导出失败" : "导出失败", exportJob.error || autoExport.error || ms.error || "查看日志");
+      } else if (["completed", "trusted", "success", "succeeded"].includes(exportState)) {
+        renderFlowStep("flowExport", "complete", automaticExportReported ? "自动导出完成" : "导出完成（触发方式未上报）", exportJob.exported_model_path || autoExport.path || exportJob.backend || "已生成加速产物");
+      } else {
+        renderFlowStep("flowExport", "pending", "尚未启动", ms.can_export_accelerated ? "可信 PT 已具备导出条件" : "等待可信 PT");
+      }
+
+      if (["running", "validating"].includes(validationState)) {
+        renderFlowStep("flowValidation", "running", "验证中", validation.message || "正在校验加载与推理结果");
+      } else if (["failed", "error", "invalid", "rejected"].includes(validationState)) {
+        renderFlowStep("flowValidation", "failed", "验证失败", validation.error || validation.message || validationState);
+      } else if (["completed", "passed", "valid", "trusted", "success", "succeeded"].includes(validationState)) {
+        renderFlowStep("flowValidation", "complete", "验证通过", validation.message || validation.report_path || "后端已确认");
+      } else {
+        renderFlowStep("flowValidation", "pending", "未上报验证结果", exportState === "completed" ? "导出完成不等于运行验证通过" : "等待导出产物");
+      }
+
+      if (acceleratedTrusted) {
+        renderFlowStep("flowTrust", "complete", "已写入白名单", exportedFingerprint || "源 PT 哈希绑定已确认");
+      } else if (exportState === "completed") {
+        renderFlowStep("flowTrust", "pending", "等待白名单确认", exportedFingerprint || "未观察到加速产物信任记录");
+      } else {
+        renderFlowStep("flowTrust", "pending", "待执行", "导出和验证后才能确认");
+      }
+
+      if (runtimeSelected) {
+        renderFlowStep("flowRuntime", "complete", "运行候选已选择", runtimeReplacement.path || selectedRuntime.path || runtimeSelection.path || ms.runtime_artifact_path || "后端已选择；不代表A模块正在运行");
+      } else if (["failed", "error", "blocked"].includes(selectionState)) {
+        renderFlowStep("flowRuntime", "blocked", "运行选择失败", runtimeSelection.error || runtimeSelection.reason || selectionState);
+      } else if (ms.allowed) {
+        renderFlowStep("flowRuntime", "ready", "准入模型已就绪", "A模块启动时使用；不代表当前已运行");
+      } else if (ms.recommended_runtime_model) {
+        renderFlowStep("flowRuntime", "ready", "已有推荐模型", ms.recommended_runtime_model.path || "下次启动时选择");
+      } else {
+        renderFlowStep("flowRuntime", "pending", "尚未选择", reasonLabel(ms.blocking_reason) || "等待前置阶段");
+      }
+
+      const failed = [scanState, purificationState, exportState, validationState, selectionState].some((value) => ["failed", "error", "invalid", "rejected", "blocked"].includes(value));
+      const busy = isTaskBusy(ms) || validationState === "running";
+      const validationPassed = ["completed", "passed", "valid", "trusted", "success", "succeeded"].includes(validationState);
+      const closed = automaticExportReported && validationPassed && acceleratedTrusted && runtimeSelected;
+      $("pipelinePill").textContent = failed ? "存在失败" : busy ? "执行中" : closed ? "闭环完成" : "等待后续阶段";
+      $("pipelinePill").className = `pill ${failed ? "bad" : busy ? "warn" : closed ? "ok" : ""}`.trim();
+      const notice = $("pipelineNotice");
+      if (acceleratedTrusted && !validationState) {
+        notice.textContent = "已观察到加速模型白名单记录，但后端未上报运行验证结果；页面不会把验证阶段标记为完成。";
+        notice.className = "notice warn";
+      } else if (failed) {
+        notice.textContent = "自动闭环存在失败或阻断阶段；请查看具体卡片、报告和日志，未完成阶段不会被放行。";
+        notice.className = "notice bad";
+      } else {
+        notice.textContent = "流程状态只依据后端任务、白名单和运行选择证据；未上报阶段不会显示为完成。";
+        notice.className = "notice";
+      }
+      renderDeviceStatus(ms);
     }
 
     function escapeHtml(value) {
@@ -704,6 +939,7 @@
       else if (status === "trust_store_compromised") text = `白名单完整性失败：${reason || lastModelSecurity.trust_store_reason || "未知原因"}。A模块禁止启动，请清空白名单后重新扫描。`;
       $("admissionNotice").textContent = text;
       $("admissionNotice").className = "notice " + tone(status);
+      renderAutomationPipeline(lastModelSecurity);
 
       const storeReason = reasonLabel(lastModelSecurity.trust_store_reason);
       $("trustStoreNotice").textContent = lastModelSecurity.trust_store_ok
@@ -749,7 +985,9 @@
       const data = await api("/api/model-security/trust");
       const trust = data.trust || {};
       const records = Array.isArray(trust.records) ? trust.records : [];
+      lastTrustRecords = records;
       $("trustCount").textContent = String(records.length);
+      renderAutomationPipeline(lastModelSecurity);
       if (!records.length) {
         $("trustRecords").innerHTML = '<div class="empty">白名单为空。</div>';
         return;
@@ -876,7 +1114,7 @@
       syncModelConfigControls();
       applyModelConfigChange();
     };
-    ["customModelPath", "sourcePtPath", "customModelFamily", "customClassNames", "testBypassModelSecurity"].forEach((id) => {
+    ["customModelPath", "customModelFamily", "customClassNames", "testBypassModelSecurity"].forEach((id) => {
       $(id).onchange = () => applyModelConfigChange();
     });
     $("browseModelBtn").onclick = async () => {
@@ -888,22 +1126,6 @@
           $("enableCustomModel").checked = true;
           syncModelConfigControls();
           await applyModelConfigChange("已选择运行模型并应用。陌生模型会在启动检测或手动扫描时进入B模块准入。");
-        }
-      } catch (err) {
-        showConfigMessage(err.message);
-      } finally {
-        syncModelConfigControls();
-      }
-    };
-    $("browseSourcePtBtn").onclick = async () => {
-      $("browseSourcePtBtn").disabled = true;
-      try {
-        const data = await api("/api/pick-file", {mode: "model", current_path: $("sourcePtPath").value || ""});
-        if (data.path) {
-          $("sourcePtPath").value = data.path;
-          $("enableCustomModel").checked = true;
-          syncModelConfigControls();
-          await applyModelConfigChange("已选择同源 PT 并应用。");
         }
       } catch (err) {
         showConfigMessage(err.message);

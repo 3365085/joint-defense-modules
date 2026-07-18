@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from defense.runtime.artifacts import resolve_artifact_candidate
 
+from .adaptive_registry import adaptive_candidate_for_source
 from .fingerprint import ModelFingerprint, sha256_file
 from .reports import ModelPurificationReport, ModelSecurityReport
 
 
 NEW_DETOX_STRATEGY = "autodetox_backbone_soup"
+ADAPTIVE_DETOX_STRATEGY = "adaptive_oda_oga_semantic_router"
 STRICT_AUDIT_NAME = "FINAL_STRICT_AUDIT_2026-05-23.json"
 
 _PACKAGED_POISONED_ATTACK_METRICS: dict[str, dict[str, Any]] = {
@@ -61,29 +64,63 @@ def _safe_slug(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value).strip("_") or "model"
 
 
-def _unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    for index in range(2, 1000):
-        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-    raise FileExistsError(f"Unable to choose a unique path for {path}")
-
-
-def _purified_done_path(source_pt: Path, *, suffix: str = "") -> Path:
+def _purified_done_path(source_pt: Path, *, output_dir: Path, suffix: str = "") -> Path:
     marker = "净化完毕"
     extra = f"_{_safe_slug(suffix)}" if suffix else ""
-    return _unique_path(source_pt.with_name(f"{source_pt.stem}_{marker}{extra}{source_pt.suffix.lower()}"))
+    return output_dir / f"{source_pt.stem}_{marker}{extra}{source_pt.suffix.lower()}"
 
 
-def _copy_candidate_to_purified_done(source_pt: Path, candidate_path: str | Path, *, suffix: str = "") -> Path:
+def _copy_candidate_to_purified_done(
+    source_pt: Path,
+    candidate_path: str | Path,
+    *,
+    output_dir: Path,
+    suffix: str = "",
+) -> Path:
     source = Path(candidate_path)
-    target = _purified_done_path(source_pt, suffix=suffix)
+    target = _purified_done_path(source_pt, output_dir=output_dir, suffix=suffix)
+    target.parent.mkdir(parents=True, exist_ok=True)
     if source.resolve() != target.resolve():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+            shutil.copy2(source, temporary_path)
+            temporary_path.replace(target)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
     return target
+
+
+def purified_model_output_path(source_pt: str | Path) -> Path:
+    source = Path(source_pt)
+    return _purified_done_path(source, output_dir=source.parent)
+
+
+def promote_purified_candidate(source_pt: str | Path, candidate_path: str | Path) -> Path:
+    source = Path(source_pt)
+    return _copy_candidate_to_purified_done(
+        source,
+        candidate_path,
+        output_dir=source.parent,
+    )
+
+
+def _promote_candidate_record(source_pt: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    promoted = dict(record)
+    staged_path = Path(str(promoted["output_model"]))
+    final_path = promote_purified_candidate(source_pt, staged_path)
+    promoted["staged_output_model"] = str(staged_path)
+    promoted["output_model"] = str(final_path)
+    promoted["output_model_hash"] = "sha256:" + sha256_file(final_path)
+    promoted["local_output_policy"] = "source_model_directory_with_purified_suffix"
+    return promoted
 
 
 def _known_poisoned_attack_metrics(family_tag: str) -> dict[str, Any] | None:
@@ -108,15 +145,28 @@ def _hash_text(value: Any) -> str:
 
 
 def seven_experiment_archive_root(project_root: str | Path) -> Path | None:
-    root = Path(project_root)
-    candidates: list[Path] = []
-    for base in (root, root.parent):
-        path = base / "purification_lab" / "seven_experiment_archive"
-        if path not in candidates:
-            candidates.append(path)
-    for path in candidates:
-        if (path / "manifest.json").exists():
-            return path
+    root = Path(project_root).resolve()
+    path = root / "purification_lab" / "seven_experiment_archive"
+    if (path / "manifest.json").is_file():
+        return path
+    return None
+
+
+def _archive_local_path(value: Any, *, archive_root: Path, experiment: str) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    raw = Path(text)
+    candidates = [raw] if raw.is_absolute() else [archive_root / raw]
+    candidates.append(archive_root / experiment / raw.name)
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(archive_root.resolve())
+        except ValueError:
+            continue
+        if resolved.is_file():
+            return resolved
     return None
 
 
@@ -135,9 +185,12 @@ def load_seven_experiment_archive(project_root: str | Path) -> list[dict[str, An
     for item in experiments:
         if not isinstance(item, Mapping):
             continue
-        summary_path = Path(str(item.get("summary_json") or ""))
-        if not summary_path.exists():
-            summary_path = archive_root / str(item.get("experiment") or "") / "summary.json"
+        experiment = str(item.get("experiment") or "")
+        summary_path = _archive_local_path(item.get("summary_json"), archive_root=archive_root, experiment=experiment)
+        if summary_path is None:
+            summary_path = _archive_local_path("summary.json", archive_root=archive_root, experiment=experiment)
+        if summary_path is None:
+            continue
         try:
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except Exception:
@@ -152,18 +205,21 @@ def load_seven_experiment_archive(project_root: str | Path) -> list[dict[str, An
         video = archive_files.get("comparison_video") if isinstance(archive_files.get("comparison_video"), Mapping) else {}
         if not poisoned or not purified:
             continue
+        poisoned_path = _archive_local_path(poisoned.get("path"), archive_root=archive_root, experiment=experiment)
+        purified_path = _archive_local_path(purified.get("path"), archive_root=archive_root, experiment=experiment)
+        video_path = _archive_local_path(video.get("path"), archive_root=archive_root, experiment=experiment)
         records.append(
             {
-                "experiment": str(summary.get("experiment") or item.get("experiment") or ""),
+                "experiment": str(summary.get("experiment") or experiment),
                 "archive_root": str(archive_root),
                 "summary_json": str(summary_path),
                 "attack_algorithm": dict(attack_algorithm) if isinstance(attack_algorithm, Mapping) else {},
                 "purification_algorithm": str(summary.get("purification_algorithm") or "universal_sandwich_detox"),
-                "poisoned_path": str(poisoned.get("path") or ""),
+                "poisoned_path": str(poisoned_path) if poisoned_path else "",
                 "poisoned_hash": "sha256:" + _hash_text(poisoned.get("sha256")),
-                "purified_path": str(purified.get("path") or ""),
+                "purified_path": str(purified_path) if purified_path else "",
                 "purified_hash": "sha256:" + _hash_text(purified.get("sha256")),
-                "video_path": str(video.get("path") or ""),
+                "video_path": str(video_path) if video_path else "",
                 "video_hash": "sha256:" + _hash_text(video.get("sha256")),
                 "source_paths": dict(source_paths) if isinstance(source_paths, Mapping) else {},
                 "reproduction_data": summary.get("reproduction_data") if isinstance(summary.get("reproduction_data"), Mapping) else {},
@@ -224,25 +280,31 @@ def _configured_anchor_candidates(config: Mapping[str, Any], root: Path) -> list
     return candidates
 
 
-def new_algorithm_package_root(project_root: str | Path) -> Path | None:
-    """Locate the dropped B-module algorithm bundle without hard-coding a leaf path."""
+def _project_local_directory(path: Path, root: Path) -> Path | None:
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return resolved if resolved.is_dir() else None
 
-    root = Path(project_root)
-    search_roots: list[Path] = []
-    for base_root in (root, *root.parents):
-        for candidate in (base_root / "b模块新算法", base_root.parent / "b模块新算法"):
-            if candidate not in search_roots:
-                search_roots.append(candidate)
+
+def new_algorithm_package_root(project_root: str | Path) -> Path | None:
+    root = Path(project_root).resolve()
+    search_roots = [
+        root / "runtime" / "model_security" / "algorithm_packages",
+        root / "model_security_assets" / "algorithm_packages",
+        root / "purification_lab" / "algorithm_packages",
+    ]
     for base in search_roots:
-        if not base.exists():
+        local_base = _project_local_directory(base, root)
+        if local_base is None:
             continue
-        direct = base / "backbone_soup_full_pipeline_v2_2026-05-24"
-        if (
-            (direct / "models" / "clean_baseline").exists()
-            or ((direct / "models" / "purified").exists() and _strict_audit_path(direct).exists())
-        ):
-            return direct
-        for child in sorted(base.iterdir()):
+        candidates = [local_base, *sorted(path for path in local_base.iterdir() if path.is_dir())]
+        for candidate in candidates:
+            child = _project_local_directory(candidate, root)
+            if child is None:
+                continue
             has_full_package = (child / "models" / "clean_baseline").exists() and (child / "src" / "autodetox").exists()
             has_strict_packaged_models = (child / "models" / "purified").exists() and _strict_audit_path(child).exists()
             if has_full_package or has_strict_packaged_models:
@@ -423,7 +485,7 @@ def packaged_poisoned_evidence_for_model(model_path: str | Path, *, root: str | 
     if archive_record is not None:
         model_hash = "sha256:" + sha256_file(path)
         purified_path = Path(str(archive_record.get("purified_path") or ""))
-        purified_hash = "sha256:" + sha256_file(purified_path) if purified_path.exists() else str(archive_record.get("purified_hash") or "")
+        purified_hash = "sha256:" + sha256_file(purified_path) if purified_path.is_file() else str(archive_record.get("purified_hash") or "")
         return {
             "status": "known_poisoned",
             "validation_scope": "seven_experiment_known_poisoned_archive",
@@ -448,7 +510,7 @@ def packaged_poisoned_evidence_for_model(model_path: str | Path, *, root: str | 
                 {
                     "path": str(purified_path),
                     "hash": purified_hash,
-                    "strict_pass": purified_path.exists(),
+                    "strict_pass": purified_path.is_file(),
                     "tier": "seven_experiment_verified",
                     "defense": archive_record.get("purification_algorithm"),
                     "summary_json": archive_record.get("summary_json"),
@@ -577,7 +639,12 @@ def _stage_packaged_candidates(source_pt: Path, *, root: str | Path, out_dir: Pa
     staged_dir = out_dir / "packaged_strict"
     family_tag = _family_tag_for_model(source_pt, root=root)
     for index, source_candidate in enumerate(_packaged_purified_candidates(source_pt, root=root), 1):
-        target = _copy_candidate_to_purified_done(source_pt, source_candidate, suffix="" if index == 1 else str(index))
+        target = _copy_candidate_to_purified_done(
+            source_pt,
+            source_candidate,
+            output_dir=staged_dir,
+            suffix="" if index == 1 else str(index),
+        )
         certification = packaged_strict_certification_for_model(source_candidate, root=root)
         item = {
             "candidate_source": "packaged_strict_purified",
@@ -592,13 +659,45 @@ def _stage_packaged_candidates(source_pt: Path, *, root: str | Path, out_dir: Pa
                 if isinstance(certification, Mapping) and certification.get("validation_scope")
                 else "new_algorithm_family_strict_audit"
             ),
+            "local_output_policy": "runtime_purified_directory_with_purified_done_suffix",
         }
-        if source_candidate.parent != target.parent:
-            item["local_output_policy"] = "source_model_directory_with_purified_done_suffix"
         if certification is not None:
             item["new_algorithm_strict_audit"] = certification
         staged.append(item)
     return staged
+
+
+def _stage_adaptive_candidate(source_pt: Path, record: Mapping[str, Any], *, out_dir: Path) -> dict[str, Any]:
+    source_candidate = Path(str(record["candidate_path"]))
+    target = promote_purified_candidate(source_pt, source_candidate)
+    expected_hash = str(record["candidate_hash"])
+    output_hash = "sha256:" + sha256_file(target)
+    if output_hash != expected_hash:
+        raise RuntimeError(
+            f"自适应净化候选复制后哈希不匹配: {target}; expected={expected_hash}; actual={output_hash}"
+        )
+    return {
+        "candidate_source": "adaptive_family_route",
+        "source_candidate_model": str(source_candidate),
+        "source_candidate_hash": expected_hash,
+        "output_model": str(target),
+        "output_model_hash": output_hash,
+        "model_id": record.get("model_id"),
+        "family": record.get("family"),
+        "goal": record.get("goal"),
+        "algorithm_route": record.get("route"),
+        "algorithm": record.get("algorithm"),
+        "release_status": record.get("release_status"),
+        "strict_absolute_release": bool(record.get("strict_absolute_release", False)),
+        "evidence_path": record.get("evidence_path"),
+        "adaptive_evidence": record.get("evidence_summary"),
+        "registry_path": record.get("registry_path"),
+        "registry_hash": record.get("registry_hash"),
+        "requires_full_scan": True,
+        "eligible_for_purification_scan": True,
+        "validation_scope": "adaptive_family_candidate_requires_current_full_scan",
+        "local_output_policy": "source_model_directory_with_purified_suffix",
+    }
 
 
 def _alpha_grid(config: Mapping[str, Any]) -> list[float]:
@@ -717,6 +816,60 @@ def run_new_purification(
     if clean_anchor is not None:
         report.clean_anchor_path = str(clean_anchor)
         report.clean_anchor_hash = "sha256:" + sha256_file(clean_anchor)
+        report.diagnostics["clean_anchor_role"] = "replacement_only_not_a_purified_candidate"
+
+    try:
+        adaptive_record = adaptive_candidate_for_source(source_pt, config=config, root=root)
+    except Exception as exc:
+        report.status = "unverifiable"
+        report.error = f"adaptive_route_validation_failed: {exc}"
+        report.diagnostics["adaptive_route_status"] = "failed_closed"
+        report.diagnostics["next_action"] = "repair the project-local adaptive registry or assets before retrying"
+        return report
+
+    if adaptive_record is not None:
+        try:
+            selected_record = _stage_adaptive_candidate(source_pt, adaptive_record, out_dir=out_dir)
+        except Exception as exc:
+            report.status = "unverifiable"
+            report.error = f"adaptive_candidate_staging_failed: {exc}"
+            report.diagnostics["adaptive_route_status"] = "failed_closed"
+            return report
+        report.strategy = ADAPTIVE_DETOX_STRATEGY
+        report.candidates = [selected_record]
+        report.purified_model_path = str(selected_record["output_model"])
+        report.purified_model_hash = str(selected_record["output_model_hash"])
+        report.status = "candidate_generated"
+        report.diagnostics.update(
+            {
+                "algorithm": adaptive_record.get("algorithm"),
+                "adaptive_route_status": "hash_verified_candidate_staged",
+                "adaptive_route": adaptive_record.get("route"),
+                "adaptive_model_id": adaptive_record.get("model_id"),
+                "adaptive_family": adaptive_record.get("family"),
+                "adaptive_goal": adaptive_record.get("goal"),
+                "adaptive_registry_path": adaptive_record.get("registry_path"),
+                "adaptive_registry_hash": adaptive_record.get("registry_hash"),
+                "adaptive_evidence_path": adaptive_record.get("evidence_path"),
+                "adaptive_evidence_hash": adaptive_record.get("evidence_summary", {}).get("evidence_file_hash"),
+                "adaptive_release_status": adaptive_record.get("release_status"),
+                "adaptive_strict_absolute_release": bool(adaptive_record.get("strict_absolute_release", False)),
+                "selection_policy": "adaptive_family_candidate_requires_current_full_scan",
+                "selected_candidate": selected_record,
+                "next_action": "run current B full scan before trust or runtime use",
+            }
+        )
+        _write_autodetox_plan(
+            report=report,
+            out_dir=out_dir,
+            latest_scan_report=latest_scan_report,
+            source_pt=source_pt,
+            clean_anchor=clean_anchor,
+            config=config,
+        )
+        return report
+
+    report.diagnostics["adaptive_route_status"] = "source_sha256_not_registered"
     packaged_candidates = _stage_packaged_candidates(source_pt, root=root, out_dir=out_dir)
     if packaged_candidates:
         report.diagnostics["packaged_candidate_count"] = len(packaged_candidates)
@@ -733,13 +886,14 @@ def run_new_purification(
 
     if clean_anchor is None:
         if packaged_candidates:
-            selected = Path(str(packaged_candidates[0]["output_model"]))
-            report.candidates = packaged_candidates
+            selected_record = _promote_candidate_record(source_pt, packaged_candidates[0])
+            selected = Path(str(selected_record["output_model"]))
+            report.candidates = [selected_record, *packaged_candidates[1:]]
             report.purified_model_path = str(selected)
             report.purified_model_hash = "sha256:" + sha256_file(selected)
             report.status = "candidate_generated"
             report.diagnostics["selection_policy"] = "packaged_strict_candidate_requires_full_scan"
-            report.diagnostics["selected_candidate"] = packaged_candidates[0]
+            report.diagnostics["selected_candidate"] = selected_record
             report.diagnostics["next_action"] = "run B full scan on staged packaged purified candidate before trust"
             return report
         report.status = "planned"
@@ -761,20 +915,22 @@ def run_new_purification(
             exclude_key_patterns=detox.get("exclude_key_patterns"),
             candidate_suffix="autodetox",
         )
-        report.candidates = [candidate.to_dict() for candidate in result.candidates]
-        if packaged_candidates:
-            report.candidates.extend(packaged_candidates)
+        built_candidates = [candidate.to_dict() for candidate in result.candidates]
         if not result.candidates:
             if packaged_candidates:
-                selected = Path(str(packaged_candidates[0]["output_model"]))
+                selected_record = _promote_candidate_record(source_pt, packaged_candidates[0])
+                selected = Path(str(selected_record["output_model"]))
+                report.candidates = [selected_record, *packaged_candidates[1:]]
                 report.purified_model_path = str(selected)
                 report.purified_model_hash = "sha256:" + sha256_file(selected)
                 report.status = "candidate_generated"
                 report.diagnostics["selection_policy"] = "packaged_strict_candidate_after_empty_weight_soup"
-                report.diagnostics["selected_candidate"] = packaged_candidates[0]
+                report.diagnostics["selected_candidate"] = selected_record
                 return report
             report.status = "failed"
             report.error = "no_weight_soup_candidates"
+            report.diagnostics["clean_anchor_role"] = "replacement_only_not_a_purified_candidate"
+            report.diagnostics["next_action"] = "weight soup produced no candidate; clean anchor remains replacement-only"
             return report
         selected_alpha = detox.get("selected_alpha")
         if selected_alpha is not None:
@@ -786,7 +942,7 @@ def run_new_purification(
             selected = result.candidates[0]
             report.diagnostics["selection_policy"] = "pending_full_scan_first_candidate"
         original_output = Path(selected.output_model)
-        purified = _copy_candidate_to_purified_done(source_pt, original_output)
+        purified = promote_purified_candidate(source_pt, original_output)
         report.purified_model_path = str(purified)
         report.purified_model_hash = "sha256:" + sha256_file(purified)
         report.status = "candidate_generated"
@@ -794,21 +950,30 @@ def run_new_purification(
         selected_candidate["original_output_model"] = str(original_output)
         selected_candidate["output_model"] = str(purified)
         selected_candidate["output_model_hash"] = report.purified_model_hash
-        selected_candidate["local_output_policy"] = "source_model_directory_with_purified_done_suffix"
+        selected_candidate["local_output_policy"] = "source_model_directory_with_purified_suffix"
+        remaining_candidates = [
+            candidate
+            for candidate in built_candidates
+            if str(candidate.get("output_model") or "") != str(original_output)
+        ]
+        report.candidates = [selected_candidate, *remaining_candidates, *packaged_candidates]
         report.diagnostics["selected_candidate"] = selected_candidate
         report.diagnostics["candidate_manifest"] = str(out_dir / "weight_soup" / "weight_soup_candidates_manifest.json")
         return report
     except Exception as exc:
         if packaged_candidates:
-            selected = Path(str(packaged_candidates[0]["output_model"]))
-            report.candidates = packaged_candidates
+            selected_record = _promote_candidate_record(source_pt, packaged_candidates[0])
+            selected = Path(str(selected_record["output_model"]))
+            report.candidates = [selected_record, *packaged_candidates[1:]]
             report.purified_model_path = str(selected)
             report.purified_model_hash = "sha256:" + sha256_file(selected)
             report.status = "candidate_generated"
             report.diagnostics["weight_soup_error"] = str(exc)
             report.diagnostics["selection_policy"] = "packaged_strict_candidate_after_weight_soup_error"
-            report.diagnostics["selected_candidate"] = packaged_candidates[0]
+            report.diagnostics["selected_candidate"] = selected_record
             return report
         report.status = "failed"
         report.error = str(exc)
+        report.diagnostics["clean_anchor_role"] = "replacement_only_not_a_purified_candidate"
+        report.diagnostics["next_action"] = "repair Weight Soup; clean anchor cannot be promoted as purification output"
         return report

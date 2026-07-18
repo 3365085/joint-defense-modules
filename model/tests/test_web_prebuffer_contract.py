@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 HTML = Path("src/defense/web/static/index.html")
+MODEL_SECURITY_HTML = Path("src/defense/web/static/model_security.html")
 
 
 def test_frontend_does_not_call_browser_frame_detection() -> None:
@@ -83,8 +84,9 @@ def test_monitor_page_does_not_expose_runtime_model_controls() -> None:
     assert "customModelDraftDirty" not in html
 
 
-def test_monitor_page_only_reads_custom_model_storage_for_explicit_test_bypass() -> None:
+def test_monitor_page_routes_stored_custom_model_by_bypass_switch() -> None:
     html = HTML.read_text(encoding="utf-8")
+    assert 'function getStored(key, fallback = "")' in html
     assert 'const DEFAULT_RUNTIME_PROFILE = "desktop_rtx";' in html
     assert "function currentRuntimeProfile()" in html
     assert 'localStorage.getItem("moduleA.lastProfile")' in html
@@ -96,18 +98,32 @@ def test_monitor_page_only_reads_custom_model_storage_for_explicit_test_bypass()
         "moduleA.lastCustomModelEnabled",
         "moduleA.lastModelPath",
         "moduleA.lastCustomModelFamily",
-        "moduleA.lastSourcePtPath",
         "moduleA.lastCustomClassNames",
     )
     for key in test_custom_model_keys:
         assert f'"{key}"' in custom_model_function
         assert f'localStorage.getItem("{key}")' in custom_model_function
     assert "if (!modelSecurityBypassEnabled())" not in custom_model_function
-    assert "const useCustomModelTestEntry = Boolean(customModel.enabled);" in html
-    assert 'const startEndpoint = useCustomModelTestEntry ? "/api/test/start" : "/api/start";' in html
+    assert 'const startEndpoint = bypassModelSecurity ? "/api/test/start" : "/api/start";' in html
+    assert "body.test_bypass_model_security = true;" in html
+    assert 'getStored("moduleA.testBypassModelSecurity", "false") === "true"' in html
     assert "profile: currentRuntimeProfile()" in html
     assert "custom_model: customModel" in html
     assert "backendLabel(status)" in html
+
+
+def test_security_center_checkbox_controls_main_monitor_bypass() -> None:
+    monitor_html = HTML.read_text(encoding="utf-8")
+    security_html = MODEL_SECURITY_HTML.read_text(encoding="utf-8")
+
+    assert '"/api/test/start"' in monitor_html
+    assert 'id="testBypassModelSecurity"' in security_html
+    assert 'id="testBypassStartBtn"' not in security_html
+    assert '"/api/test/start"' not in security_html
+    assert "test_bypass_model_security" in monitor_html
+    assert 'getStored("moduleA.testBypassModelSecurity", "false") === "true"' in monitor_html
+    assert '$("testBypassModelSecurity").checked = getStored("moduleA.testBypassModelSecurity", "false") === "true";' in security_html
+    assert "开启后，返回主监控台点击“开始检测”" in security_html
 
 
 def test_file_preview_no_longer_waits_for_first_detection() -> None:
@@ -129,11 +145,11 @@ def test_security_center_exposes_runtime_model_controls() -> None:
     assert 'id="profileSelect"' not in html
     assert 'id="enableCustomModel"' in html
     assert 'id="customModelPath"' in html
-    assert 'id="sourcePtPath"' in html
+    assert 'id="sourcePtPath"' not in html
     assert 'id="customModelBackend"' not in html
     assert 'id="customModelFamily"' in html
     assert 'id="browseModelBtn"' in html
-    assert 'id="browseSourcePtBtn"' in html
+    assert 'id="browseSourcePtBtn"' not in html
     assert 'id="saveModelConfigBtn"' not in html
     assert 'id="resetModelConfigBtn"' not in html
     assert 'id="resolvedBackend"' in html
@@ -143,16 +159,25 @@ def test_security_center_exposes_runtime_model_controls() -> None:
     assert "moduleA.lastProfile" in html
     assert "moduleA.lastCustomModelEnabled" in html
     assert "moduleA.lastModelPath" in html
-    assert "moduleA.lastSourcePtPath" in html
+    assert "moduleA.lastSourcePtPath" not in html
     assert "profile: currentRuntimeProfile()" in html
     assert "custom_model: customModelOptions()" in html
     assert "后端：" in html
     assert "模型族：" in html
-    assert "配置变更会立即应用" in html
+    assert "配置变更会立即同步到主监控台" in html
+    assert "主监控台会将其作为正常运行模型并由B模块执行安全准入" in html
+    assert "按运行模型哈希自动核对源 PT 绑定" in html
     assert 'const backend = "auto";' in html
     assert '$("testBypassModelSecurity").disabled = !enabled;' in html
     assert 'setStored("moduleA.testBypassModelSecurity", "false")' in html
     assert 'production_authoritative: "生产权威模型"' in html
+
+
+def test_monitor_page_displays_actual_purified_or_bypassed_runtime() -> None:
+    html = HTML.read_text(encoding="utf-8")
+    assert "普通启动将由B模块替换为净化可信模型" in html
+    assert "测试绕过B模块 · 实际直接运行原始模型" in html
+    assert "B模块已替换为净化运行模型" in html
 
 
 def test_main_page_keeps_model_security_as_entry_only() -> None:

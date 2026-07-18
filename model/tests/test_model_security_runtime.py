@@ -15,7 +15,7 @@ from defense.model_security.purifier import (
     packaged_strict_certification_for_model,
 )
 from defense.model_security.registry import ModelTrustRegistry
-from defense.model_security.reports import ModelSecurityReport
+from defense.model_security.reports import ModelPurificationReport, ModelSecurityReport
 from defense.runtime.config import load_runtime_config
 from defense.web.fastapi_app import create_app
 
@@ -896,6 +896,60 @@ def test_clear_trust_rebuilds_empty_seal_after_tamper(tmp_path: Path):
     assert status["trust_store_ok"] is True
     assert Path(status["registry_seal_path"]).exists()
 
+    restarted = ModelSecurityService(root=tmp_path)
+    restarted_status = restarted.trust_records()
+    assert restarted_status["count"] == 0
+    assert restarted_status["records"] == []
+    assert restarted_status["trust_store_ok"] is True
+
+
+def test_delete_trust_persists_empty_registry_after_restart(tmp_path: Path):
+    svc = ModelSecurityService(root=tmp_path)
+    svc.registry.mark_trusted(
+        "sha256:test",
+        risk_score=0.0,
+        scanner_version=model_security_service.SCANNER_VERSION,
+    )
+
+    result = svc.delete_trust("sha256:test")
+
+    assert result["deleted"] is True
+    restarted = ModelSecurityService(root=tmp_path)
+    restarted_status = restarted.trust_records()
+    assert restarted_status["count"] == 0
+    assert restarted_status["records"] == []
+    assert restarted_status["trust_store_ok"] is True
+
+
+@pytest.mark.parametrize("thread_attribute", ["_scan_thread", "_purify_thread", "_export_thread"])
+@pytest.mark.parametrize("operation", ["delete", "clear"])
+def test_whitelist_mutation_is_rejected_while_background_task_runs(
+    tmp_path: Path,
+    thread_attribute: str,
+    operation: str,
+):
+    class AliveThread:
+        @staticmethod
+        def is_alive() -> bool:
+            return True
+
+    svc = ModelSecurityService(root=tmp_path)
+    svc.registry.mark_trusted(
+        "sha256:test",
+        risk_score=0.0,
+        scanner_version=model_security_service.SCANNER_VERSION,
+    )
+    setattr(svc, thread_attribute, AliveThread())
+
+    with pytest.raises(ValueError) as exc_info:
+        if operation == "delete":
+            svc.delete_trust("sha256:test")
+        else:
+            svc.clear_trust()
+
+    assert str(exc_info.value).startswith("model_security_background_task_running")
+    assert svc.trust_records()["count"] == 1
+
 
 def test_clean_model_purification_is_rejected(tmp_path: Path, monkeypatch):
     cfg_path = tmp_path / "runtime.yaml"
@@ -1489,7 +1543,7 @@ model_security:
     assert len(svc.registry.list_records()) == 1
 
 
-def test_service_returns_trusted_purified_runtime_model_after_clean_rescan(tmp_path: Path, monkeypatch):
+def test_original_poisoned_model_is_not_replaced_after_clean_purification(tmp_path: Path):
     package = tmp_path / "b模块新算法" / "backbone_soup_full_pipeline_v2_2026-05-24"
     poisoned_dir = package / "models" / "poisoned"
     purified_dir = package / "models" / "purified"
@@ -1558,40 +1612,104 @@ model_security:
         encoding="utf-8",
     )
 
-    def fake_external(*_args, **_kwargs):
-        raise AssertionError("known poisoned and strict purified package paths should not hit external validation")
-
-    monkeypatch.setattr(model_security_scanner, "_run_external_validation", fake_external)
     svc = ModelSecurityService(config_path=cfg_path, root=tmp_path)
-    assert svc.scan(scan_type="full")["status"] == "suspicious"
-    assert svc.purify(scan_after=True)["status"] == "scan_clean_trusted"
+    source_fp = svc.current_fingerprint()
+    source_hash = "sha256:" + sha256_file(poisoned)
+    runtime_purified = poisoned.with_name(f"{poisoned.stem}_净化完毕.pt")
+    runtime_purified.write_bytes(purified.read_bytes())
+    purified_custom_model = {
+        "enabled": True,
+        "path": str(runtime_purified),
+        "backend": "pytorch",
+        "model_family": "yolov5",
+        "source_pt_path": str(runtime_purified),
+    }
+    purified_fp = svc.current_fingerprint(custom_model=purified_custom_model)
+    purified_hash = "sha256:" + sha256_file(runtime_purified)
+
+    suspicious_report = svc._write_report(
+        ModelSecurityReport(
+            fingerprint=source_fp.to_dict(),
+            scan_type="full",
+            status="suspicious",
+            risk_score=0.95,
+            diagnostics={"external_eval_policy": {"version": "ppe_three_class_target_v3"}},
+            source_model_path=str(poisoned),
+            source_model_hash=source_hash,
+            runtime_artifact_path=str(poisoned),
+        )
+    )
+    clean_report = svc._write_report(
+        ModelSecurityReport(
+            fingerprint=purified_fp.to_dict(),
+            scan_type="full",
+            status="clean",
+            risk_score=0.0,
+            diagnostics={"external_eval_policy": {"version": "ppe_three_class_target_v3"}},
+            source_model_path=str(runtime_purified),
+            source_model_hash=purified_hash,
+            runtime_artifact_path=str(runtime_purified),
+        )
+    )
+    purification_report = svc._write_purification_report(
+        ModelPurificationReport(
+            fingerprint=source_fp.to_dict(),
+            status="scan_clean_trusted",
+            strategy="unit_contract",
+            source_model_path=str(poisoned),
+            source_model_hash=source_hash,
+            purified_model_path=str(runtime_purified),
+            purified_model_hash=purified_hash,
+            scan_report_path=clean_report.report_path,
+            scan_status="clean",
+        )
+    )
+    svc.registry.mark_trusted(
+        purified_fp.fingerprint,
+        risk_score=0.0,
+        report_path=clean_report.report_path,
+        runtime_model_hash=purified_fp.model_hash,
+        runtime_model_path=str(runtime_purified),
+        source_model_hash=purified_hash,
+        source_model_path=str(runtime_purified),
+        original_source_model_hash=source_hash,
+        original_source_model_path=str(poisoned),
+        backend="pytorch",
+        model_family="yolov5",
+        image_size=purified_fp.image_size,
+        scanner_version=purified_fp.scanner_version,
+        class_names_hash=purified_fp.class_names_hash,
+        ppe_mapping_hash=purified_fp.ppe_mapping_hash,
+        purification_report_path=purification_report.report_path,
+        approval_source="purified_full_scan",
+    )
 
     original_status = svc.status()
     runtime = svc.trusted_purified_runtime_model()
 
-    assert original_status["admission_status"] == "purified_alternative_available"
+    assert original_status["allowed"] is False
+    assert original_status["admission_status"] == "suspicious"
+    assert original_status["admission_status"] not in {
+        "trusted",
+        "purified_alternative_available",
+    }
+    assert original_status["recommended_runtime_model"] is None
     assert original_status["can_scan"] is True
     assert original_status["can_purify"] is False
-    assert original_status["last_scan_completed"] is True
-    assert original_status["last_purification_completed"] is True
-    assert original_status["last_scan_job"]["status"] == "suspicious"
-    assert original_status["last_purification_job"]["status"] == "scan_clean_trusted"
-    assert original_status["last_purification_job"]["scan_status"] == "clean"
-    recommended = original_status["recommended_runtime_model"]
-    assert recommended["path"] == original_status["purified_model_path"]
-    assert recommended["source_pt_path"] == recommended["path"]
-    assert recommended["admission_status"] == "trusted"
-    assert recommended["allowed"] is True
-    assert runtime is not None
-    assert runtime["custom_model"]["enabled"] is True
-    assert runtime["custom_model"]["backend"] == "pytorch"
-    assert runtime["custom_model"]["model_family"] == "yolov5"
-    assert runtime["custom_model"]["source_pt_path"] == runtime["custom_model"]["path"]
-    assert Path(runtime["custom_model"]["path"]).exists()
-    assert runtime["model_security"]["admission_status"] == "trusted"
-    assert runtime["model_security"]["allowed"] is True
-    assert runtime["source_model_security"]["admission_status"] == "purified_alternative_available"
-    assert svc.recent_logs(limit=5)["entries"][0]["event"] == "purified_runtime_selected"
+    assert original_status["report_path"] == suspicious_report.report_path
+    assert original_status["purification_status"] == "scan_clean_trusted"
+    assert original_status["purification_report_path"] == purification_report.report_path
+    assert svc.registry.get(original_status["fingerprint"]) is None
+    assert runtime is None
+
+    purified_status = svc.status(custom_model=purified_custom_model)
+    assert purified_status["allowed"] is True
+    assert purified_status["admission_status"] == "trusted"
+
+    selected_purified = svc.trusted_purified_runtime_model(custom_model=purified_custom_model)
+    assert selected_purified is not None
+    assert selected_purified["custom_model"]["path"] == str(runtime_purified)
+    assert selected_purified["model_security"]["admission_status"] == "trusted"
 
 
 def test_custom_purified_pt_scan_uses_itself_as_source_pt(tmp_path: Path, monkeypatch):

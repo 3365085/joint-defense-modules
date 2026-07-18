@@ -20,7 +20,7 @@ class FakeModelSecurity:
         custom_model: dict,
         auto_remediate: bool,
     ) -> dict:
-        assert auto_remediate is True
+        assert auto_remediate is False
         return {
             "allowed": True,
             "custom_model": custom_model,
@@ -175,15 +175,17 @@ def test_frontend_prefers_effective_config_without_overwriting_user_input() -> N
     assert "setA3bSensitivityCustom(effectiveConfig)" in apply_source
 
 
-def test_frontend_surfaces_authoritative_lock_and_gates_test_override() -> None:
+def test_frontend_routes_custom_model_by_persisted_bypass_switch() -> None:
     source = INDEX.read_text(encoding="utf-8")
 
     assert 'id="runtimeModelSummary"' in source
     assert 'id="runtimeModelIdentity"' in source
-    assert 'id="resetCustomModelBtn"' in source
+    assert 'id="resetCustomModelBtn"' not in source
     assert "function runtimeModelSelectionSummary" in source
-    assert "生产运行已锁定 mask_bd_v4_clean_baseline.pt" in source
+    assert "默认使用 mask_bd_v4_clean_baseline.pt 及其绑定的 TensorRT FP16" in source
+    assert "在安全中心开启后可选择其他模型，并由B模块执行安全准入" in source
     assert 'localStorage.getItem("moduleA.lastCustomModelEnabled")' in source
-    assert "const useCustomModelTestEntry = Boolean(customModel.enabled);" in source
-    assert '"/api/test/start"' in source
-    assert 'resetButton.style.display = custom.enabled ? "" : "none";' in source
+    assert "自定义运行模型" in source
+    assert "启动前由B模块执行安全准入" in source
+    assert 'const startEndpoint = bypassModelSecurity ? "/api/test/start" : "/api/start";' in source
+    assert "body.test_bypass_model_security = true;" in source

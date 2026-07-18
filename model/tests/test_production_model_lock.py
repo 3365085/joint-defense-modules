@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from defense.runtime.authoritative_model import authoritative_source_path
-from defense.runtime.config import DEFAULT_CONFIG_PATH, load_runtime_config, project_root
+from defense.runtime.config import DEFAULT_CONFIG_PATH, load_runtime_config
 from defense.web.fastapi_app import create_app
 
 
@@ -31,8 +30,17 @@ class _Engine:
 
 
 class _Security:
+    def __init__(self) -> None:
+        self.prepare_calls: list[dict] = []
+
     def prepare_runtime_for_start(self, *, profile, custom_model, auto_remediate):
-        del profile, auto_remediate
+        self.prepare_calls.append(
+            {
+                "profile": profile,
+                "custom_model": custom_model,
+                "auto_remediate": auto_remediate,
+            }
+        )
         return {
             "allowed": True,
             "custom_model": custom_model,
@@ -46,13 +54,19 @@ class _Security:
         return {"allowed": True, "status": "trusted"}
 
 
-def test_production_web_rejects_custom_model_before_engine_start() -> None:
+def test_production_web_allows_custom_model_after_b_admission() -> None:
     engine = _Engine()
+    security = _Security()
     app = create_app(
         config_path=DEFAULT_CONFIG_PATH,
         engine=engine,
-        model_security=_Security(),
+        model_security=security,
     )
+    custom_model = {
+        "enabled": True,
+        "path": "other.engine",
+        "backend": "tensorrt",
+    }
     with TestClient(app) as client:
         response = client.post(
             "/api/start",
@@ -60,20 +74,23 @@ def test_production_web_rejects_custom_model_before_engine_start() -> None:
                 "source_type": "file",
                 "source": "unused.mp4",
                 "profile": "desktop_rtx",
-                "custom_model": {
-                    "enabled": True,
-                    "path": "other.engine",
-                    "backend": "tensorrt",
-                },
+                "custom_model": custom_model,
             },
         )
 
-    assert response.status_code == 409
-    assert response.json()["error"] == "production_model_locked"
-    assert engine.started_with is None
+    assert response.status_code == 200
+    assert response.json()["model_security"]["status"] == "trusted"
+    assert engine.started_with["custom_model"] == custom_model
+    assert security.prepare_calls == [
+        {
+            "profile": "desktop_rtx",
+            "custom_model": custom_model,
+            "auto_remediate": False,
+        }
+    ]
 
 
-def test_production_web_ignores_stale_authoritative_pt_custom_selection() -> None:
+def test_production_web_without_custom_selection_uses_default_model() -> None:
     engine = _Engine()
     app = create_app(
         config_path=DEFAULT_CONFIG_PATH,
@@ -87,15 +104,6 @@ def test_production_web_ignores_stale_authoritative_pt_custom_selection() -> Non
                 "source_type": "file",
                 "source": "unused.mp4",
                 "profile": "desktop_rtx",
-                "custom_model": {
-                    "enabled": True,
-                    "path": str(authoritative_source_path(project_root())),
-                    "backend": "pytorch",
-                    "model_family": "ultralytics",
-                },
-                # Legacy pages posted this flag to /api/start.  It must not turn
-                # the authoritative source PT into a test-bypass runtime.
-                "test_bypass_model_security": True,
             },
         )
 
@@ -123,8 +131,8 @@ def test_production_web_rejects_model_security_bypass() -> None:
             },
         )
 
-    assert response.status_code == 409
-    assert response.json()["error"] == "production_security_bypass_forbidden"
+    assert response.status_code == 403
+    assert response.json()["error"] == "test_security_bypass_endpoint_required"
     assert engine.started_with is None
 
 
@@ -161,7 +169,7 @@ def test_localhost_test_entry_allows_explicit_custom_model_bypass() -> None:
     assert engine.started_with["allow_test_custom_model"] is True
 
 
-def test_localhost_test_entry_allows_custom_model_after_security_admission() -> None:
+def test_ordinary_custom_model_uses_production_start_after_security_admission() -> None:
     engine = _Engine()
     app = create_app(
         config_path=DEFAULT_CONFIG_PATH,
@@ -178,20 +186,18 @@ def test_localhost_test_entry_allows_custom_model_after_security_admission() -> 
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/test/start",
+            "/api/start",
             json={
                 "source_type": "file",
                 "source": "unused.mp4",
                 "profile": "desktop_rtx",
                 "custom_model": custom_model,
-                "test_bypass_model_security": False,
             },
         )
 
     assert response.status_code == 200
     assert response.json()["model_security"]["status"] == "trusted"
     assert engine.started_with["custom_model"] == custom_model
-    assert engine.started_with["allow_test_custom_model"] is True
 
 
 def test_test_custom_model_override_only_changes_effective_config(tmp_path) -> None:

@@ -42,7 +42,19 @@ def write_image(path: str | Path, img_bgr: np.ndarray) -> None:
 def label_path_for_image(image_path: str | Path, labels_dir: str | Path | None = None) -> Path:
     ip = Path(image_path)
     if labels_dir is not None:
-        return Path(labels_dir) / f"{ip.stem}.txt"
+        label_root = Path(labels_dir)
+        parts = list(label_root.parts)
+        label_indexes = [index for index, part in enumerate(parts) if part.lower() == "labels"]
+        if label_indexes:
+            parts[label_indexes[-1]] = "images"
+            image_root = Path(*parts)
+            try:
+                relative_image = ip.resolve().relative_to(image_root.resolve())
+            except ValueError:
+                pass
+            else:
+                return (label_root / relative_image).with_suffix(".txt")
+        return label_root / f"{ip.stem}.txt"
     # YOLO standard: images/.../x.jpg -> labels/.../x.txt
     parts = list(ip.parts)
     if "images" in parts:

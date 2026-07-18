@@ -177,21 +177,11 @@ def load_runtime_config(
 
     apply_feature_options(cfg, feature_options or {})
     normalized_custom = normalize_custom_model_options(custom_model)
-    production_unique_model = bool(
-        cfg.get("runtime", {}).get("production_unique_model", False)
-        if isinstance(cfg.get("runtime"), dict)
-        else False
-    )
-    if production_unique_model and bool(normalized_custom.get("enabled", False)):
-        if not allow_test_custom_model:
-            raise ConfigValidationError(
-                "生产运行已锁定唯一 YOLO 模型，禁止 custom_model 覆盖。"
-            )
-        # Explicit localhost-only Web test entry.  This changes only the
-        # effective in-memory copy; the authoritative production YAML remains
-        # locked and normal callers cannot opt in accidentally.
-        cfg.setdefault("runtime", {})["production_unique_model"] = False
-        cfg["runtime"]["test_custom_model_bypass"] = True
+    if bool(normalized_custom.get("enabled", False)):
+        runtime = cfg.setdefault("runtime", {})
+        runtime["production_unique_model"] = False
+        if allow_test_custom_model:
+            runtime["test_custom_model_bypass"] = True
     resolved_custom = apply_custom_model(cfg, normalized_custom)
     cfg.setdefault("runtime", {})["profile"] = profile or "default"
     cfg.setdefault("runtime", {})["custom_model"] = resolved_custom

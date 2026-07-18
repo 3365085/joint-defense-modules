@@ -1,25 +1,27 @@
 # Module A Video Defense Runtime
 
+主运行包。仓库总介绍见 `../README.md`；A 模块实现与数据风险见
+`../docs/技术.算法/2026-07-18-项目介绍-A模块实现与数据风险.md`。
+
+风险先说：攻击正例少。当前结果只代表指定素材和当前配置，不代表跨设备生产泛化。
+
 Refactored runtime with a src-layout package, FastAPI Web UI, decoupled preview/detection buses, YOLO backend abstraction, PPE postprocessing, Module A A1-A4 detection, A3b/static-media logic, evidence events, diagnostics, and low-power profiles.
 
 ## Start
 
-Current delivery workspace root is `D:\联合防御模块`, and the package root is
-`D:\联合防御模块\model`. Double-click `D:\联合防御模块\start_web.bat` to start
-the Web UI through `D:\联合防御模块\.pixi`. Do not start the Web service with
-global Python.
+从仓库根目录启动。双击 `start_web.bat`，或使用 Pixi。不要使用全局 Python。
 
 Windows/Pixi:
 
 ```powershell
-cd D:\联合防御模块
+cd <repo-root>
 pixi run monitor
 ```
 
 For manual debugging, still enter the Pixi environment from the workspace root:
 
 ```powershell
-cd D:\联合防御模块
+cd <repo-root>
 pixi run app
 ```
 
@@ -28,7 +30,7 @@ pixi run app
 Preferred path:
 
 ```powershell
-cd D:\联合防御模块
+cd <repo-root>
 pixi run smoke
 ```
 

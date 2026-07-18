@@ -1,7 +1,7 @@
 """Verified loader and observability bridge for ``module_a_native``.
 
-This module does not wire the native operators into the production detector.
-It provides a strict, inspectable loading boundary for the source-owned crate:
+The rebuilt production detector calls these operators through ``_native_call``.
+This module provides a strict, inspectable loading boundary for that source-owned crate:
 
 * reject any import/distribution evidence that points at ``rebuilt_demo``;
 * require the A3b batch metadata/capability contract while preserving API v1;

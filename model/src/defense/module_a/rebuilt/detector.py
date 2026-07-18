@@ -372,12 +372,7 @@ class _MediaTrack:
 
 
 class ModuleADetector:
-    """Design-aligned rebuilt Module A detector.
-
-    This demo implementation intentionally does not inherit the production
-    Module A detector. It keeps the experiment scoped to rebuilt_demo while
-    preserving the public ModuleAInput / ModuleAResult contract.
-    """
+    """Production rebuilt Module A detector using the shared result contract."""
 
     _A3B_CLOSE_JOIN_BUDGET_SECONDS = 1.0
 
@@ -3009,11 +3004,12 @@ class ModuleADetector:
                     else "predict_failed"
                 )
 
-        # 贡献权重：只在本帧分类器确实成功使用时读取其重要性；任何降级路径
-        # 都使用固定经验乘数，避免错误资产继续影响 dominant input。
+        # 贡献归因只覆盖前 16 个 A1/A2/A3 基础特征。后 80 个 patch/delta
+        # 特征属于 A4 救援证据，不反算为单个基础模块贡献。降级路径使用固定
+        # 经验乘数，避免错误 artifact 继续影响 dominant input。
         if classifier_used and hasattr(self._classifier, "feature_importances_"):
-            fi = self._classifier.feature_importances_  # shape (16,)
-            # 用各模块的全局重要性之和作为乘数，比固定 1.00/1.08/1.12 更有数据依据
+            fi = self._classifier.feature_importances_
+            # 只聚合基础特征区间；当前生产 schema 总计 96 维。
             w1 = s1 * float(np.sum(fi[0:5]))    # A1 (5维): ~0.328
             w2 = s2 * float(np.sum(fi[5:10]))   # A2 (5维): ~0.297
             w3 = s3 * float(np.sum(fi[10:16]))  # A3 (6维): ~0.244
@@ -3131,9 +3127,12 @@ class ModuleADetector:
 
     @staticmethod
     def _rule_p_adv(max_score: float, second_score: float, third_score: float, multi_evidence: float) -> float:
-        """规则融合回退，待有标注数据后用 XGBoost/MLP 替换（见设计稿 §7.1）。
-        A3 使用 Farneback 稠密光流（非 FlowNetC-S）；FlowNetC-S 需要模型文件，
-        部署后可替换 _compute_flow() 并保持 a3_feature_score 接口不变。
+        """Return rule evidence used beside XGBoost and as its safe fallback.
+
+        Production A3 prefers RAFT TensorRT, then GPU Lucas-Kanade, then DIS
+        CPU. A4 keeps this rule score active even when the 96-feature XGBoost
+        rescue classifier is loaded; a missing or invalid classifier therefore
+        degrades visibly without disabling physical-attack scoring.
         """
         linear = (
             3.05 * max_score
@@ -4093,6 +4092,9 @@ class ModuleADetector:
             outside_motion = 0.0
         flow_gap = abs(inside_motion - outside_motion)
         inner_outer_ratio = inside_motion / max(0.05, outside_motion)
+        # Compatibility field name retained for consumers. The rebuilt path
+        # does not run KLT/RANSAC homography here; this is a plane-likeness
+        # heuristic from rectangle, edge, and inside/outside flow evidence.
         homography_inlier_ratio = _clamp(
             0.50 * candidate["rect_score"]
             + 0.25 * candidate["edge_score"]

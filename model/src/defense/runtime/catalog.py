@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from defense.runtime_paths import runtime_data_root
+
 
 DEFAULT_RUNTIME_ROOT = Path(__file__).resolve().parents[3] / "runtime"
 
@@ -16,7 +18,7 @@ def now_iso() -> str:
 
 
 def default_runtime_root() -> Path:
-    return DEFAULT_RUNTIME_ROOT
+    return runtime_data_root()
 
 
 def default_catalog_path(root: str | Path | None = None) -> Path:

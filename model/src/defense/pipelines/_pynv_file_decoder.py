@@ -20,10 +20,15 @@ from defense.pipelines.video_decoder import (
     VideoDecoderUnavailable,
     VideoStreamInfo,
 )
+from defense.runtime_paths import runtime_data_root
 
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
+
+
+def default_video_decode_alias_root() -> Path:
+    return runtime_data_root() / "video_decode_alias"
 
 
 def _source_identity(path: Path) -> tuple[str, dict[str, int]]:
@@ -177,8 +182,14 @@ class _AsciiSourceAlias:
         physical_root = (
             Path(alias_root).expanduser().resolve(strict=False)
             if alias_root is not None
-            else _project_root() / "runtime" / "video_decode_alias"
+            else default_video_decode_alias_root()
         )
+        if alias_root is None and not _same_volume(source_path, physical_root):
+            physical_root = (
+                _ascii_access_root(source_path.parent)
+                / "runtime"
+                / "video_decode_alias"
+            )
         physical_root.mkdir(parents=True, exist_ok=True)
         suffix = source_path.suffix.lower()
         if not suffix or not suffix[1:].isalnum():

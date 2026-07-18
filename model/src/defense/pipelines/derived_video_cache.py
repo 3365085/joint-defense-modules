@@ -14,6 +14,7 @@ from defense.pipelines.video_decoder import (
     VideoDecoderError,
     VideoStreamInfo,
 )
+from defense.runtime_paths import runtime_data_root
 
 
 class DerivedVideoCacheError(VideoDecoderError):
@@ -41,12 +42,7 @@ def default_derived_video_cache_root() -> Path:
     ).strip()
     if configured:
         return Path(configured).expanduser().resolve()
-    return (
-        Path(__file__).resolve().parents[3]
-        / "runtime"
-        / "artifacts"
-        / "video_decode"
-    )
+    return runtime_data_root() / "artifacts" / "video_decode"
 
 
 def sha256_file(path: str | Path) -> str:

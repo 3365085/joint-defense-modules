@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from defense.runtime import MonitorEngine, PipelineCache, list_profiles, sample_sources, scan_camera_devices
-from defense.runtime.config import DEFAULT_CONFIG_PATH, project_root
+from defense.runtime.config import DEFAULT_CONFIG_PATH, project_root, runtime_data_root
 from defense.runtime.evidence import (
     evidence_path_from_token,
     list_evidence_events,
@@ -191,7 +191,11 @@ def create_app(
     app.state.bind_host = bind_host
     app.state.security_policy = SecurityPolicy.from_env(bind_host)
     app.state.engine = engine or MonitorEngine(PipelineCache(config_path=config, root=project_root()))
-    app.state.model_security = model_security or ModelSecurityService(config_path=config, root=project_root())
+    app.state.model_security = model_security or ModelSecurityService(
+        config_path=config,
+        root=project_root(),
+        runtime_root=runtime_data_root(),
+    )
 
     @app.get("/")
     @app.get("/index.html")

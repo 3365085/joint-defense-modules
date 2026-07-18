@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 
 from defense.runtime.catalog import register_artifact
+from defense.runtime_paths import runtime_data_root
 from defense.visualization import draw_hud, draw_ppe_hud
 
 
@@ -32,7 +33,7 @@ LOGGER = logging.getLogger(__name__)
 
 def default_evidence_root() -> Path:
     override = os.environ.get("MODULE_A_EVIDENCE_ROOT")
-    return Path(override).expanduser() if override else DEFAULT_EVIDENCE_ROOT
+    return Path(override).expanduser() if override else runtime_data_root() / "evidence" / "monitor"
 
 
 def safe_path_part(text: str, fallback: str = "source", max_len: int = 80) -> str:

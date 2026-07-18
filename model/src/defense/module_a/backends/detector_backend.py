@@ -11,6 +11,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from defense.runtime_paths import runtime_data_root
+
 
 def temporal_reuse_max_consecutive(configured: Any | None = None) -> int:
     """Return the conservative cap for consecutive detector-reuse frames."""
@@ -407,8 +409,7 @@ class YoloV5DetectorBackend:
     @staticmethod
     def _configure_yolov5_base_runtime(yolov5_root: Path) -> None:
         """Constrain bundled YOLOv5 code to local artifact loading only."""
-        project_root = Path(__file__).resolve().parents[4]
-        runtime_dir = project_root.parent / "logs" / "yolov5_runtime"
+        runtime_dir = runtime_data_root() / "logs" / "yolov5_runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("YOLOv5_AUTOINSTALL", "0")
         os.environ.setdefault("YOLOV5_AUTOINSTALL", "0")

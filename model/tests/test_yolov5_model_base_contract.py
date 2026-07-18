@@ -8,6 +8,7 @@ from defense.runtime.config import (
     infer_backend_from_model_path,
     infer_model_family_from_model_path,
     normalize_custom_model_options,
+    runtime_data_root,
 )
 
 
@@ -153,7 +154,7 @@ def test_yolov5_runtime_sets_offline_guards(monkeypatch: pytest.MonkeyPatch) -> 
 
     YoloV5DetectorBackend._configure_yolov5_base_runtime(base)
 
-    runtime_dir = Path(__file__).resolve().parents[2] / "logs" / "yolov5_runtime"
+    runtime_dir = runtime_data_root() / "logs" / "yolov5_runtime"
     assert "0" == __import__("os").environ["YOLOv5_AUTOINSTALL"]
     assert "0" == __import__("os").environ["YOLOV5_AUTOINSTALL"]
     assert "1" == __import__("os").environ["YOLOv5_OFFLINE"]

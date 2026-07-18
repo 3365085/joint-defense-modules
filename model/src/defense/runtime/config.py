@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from defense.runtime_paths import RUNTIME_DATA_ROOT_ENV, runtime_data_root
+
 from .authoritative_model import (
     AuthoritativeModelValidationError,
     validate_production_model_config,

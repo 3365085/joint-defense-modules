@@ -129,10 +129,17 @@ def _read_torch_zip_class_names(path: Path) -> dict[int, str]:
 class ModelSecurityService:
     """Runtime wrapper for Module B model security without blocking Module A preview/detection."""
 
-    def __init__(self, *, config_path: str | Path | None = None, root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        config_path: str | Path | None = None,
+        root: str | Path | None = None,
+        runtime_root: str | Path | None = None,
+    ) -> None:
         self.config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
         self.root = Path(root) if root else project_root()
-        self.storage = ModelSecurityStorage.from_project_root(self.root)
+        storage_runtime_root = Path(runtime_root) if runtime_root is not None else self.root / "runtime"
+        self.storage = ModelSecurityStorage(storage_runtime_root / "model_security")
         self.storage.ensure()
         self.runtime_dir = self.storage.root
         self.log_path = self.storage.log_path
@@ -270,7 +277,7 @@ class ModelSecurityService:
         return {"log_path": str(self.log_path), "cleared": True, "entries": []}
 
     def _catalog_root(self) -> Path:
-        return self.root / "runtime"
+        return self.storage.root.parent
 
     def _register_output(
         self,
